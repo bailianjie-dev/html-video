@@ -16,7 +16,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "node --test test/"
+    "test": "node -e \"require('node:fs').existsSync('test') ? require('node:child_process').execFileSync(process.execPath, ['--test', 'test/'], { stdio: 'inherit' }) : console.log('no tests')\""
   },
   "dependencies": {
     "@html-video/core": "workspace:*",

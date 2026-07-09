@@ -1,0 +1,20 @@
+[oss]
+# Set to true to enable the dev OSS upload test.
+enabled = true
+
+# MVP implementation currently supports Aliyun OSS.
+provider = "aliyun"
+
+# Example: "oss-cn-hangzhou.aliyuncs.com"
+endpoint = "oss-cn-example.aliyuncs.com"
+bucket = "your-bucket-name"
+
+# Fill these in .html-video/oss.toml only. Do not commit real secrets.
+access_key_id = "YOUR_ACCESS_KEY_ID"
+access_key_secret = "YOUR_ACCESS_KEY_SECRET"
+
+# Optional. Defaults to https://<bucket>.<endpoint>
+public_base_url = "https://your-bucket-name.oss-cn-example.aliyuncs.com"
+
+# Uploaded test objects will be written under this prefix.
+prefix = "html-video/dev"

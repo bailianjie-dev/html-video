@@ -65,3 +65,7 @@ tmp/
 *.gif
 output/
 renders/
+
+.html-video/oss.toml
+
+.html-video/database.toml

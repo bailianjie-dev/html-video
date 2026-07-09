@@ -1,0 +1,451 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>Scroll Story Album</title>
+<style>
+  :root {
+    --ink: #181715;
+    --paper: #f4f0e8;
+    --muted: #746c61;
+    --line: rgba(24, 23, 21, .16);
+    --panel: rgba(255, 252, 244, .84);
+    --teal: #286d7a;
+    --coral: #d85c43;
+    --gold: #e6bd4d;
+    --violet: #5a4d7a;
+    --shadow: 0 24px 70px rgba(24, 23, 21, .16);
+  }
+
+  * { box-sizing: border-box; }
+  html, body { width: 100%; height: 100%; margin: 0; }
+  body {
+    font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif;
+    color: var(--ink);
+    background: var(--paper);
+    overflow: hidden;
+  }
+
+  .album {
+    height: 100vh;
+    height: 100dvh;
+    overflow-y: auto;
+    scroll-snap-type: y mandatory;
+    scroll-behavior: smooth;
+    background:
+      linear-gradient(90deg, rgba(24, 23, 21, .055) 1px, transparent 1px) 0 0 / 72px 72px,
+      linear-gradient(0deg, rgba(24, 23, 21, .045) 1px, transparent 1px) 0 0 / 72px 72px,
+      var(--paper);
+  }
+
+  .album-page {
+    position: relative;
+    min-height: 100vh;
+    min-height: 100dvh;
+    scroll-snap-align: start;
+    display: grid;
+    place-items: center;
+    padding: clamp(28px, 6vw, 92px);
+    isolation: isolate;
+  }
+
+  .album-page::before {
+    content: "";
+    position: absolute;
+    inset: clamp(18px, 3vw, 42px);
+    border: 1px solid var(--line);
+    pointer-events: none;
+    z-index: -1;
+  }
+
+  .page-inner {
+    width: min(100%, 1380px);
+    min-height: min(76vh, 1120px);
+    display: grid;
+    grid-template-columns: minmax(0, .95fr) minmax(320px, 1.05fr);
+    gap: clamp(26px, 5vw, 84px);
+    align-items: center;
+  }
+
+  .cover .page-inner,
+  .closing .page-inner {
+    grid-template-columns: minmax(0, 1fr);
+    align-content: center;
+  }
+
+  .copy {
+    max-width: 720px;
+    padding: clamp(18px, 3vw, 34px);
+  }
+
+  .eyebrow {
+    margin: 0 0 18px;
+    font-size: clamp(12px, 1.4vw, 18px);
+    line-height: 1.2;
+    text-transform: uppercase;
+    letter-spacing: .12em;
+    color: var(--muted);
+    font-weight: 700;
+  }
+
+  h1, h2 {
+    margin: 0;
+    font-family: Georgia, "Times New Roman", serif;
+    font-weight: 500;
+    letter-spacing: 0;
+  }
+
+  h1 {
+    max-width: 980px;
+    font-size: clamp(58px, 10vw, 154px);
+    line-height: .92;
+  }
+
+  h2 {
+    font-size: clamp(44px, 7vw, 112px);
+    line-height: .94;
+  }
+
+  .caption {
+    max-width: 660px;
+    margin: clamp(18px, 3vw, 34px) 0 0;
+    color: var(--muted);
+    font-size: clamp(18px, 2.1vw, 32px);
+    line-height: 1.32;
+  }
+
+  .meta-line {
+    margin-top: clamp(30px, 5vw, 66px);
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px 18px;
+    color: var(--muted);
+    font-size: clamp(13px, 1.5vw, 18px);
+  }
+
+  .media {
+    position: relative;
+    width: 100%;
+    aspect-ratio: 4 / 5;
+    min-height: 440px;
+    margin: 0;
+    border: 1px solid rgba(24, 23, 21, .22);
+    box-shadow: var(--shadow);
+    overflow: hidden;
+    background: #ddd;
+  }
+
+  .media img {
+    width: 100%;
+    height: 100%;
+    display: block;
+    object-fit: cover;
+  }
+
+  .media-a {
+    background:
+      linear-gradient(155deg, rgba(40, 109, 122, .88), rgba(40, 109, 122, .12) 54%, transparent 55%),
+      linear-gradient(24deg, #f6d777, #ef8a5f 46%, #282a35);
+  }
+
+  .media-b {
+    background:
+      linear-gradient(145deg, transparent 42%, rgba(230, 189, 77, .9) 43% 62%, transparent 63%),
+      linear-gradient(26deg, #1f6c62, #eef0df 48%, #5a4d7a);
+  }
+
+  .media-c {
+    background:
+      linear-gradient(90deg, rgba(24, 23, 21, .13) 1px, transparent 1px) 0 0 / 44px 44px,
+      linear-gradient(160deg, #f3efe2, #d85c43 42%, #173941);
+  }
+
+  .media::after {
+    content: attr(data-label);
+    position: absolute;
+    left: 22px;
+    right: 22px;
+    bottom: 18px;
+    padding-top: 16px;
+    border-top: 1px solid rgba(255,255,255,.56);
+    color: rgba(255,255,255,.92);
+    font-size: 13px;
+    letter-spacing: .09em;
+    text-transform: uppercase;
+  }
+
+  .paper-card {
+    max-width: 760px;
+    padding: clamp(34px, 5vw, 70px);
+    background: var(--panel);
+    border: 1px solid var(--line);
+    box-shadow: var(--shadow);
+  }
+
+  .closing-mark {
+    width: min(52vw, 420px);
+    aspect-ratio: 1;
+    margin-top: 46px;
+    border: 1px solid var(--line);
+    background:
+      linear-gradient(135deg, transparent 0 48%, var(--coral) 49% 57%, transparent 58%),
+      linear-gradient(45deg, var(--teal), #f4f0e8 46%, var(--gold));
+  }
+
+  .album-controls {
+    position: fixed;
+    z-index: 10;
+    right: max(22px, env(safe-area-inset-right));
+    bottom: max(22px, env(safe-area-inset-bottom));
+    display: grid;
+    grid-template-columns: 46px 46px;
+    gap: 8px;
+    align-items: center;
+  }
+
+  .album-controls button {
+    width: 46px;
+    height: 46px;
+    border: 1px solid rgba(24, 23, 21, .28);
+    border-radius: 50%;
+    color: var(--ink);
+    background: rgba(244, 240, 232, .86);
+    font-size: 22px;
+    line-height: 1;
+    cursor: pointer;
+    backdrop-filter: blur(14px);
+  }
+
+  .album-controls button:hover { background: #fffaf0; }
+  .album-controls button:disabled { opacity: .35; cursor: default; }
+
+  .counter {
+    grid-column: 1 / -1;
+    justify-self: end;
+    padding: 6px 10px;
+    border: 1px solid rgba(24, 23, 21, .18);
+    background: rgba(244, 240, 232, .86);
+    color: var(--muted);
+    font-size: 12px;
+    font-weight: 700;
+    letter-spacing: .08em;
+    backdrop-filter: blur(14px);
+  }
+
+  .dots {
+    position: fixed;
+    z-index: 10;
+    left: max(22px, env(safe-area-inset-left));
+    top: 50%;
+    transform: translateY(-50%);
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+
+  .dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    border: 1px solid rgba(24, 23, 21, .42);
+    background: transparent;
+    padding: 0;
+    cursor: pointer;
+  }
+
+  .dot.active { background: var(--ink); }
+
+  @media (max-width: 860px), (pointer: coarse) {
+    body { overflow: auto; }
+    .album-page { padding: 28px 20px 44px; align-items: stretch; }
+    .album-page::before { inset: 12px; }
+    .page-inner {
+      min-height: calc(100vh - 72px);
+      min-height: calc(100dvh - 72px);
+      grid-template-columns: 1fr;
+      gap: 24px;
+      align-content: center;
+    }
+    .copy { padding: 0 6px; }
+    h1 { font-size: clamp(56px, 18vw, 92px); }
+    h2 { font-size: clamp(42px, 14vw, 74px); }
+    .caption { font-size: clamp(17px, 4.6vw, 23px); }
+    .media {
+      min-height: 0;
+      aspect-ratio: 4 / 3.8;
+      box-shadow: 0 18px 44px rgba(24, 23, 21, .16);
+    }
+    .album-controls { display: none; }
+    .dots {
+      left: 50%;
+      top: auto;
+      bottom: max(14px, env(safe-area-inset-bottom));
+      transform: translateX(-50%);
+      flex-direction: row;
+      padding: 8px 10px;
+      border: 1px solid rgba(24, 23, 21, .14);
+      background: rgba(244, 240, 232, .82);
+      backdrop-filter: blur(14px);
+    }
+    .paper-card { padding: 28px; }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .album { scroll-behavior: auto; }
+  }
+</style>
+</head>
+<body>
+  <main class="album" id="album" aria-label="Electronic album pages">
+    <section class="album-page cover" data-page>
+      <div class="page-inner">
+        <div class="paper-card">
+          <p class="eyebrow" data-hv-text="cover_eyebrow">Interactive album</p>
+          <h1 data-hv-text="cover_title">Aoki Company Album</h1>
+          <p class="caption" data-hv-text="cover_subtitle">A compact story about people, products, milestones, and the next focused year.</p>
+          <div class="meta-line">
+            <span data-hv-text="cover_meta_left">Swipe down on mobile</span>
+            <span data-hv-text="cover_meta_right">Click next on desktop</span>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="album-page" data-page>
+      <div class="page-inner">
+        <div class="copy">
+          <p class="eyebrow" data-hv-text="page_01_eyebrow">01 / Origin</p>
+          <h2 data-hv-text="page_01_title">Built around dependable delivery.</h2>
+          <p class="caption" data-hv-text="page_01_caption">Aoki began with one promise: make complex work feel predictable from the first conversation to final handoff.</p>
+        </div>
+        <figure class="media media-a" data-label="Replace with uploaded photo">
+          <img alt="" src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 900 1125'%3E%3Crect width='900' height='1125' fill='%23f6d777'/%3E%3Cpath d='M0 850 C180 700 312 760 460 620 C640 450 735 506 900 350 L900 1125 L0 1125 Z' fill='%23286d7a'/%3E%3Ccircle cx='255' cy='285' r='92' fill='%23fff4d6'/%3E%3Cpath d='M104 210 L708 118 L808 702 L204 795 Z' fill='none' stroke='%23181715' stroke-width='18' opacity='.25'/%3E%3C/svg%3E" />
+        </figure>
+      </div>
+    </section>
+
+    <section class="album-page" data-page>
+      <div class="page-inner">
+        <figure class="media media-b" data-label="People / workspace / material">
+          <img alt="" src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 900 1125'%3E%3Crect width='900' height='1125' fill='%23eef0df'/%3E%3Cg fill='%235a4d7a'%3E%3Crect x='110' y='140' width='280' height='360'/%3E%3Crect x='510' y='220' width='240' height='280'/%3E%3Crect x='214' y='620' width='472' height='278'/%3E%3C/g%3E%3Cpath d='M0 900 L900 420 L900 1125 L0 1125 Z' fill='%23e6bd4d' opacity='.85'/%3E%3C/svg%3E" />
+        </figure>
+        <div class="copy">
+          <p class="eyebrow" data-hv-text="page_02_eyebrow">02 / Team</p>
+          <h2 data-hv-text="page_02_title">Practical operators with product taste.</h2>
+          <p class="caption" data-hv-text="page_02_caption">Use this page for the team, workspace, founder, or a customer-facing moment from the uploaded materials.</p>
+        </div>
+      </div>
+    </section>
+
+    <section class="album-page" data-page>
+      <div class="page-inner">
+        <div class="copy">
+          <p class="eyebrow" data-hv-text="page_03_eyebrow">03 / Proof</p>
+          <h2 data-hv-text="page_03_title">Clear service, visible progress.</h2>
+          <p class="caption" data-hv-text="page_03_caption">Turn screenshots, product photos, metrics, or a pasted HTML page into a concise story page with one memorable takeaway.</p>
+        </div>
+        <figure class="media media-c" data-label="Screenshot / product / chart">
+          <img alt="" src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 900 1125'%3E%3Crect width='900' height='1125' fill='%23f3efe2'/%3E%3Crect x='120' y='150' width='660' height='820' rx='22' fill='%23181715'/%3E%3Crect x='164' y='216' width='572' height='84' fill='%23d85c43'/%3E%3Crect x='164' y='354' width='410' height='42' fill='%23f4f0e8' opacity='.9'/%3E%3Crect x='164' y='440' width='510' height='42' fill='%23f4f0e8' opacity='.65'/%3E%3Crect x='164' y='594' width='156' height='270' fill='%23286d7a'/%3E%3Crect x='372' y='506' width='156' height='358' fill='%23e6bd4d'/%3E%3Crect x='580' y='660' width='156' height='204' fill='%23d85c43'/%3E%3C/svg%3E" />
+        </figure>
+      </div>
+    </section>
+
+    <section class="album-page closing" data-page>
+      <div class="page-inner">
+        <div class="copy">
+          <p class="eyebrow" data-hv-text="closing_eyebrow">04 / Next</p>
+          <h2 data-hv-text="closing_title">A focused year ahead.</h2>
+          <p class="caption" data-hv-text="closing_caption">Close with the next milestone, contact line, or the one sentence people should remember after browsing the album.</p>
+          <div class="closing-mark" aria-hidden="true"></div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <nav class="album-controls" aria-label="Album navigation">
+    <button type="button" id="prevPage" aria-label="Previous page">↑</button>
+    <button type="button" id="nextPage" aria-label="Next page">↓</button>
+    <div class="counter" id="pageCounter">01 / 05</div>
+  </nav>
+  <div class="dots" id="pageDots" aria-label="Album page dots"></div>
+
+<script>
+(function () {
+  const album = document.getElementById('album');
+  const pages = Array.from(document.querySelectorAll('[data-page]'));
+  const prev = document.getElementById('prevPage');
+  const next = document.getElementById('nextPage');
+  const counter = document.getElementById('pageCounter');
+  const dots = document.getElementById('pageDots');
+  let active = 0;
+
+  function pad(n) { return String(n).padStart(2, '0'); }
+  function go(index) {
+    const nextIndex = Math.max(0, Math.min(pages.length - 1, index));
+    pages[nextIndex].scrollIntoView({ behavior: 'smooth', block: 'start' });
+    setActive(nextIndex);
+  }
+  function setActive(index) {
+    active = Math.max(0, Math.min(pages.length - 1, index));
+    counter.textContent = pad(active + 1) + ' / ' + pad(pages.length);
+    prev.disabled = active === 0;
+    next.disabled = active === pages.length - 1;
+    dots.querySelectorAll('.dot').forEach(function (dot, i) {
+      dot.classList.toggle('active', i === active);
+      dot.setAttribute('aria-current', i === active ? 'page' : 'false');
+    });
+  }
+
+  pages.forEach(function (_, i) {
+    const dot = document.createElement('button');
+    dot.type = 'button';
+    dot.className = 'dot';
+    dot.setAttribute('aria-label', 'Go to page ' + (i + 1));
+    dot.addEventListener('click', function () { go(i); });
+    dots.appendChild(dot);
+  });
+
+  prev.addEventListener('click', function () { go(active - 1); });
+  next.addEventListener('click', function () { go(active + 1); });
+
+  document.addEventListener('keydown', function (event) {
+    const tag = document.activeElement && document.activeElement.tagName;
+    if (tag === 'INPUT' || tag === 'TEXTAREA' || document.activeElement?.isContentEditable) return;
+    if (['ArrowDown', 'ArrowRight', 'PageDown', ' '].includes(event.key)) {
+      event.preventDefault();
+      go(active + 1);
+    } else if (['ArrowUp', 'ArrowLeft', 'PageUp'].includes(event.key)) {
+      event.preventDefault();
+      go(active - 1);
+    } else if (event.key === 'Home') {
+      event.preventDefault();
+      go(0);
+    } else if (event.key === 'End') {
+      event.preventDefault();
+      go(pages.length - 1);
+    }
+  });
+
+  if ('IntersectionObserver' in window) {
+    const observer = new IntersectionObserver(function (entries) {
+      let best = null;
+      entries.forEach(function (entry) {
+        if (!entry.isIntersecting) return;
+        if (!best || entry.intersectionRatio > best.intersectionRatio) best = entry;
+      });
+      if (best) setActive(pages.indexOf(best.target));
+    }, { root: album, threshold: [.45, .65, .85] });
+    pages.forEach(function (page) { observer.observe(page); });
+  } else {
+    album.addEventListener('scroll', function () {
+      const index = Math.round(album.scrollTop / Math.max(1, album.clientHeight));
+      setActive(index);
+    }, { passive: true });
+  }
+
+  setActive(0);
+})();
+</script>
+</body>
+</html>

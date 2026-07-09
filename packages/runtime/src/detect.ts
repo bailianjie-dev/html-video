@@ -18,8 +18,17 @@ async function which(bin: string): Promise<string | null> {
     // spuriously mark an installed agent (claude/codex) unavailable, which then
     // makes the studio fall back to the API-key-only anthropic-api agent.
     const { stdout } = await exec(WHICH_CMD, [bin], { timeout: 8000 });
-    const first = stdout.trim().split(/\r?\n/)[0]?.trim();
-    return first || null;
+    const candidates = stdout.trim().split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
+    if (process.platform !== 'win32') return candidates[0] ?? null;
+    // `where codex` can return an extensionless npm shim before codex.cmd.
+    // Node's spawn() cannot execute that shim on Windows, so prefer a real
+    // executable or a batch shim we can route through cmd.exe.
+    return (
+      candidates.find((p) => /\.exe$/i.test(p)) ??
+      candidates.find((p) => /\.(?:cmd|bat)$/i.test(p)) ??
+      candidates[0] ??
+      null
+    );
   } catch {
     return null;
   }
@@ -53,7 +62,10 @@ export async function resolveBin(def: AgentDef): Promise<string | null> {
 
 async function probeVersion(bin: string, args: string[]): Promise<string | null> {
   try {
-    const { stdout } = await exec(bin, args, { timeout: 5000 });
+    const { stdout } = await exec(bin, args, {
+      timeout: 5000,
+      ...(process.platform === 'win32' && /\.(?:cmd|bat)$/i.test(bin) && { shell: true }),
+    });
     return stdout.trim().split('\n')[0] ?? null;
   } catch {
     return null;

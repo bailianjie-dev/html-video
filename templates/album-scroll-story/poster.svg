@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1080 1920" role="img" aria-label="Scroll Story Album poster">
+  <rect width="1080" height="1920" fill="#f4f0e8"/>
+  <rect x="80" y="80" width="920" height="1760" rx="34" fill="#171717"/>
+  <rect x="132" y="140" width="816" height="624" rx="26" fill="#d85c43"/>
+  <rect x="168" y="176" width="744" height="552" rx="20" fill="#f6d777"/>
+  <path d="M168 590 C280 500 365 524 454 450 C552 370 680 392 912 260 L912 728 L168 728 Z" fill="#286d7a"/>
+  <circle cx="292" cy="292" r="62" fill="#fff4d6"/>
+  <text x="132" y="900" font-family="Arial, Helvetica, sans-serif" font-size="40" fill="#f4f0e8" letter-spacing="8">ELECTRONIC ALBUM</text>
+  <text x="132" y="1004" font-family="Georgia, serif" font-size="96" fill="#f4f0e8">Scroll</text>
+  <text x="132" y="1110" font-family="Georgia, serif" font-size="96" fill="#f4f0e8">Story</text>
+  <text x="132" y="1226" font-family="Arial, Helvetica, sans-serif" font-size="32" fill="#c8c0b4">Mobile scroll / desktop next page</text>
+  <g fill="#f4f0e8">
+    <circle cx="132" cy="1660" r="10"/>
+    <circle cx="174" cy="1660" r="10" opacity=".42"/>
+    <circle cx="216" cy="1660" r="10" opacity=".42"/>
+    <circle cx="258" cy="1660" r="10" opacity=".42"/>
+  </g>
+  <path d="M866 1644 l34 34 l34 -34" fill="none" stroke="#f4f0e8" stroke-width="12" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

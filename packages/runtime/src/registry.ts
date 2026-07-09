@@ -12,6 +12,7 @@ import { copilot } from './defs/copilot.js';
 import { aider } from './defs/aider.js';
 import { traeCli } from './defs/trae-cli.js';
 import { qoderCli } from './defs/qoder.js';
+import { piAgent } from './defs/pi-agent.js';
 import type { AgentDef } from './types.js';
 
 /**
@@ -41,6 +42,7 @@ export const AGENT_DEFS: AgentDef[] = [
   copilot,
   aider,
   qoderCli,
+  piAgent,
 ];
 
 export function findAgent(id: string): AgentDef | undefined {

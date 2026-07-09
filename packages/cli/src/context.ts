@@ -8,23 +8,37 @@ import { fileURLToPath } from 'node:url';
 import {
   AssetStore,
   EngineRegistry,
+  FileProjectPersistence,
+  PostgresProjectPersistence,
   ProjectOrchestrator,
   ProjectStore,
   TemplateRegistry,
 } from '@html-video/core';
+import type { ProjectPersistence } from '@html-video/core';
 import hfAdapter from '@html-video/adapter-hyperframes';
 import remotionAdapter, { remotionInstalled } from '@html-video/adapter-remotion';
 import { MediaConfigStore } from './media-config.js';
+import {
+  createPgClient,
+  loadDatabaseConfig,
+  type DatabaseConfig,
+  type PgClientHandle,
+} from './database-config.js';
 
 export interface CliContext {
   projectRoot: string;
   engines: EngineRegistry;
   templates: TemplateRegistry;
-  projects: ProjectStore;
+  projects: ProjectPersistence;
   assets: AssetStore;
   orchestrator: ProjectOrchestrator;
   templatesDir: string;
   mediaConfig: MediaConfigStore;
+  database?: {
+    config: DatabaseConfig;
+    handle?: PgClientHandle;
+    mode: 'postgres' | 'file';
+  };
 }
 
 export function findProjectRoot(start: string = process.cwd()): string {
@@ -67,7 +81,21 @@ export async function bootstrap(opts: { cwd?: string } = {}): Promise<CliContext
   const templatesDir = findTemplatesDir(projectRoot);
   await templates.scan(templatesDir);
 
-  const projects = new ProjectStore(projectRoot);
+  const projectStore = new ProjectStore(projectRoot);
+  const databaseConfig = loadDatabaseConfig(projectRoot);
+  let databaseHandle: PgClientHandle | undefined;
+  let projects: ProjectPersistence = new FileProjectPersistence(projectStore);
+  let database: CliContext['database'];
+  if (databaseConfig?.enabled) {
+    databaseHandle = createPgClient(databaseConfig);
+    projects = new PostgresProjectPersistence({
+      db: databaseHandle.db,
+      projectRoot,
+    });
+    database = { config: databaseConfig, handle: databaseHandle, mode: 'postgres' };
+  } else if (databaseConfig) {
+    database = { config: databaseConfig, mode: 'file' };
+  }
   const assets = new AssetStore({ projectRoot });
 
   const orchestrator = new ProjectOrchestrator({
@@ -80,5 +108,15 @@ export async function bootstrap(opts: { cwd?: string } = {}): Promise<CliContext
 
   const mediaConfig = new MediaConfigStore(projectRoot);
 
-  return { projectRoot, engines, templates, projects, assets, orchestrator, templatesDir, mediaConfig };
+  return {
+    projectRoot,
+    engines,
+    templates,
+    projects,
+    assets,
+    orchestrator,
+    templatesDir,
+    mediaConfig,
+    ...(database !== undefined && { database }),
+  };
 }

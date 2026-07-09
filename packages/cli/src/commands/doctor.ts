@@ -1,4 +1,6 @@
 import { execSync } from 'node:child_process';
+import { existsSync } from 'node:fs';
+import { join } from 'node:path';
 import type { CliContext } from '../context.js';
 import { ok } from '../output.js';
 
@@ -12,12 +14,41 @@ interface Check {
 
 function which(cmd: string): string | null {
   try {
-    return execSync(`which ${cmd}`, { stdio: ['ignore', 'pipe', 'ignore'] })
+    const probe = process.platform === 'win32' ? `where ${cmd}` : `which ${cmd}`;
+    return execSync(probe, { stdio: ['ignore', 'pipe', 'ignore'] })
       .toString()
       .trim() || null;
   } catch {
     return null;
   }
+}
+
+function localFfmpeg(projectRoot: string): string | null {
+  const binary = process.platform === 'win32' ? 'ffmpeg.exe' : 'ffmpeg';
+  const candidate = join(projectRoot, 'tools', 'ffmpeg', 'bin', binary);
+  return existsSync(candidate) ? candidate : null;
+}
+
+function chromeCandidates(): string[] {
+  return process.platform === 'win32'
+    ? [
+        join(process.env.ProgramFiles || 'C:\\Program Files', 'Google', 'Chrome', 'Application', 'chrome.exe'),
+        join(process.env['ProgramFiles(x86)'] || 'C:\\Program Files (x86)', 'Google', 'Chrome', 'Application', 'chrome.exe'),
+        join(process.env.ProgramFiles || 'C:\\Program Files', 'Microsoft', 'Edge', 'Application', 'msedge.exe'),
+        join(process.env['ProgramFiles(x86)'] || 'C:\\Program Files (x86)', 'Microsoft', 'Edge', 'Application', 'msedge.exe'),
+      ]
+    : process.platform === 'darwin'
+      ? [
+          '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+          '/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge',
+          '/Applications/Chromium.app/Contents/MacOS/Chromium',
+        ]
+      : [
+          '/usr/bin/chromium',
+          '/usr/bin/chromium-browser',
+          '/usr/bin/google-chrome',
+          '/usr/bin/microsoft-edge',
+        ];
 }
 
 function version(cmd: string, args = '--version'): string | null {
@@ -45,30 +76,20 @@ export async function runDoctor(ctx: CliContext): Promise<void> {
   });
 
   // ffmpeg
-  if (which('ffmpeg')) {
-    checks.push({ name: 'ffmpeg', status: 'ok', value: version('ffmpeg', '-version')?.split(' ')[2] ?? '?' });
+  const ffmpeg = localFfmpeg(ctx.projectRoot) ?? which('ffmpeg');
+  if (ffmpeg) {
+    const ffmpegCmd = ffmpeg.includes('\n') ? 'ffmpeg' : `"${ffmpeg}"`;
+    checks.push({ name: 'ffmpeg', status: 'ok', value: version(ffmpegCmd, '-version')?.split(' ')[2] ?? ffmpeg });
   } else {
     checks.push({
       name: 'ffmpeg',
       status: 'missing',
-      install_hint: 'brew install ffmpeg  (macOS) / apt install ffmpeg (Linux)',
+      install_hint: 'Install ffmpeg on PATH, or place ffmpeg at tools/ffmpeg/bin/ffmpeg.exe on Windows.',
     });
   }
 
   // chromium / chrome (for HF puppeteer)
-  const chromePaths = [
-    '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
-    '/usr/bin/chromium',
-    '/usr/bin/google-chrome',
-  ];
-  const chromiumOk = chromePaths.some((p) => {
-    try {
-      execSync(`test -x "${p}"`);
-      return true;
-    } catch {
-      return false;
-    }
-  });
+  const chromiumOk = chromeCandidates().some((p) => existsSync(p));
   checks.push({
     name: 'chromium',
     status: chromiumOk ? 'ok' : 'warning',

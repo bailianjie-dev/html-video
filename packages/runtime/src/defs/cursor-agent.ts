@@ -6,7 +6,9 @@ export const cursorAgent: AgentDef = {
   bin: 'cursor-agent',
   versionArgs: ['--version'],
   buildArgs(_prompt, _ctx) {
-    return ['--print'];
+    // Cursor Agent refuses non-interactive runs in a fresh workspace unless
+    // trust is explicit. Studio cannot answer the prompt, so opt in here.
+    return ['--print', '--trust'];
   },
   streamFormat: 'plain',
   promptViaStdin: true,

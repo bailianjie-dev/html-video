@@ -7,13 +7,44 @@ import { createServer, type IncomingMessage, type ServerResponse } from 'node:ht
 import { readFile, copyFile, mkdir } from 'node:fs/promises';
 import { existsSync, statSync } from 'node:fs';
 import { dirname, extname, join, resolve, basename } from 'node:path';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { tmpdir } from 'node:os';
 import type { CliContext } from './context.js';
-import { AssetStore, generateTts, generateMusic } from '@html-video/core';
+import {
+  AlbumPageRepository,
+  AlbumRepository,
+  AssetRepository,
+  AssetStore,
+  ExportJobRepository,
+  generateTts,
+  generateMusic,
+  PostgresProjectPersistence,
+  type Asset,
+  type AssetRow,
+  type DbAssetType,
+  type ExportJobRow,
+  type Project,
+} from '@html-video/core';
+import type { ContentGraph } from '@html-video/content-graph';
 import { extractUrls, fetchSource } from './fetch-source.js';
 import { detectAll, findAgent, spawnAgent } from '@html-video/runtime';
+import { createPgClient, loadDatabaseConfig, maskedDatabaseConfig } from './database-config.js';
+import { loadOssConfig, maskedOssConfig, uploadToAliyunOss } from './oss-config.js';
+import {
+  createDevAuthToken,
+  DEV_AUTH_USERNAME,
+  loadAuthConfig,
+  verifyDevAuthToken,
+  verifyDevCredentials,
+  type AuthConfig,
+} from './auth-config.js';
+import {
+  AiGenerationLogger,
+  aiProviderModel,
+  type AiGenerationLogHandle,
+} from './ai-generation-logger.js';
+import { ExportJobTracker } from './export-job-tracker.js';
 
 interface StudioHandle {
   url: string;
@@ -62,6 +93,517 @@ export async function startStudioServer(ctx: CliContext, port: number): Promise<
 
       // ============== API ==============
 
+      if (url.pathname === '/api/auth/me' && m === 'GET') {
+        return json(res, 200, {
+          user: getRequestUser(req, loadAuthConfig(ctx.projectRoot)),
+        });
+      }
+
+      if (url.pathname === '/api/auth/dev-login' && m === 'POST') {
+        const body = await readBody(req).catch(() => ({} as Record<string, unknown>));
+        const authConfig = loadAuthConfig(ctx.projectRoot);
+        if (!authConfig) {
+          return json(res, 503, {
+            error: 'Temporary login is not configured. Create .html-video/auth.toml from auth.example.toml.',
+          });
+        }
+        const username = typeof body.username === 'string'
+          ? body.username
+          : typeof body.user_id === 'string'
+            ? body.user_id
+            : '';
+        const password = typeof body.password === 'string' ? body.password : '';
+        if (!verifyDevCredentials(authConfig, username, password)) {
+          return json(res, 401, { error: 'Invalid username or password' });
+        }
+        return json(res, 200, {
+          user: {
+            user_id: DEV_AUTH_USERNAME,
+            actor_id: DEV_AUTH_USERNAME,
+            display_name: 'Administrator',
+            source: 'dev-cookie',
+            authenticated: true,
+          },
+        }, {
+          'set-cookie': [
+            makeCookie('hv_user_id', DEV_AUTH_USERNAME),
+            makeCookie('hv_display_name', 'Administrator'),
+            makeCookie('hv_auth', createDevAuthToken(authConfig)),
+          ],
+        });
+      }
+
+      if (url.pathname === '/api/auth/logout' && m === 'POST') {
+        return json(res, 200, {
+          ok: true,
+          user: {
+            user_id: 'local-dev',
+            actor_id: 'local-dev',
+            display_name: 'Local Dev User',
+            source: 'default',
+            authenticated: false,
+          },
+        }, {
+          'set-cookie': [
+            clearCookie('hv_user_id'),
+            clearCookie('hv_display_name'),
+            clearCookie('hv_auth'),
+          ],
+        });
+      }
+
+      if (url.pathname === '/api/dev/persistence-test' && m === 'POST') {
+        const cfg = loadDatabaseConfig(ctx.projectRoot);
+        if (!cfg) {
+          return json(res, 500, {
+            ok: false,
+            error: 'Database config not found or invalid. Create .html-video/database.toml with a [database] section.',
+          });
+        }
+        if (!cfg.enabled) {
+          return json(res, 200, {
+            ok: true,
+            mode: 'mock',
+            config: maskedDatabaseConfig(cfg),
+            note: 'database.enabled is false; PostgreSQL write/read was skipped.',
+          });
+        }
+
+        const handle = ctx.database?.handle && ctx.database.config.sourcePath === cfg.sourcePath
+          ? ctx.database.handle
+          : createPgClient(cfg);
+        const shouldClose = handle !== ctx.database?.handle;
+        try {
+          const repo = new AlbumRepository(handle.db);
+          const now = new Date().toISOString();
+          const id = randomUUID();
+          const sourceProjectId = `dev_persistence_${id.slice(0, 8)}`;
+          const created = await repo.create({
+            id,
+            user_id: 'local-dev',
+            source_project_id: sourceProjectId,
+            title: `Persistence Test ${now}`,
+            description: 'Created by POST /api/dev/persistence-test',
+            status: 'draft',
+            settings: { test_route: '/api/dev/persistence-test', created_at: now },
+            created_by: 'dev-test',
+            updated_by: 'dev-test',
+          });
+          const loaded = await repo.findById('local-dev', created.id);
+          return json(res, 200, {
+            ok: true,
+            mode: 'postgres',
+            config: maskedDatabaseConfig(cfg),
+            created: {
+              id: created.id,
+              source_project_id: created.source_project_id,
+              title: created.title,
+              status: created.status,
+              created_time: created.created_time,
+            },
+            loaded: loaded ? {
+              id: loaded.id,
+              source_project_id: loaded.source_project_id,
+              title: loaded.title,
+              status: loaded.status,
+              created_time: loaded.created_time,
+            } : null,
+          });
+        } catch (err) {
+          return json(res, 500, {
+            ok: false,
+            mode: 'postgres',
+            config: maskedDatabaseConfig(cfg),
+            error: err instanceof Error ? err.message : String(err),
+          });
+        } finally {
+          if (shouldClose) await handle.close().catch(() => {});
+        }
+      }
+
+      if (url.pathname === '/api/dev/page-persistence-test' && m === 'POST') {
+        const cfg = loadDatabaseConfig(ctx.projectRoot);
+        if (!cfg) {
+          return json(res, 500, {
+            ok: false,
+            error: 'Database config not found or invalid. Create .html-video/database.toml with a [database] section.',
+          });
+        }
+        if (!cfg.enabled) {
+          return json(res, 200, {
+            ok: true,
+            mode: 'mock',
+            config: maskedDatabaseConfig(cfg),
+            note: 'database.enabled is false; PostgreSQL write/read was skipped.',
+          });
+        }
+
+        const handle = ctx.database?.handle && ctx.database.config.sourcePath === cfg.sourcePath
+          ? ctx.database.handle
+          : createPgClient(cfg);
+        const shouldClose = handle !== ctx.database?.handle;
+        try {
+          const persistence = new PostgresProjectPersistence({
+            db: handle.db,
+            projectRoot: ctx.projectRoot,
+          });
+          const albums = new AlbumRepository(handle.db);
+          const pages = new AlbumPageRepository(handle.db);
+          const now = new Date().toISOString();
+          const projectId = `dev_page_persistence_${randomUUID().slice(0, 8)}`;
+          const project: Project = {
+            id: projectId,
+            name: `Page Persistence Test ${now}`,
+            intent: 'Dev-only test for ai_album_album_pages persistence.',
+            assets: [],
+            templateId: null,
+            variables: {},
+            preferences: {
+              resolution: { width: 1280, height: 720 },
+              fps: 30,
+              durationTargetSec: 6,
+              format: 'mp4',
+            },
+            status: 'draft',
+            frames: [],
+            createdAt: now,
+            updatedAt: now,
+          };
+          const graph: ContentGraph = {
+            schemaVersion: 1,
+            intent: 'other',
+            synopsis: 'Dev test graph with two album pages.',
+            nodes: [
+              {
+                id: 'intro',
+                kind: 'text',
+                label: 'Intro',
+                frameIntent: 'intro',
+                durationSec: 3,
+                text: 'PostgreSQL page persistence intro',
+              },
+              {
+                id: 'details',
+                kind: 'text',
+                label: 'Details',
+                frameIntent: 'list',
+                durationSec: 3,
+                text: 'raw-html, content-graph, and frame raw-html are stored in ai_album_album_pages',
+              },
+            ],
+            edges: [{ from: 'intro', to: 'details', kind: 'sequence' }],
+          };
+          const rawHtml = `<!doctype html><html><head><meta charset="utf-8"><title>${project.name}</title></head><body><main data-test="raw-html">Raw HTML persisted at ${now}</main></body></html>`;
+          const introFrameHtml = `<!doctype html><html><head><meta charset="utf-8"><title>intro</title></head><body><section data-frame="intro">Intro frame persisted at ${now}</section></body></html>`;
+          const detailsFrameHtml = `<!doctype html><html><head><meta charset="utf-8"><title>details</title></head><body><section data-frame="details">Details frame persisted at ${now}</section></body></html>`;
+
+          await persistence.save(project);
+          const rawWrite = await persistence.writeRawHtml(project.id, rawHtml);
+          const graphWrite = await persistence.writeContentGraph(project.id, graph);
+          const introWrite = await persistence.writeFrameHtml(project.id, 'intro', introFrameHtml, {
+            graphNodeId: 'intro',
+            htmlPath: '',
+            durationSec: 3,
+            order: 0,
+          });
+          const detailsWrite = await persistence.writeFrameHtml(project.id, 'details', detailsFrameHtml, {
+            graphNodeId: 'details',
+            htmlPath: '',
+            durationSec: 3,
+            order: 1,
+          });
+
+          const loadedProject = await persistence.load(project.id);
+          const loadedRawHtml = await persistence.readRawHtml(project.id);
+          const loadedGraph = await persistence.readContentGraph(project.id);
+          const loadedIntroFrameHtml = await persistence.readFrameHtml(project.id, 'intro');
+          const loadedDetailsFrameHtml = await persistence.readFrameHtml(project.id, 'details');
+          const album = await albums.findBySourceProjectId('local-dev', project.id);
+          const pageRows = album ? await pages.listByAlbum('local-dev', album.id) : [];
+
+          return json(res, 200, {
+            ok: true,
+            mode: 'postgres',
+            config: maskedDatabaseConfig(cfg),
+            project: {
+              id: loadedProject.id,
+              name: loadedProject.name,
+              status: loadedProject.status,
+              content_graph_path: loadedProject.contentGraphPath ?? null,
+              frames: (loadedProject.frames ?? []).map((frame) => ({
+                graph_node_id: frame.graphNodeId,
+                order: frame.order,
+                duration_sec: frame.durationSec,
+                html_path: frame.htmlPath,
+              })),
+            },
+            writes: {
+              raw_html_path: rawWrite.htmlPath,
+              content_graph_path: graphWrite.graphPath,
+              intro_frame_path: introWrite.frame.htmlPath,
+              details_frame_path: detailsWrite.frame.htmlPath,
+            },
+            reads: {
+              raw_html: loadedRawHtml,
+              content_graph: loadedGraph,
+              frame_html: {
+                intro: loadedIntroFrameHtml,
+                details: loadedDetailsFrameHtml,
+              },
+            },
+            database: {
+              album: album ? {
+                id: album.id,
+                source_project_id: album.source_project_id,
+                title: album.title,
+                status: album.status,
+                page_count: album.page_count,
+              } : null,
+              pages: pageRows.map((page) => ({
+                id: page.id,
+                node_id: page.node_id,
+                page_no: page.page_no,
+                title: page.title,
+                status: page.status,
+                duration_ms: page.duration_ms,
+                has_raw_html: Boolean(page.raw_html),
+                content_keys: Object.keys(page.content),
+              })),
+            },
+          });
+        } catch (err) {
+          return json(res, 500, {
+            ok: false,
+            mode: 'postgres',
+            config: maskedDatabaseConfig(cfg),
+            error: err instanceof Error ? err.message : String(err),
+          });
+        } finally {
+          if (shouldClose) await handle.close().catch(() => {});
+        }
+      }
+
+      if (url.pathname === '/api/dev/oss-asset-test' && m === 'POST') {
+        const dbCfg = loadDatabaseConfig(ctx.projectRoot);
+        if (!dbCfg) {
+          return json(res, 500, {
+            ok: false,
+            error: 'Database config not found or invalid. Create .html-video/database.toml with a [database] section.',
+          });
+        }
+        if (!dbCfg.enabled) {
+          return json(res, 200, {
+            ok: true,
+            mode: 'mock',
+            database_config: maskedDatabaseConfig(dbCfg),
+            note: 'database.enabled is false; OSS upload and asset DB write were skipped.',
+          });
+        }
+
+        const ossCfg = loadOssConfig(ctx.projectRoot);
+        if (!ossCfg) {
+          return json(res, 500, {
+            ok: false,
+            error: 'OSS config not found or invalid. Create .html-video/oss.toml from .html-video/oss.example.toml.',
+          });
+        }
+        if (!ossCfg.enabled) {
+          return json(res, 200, {
+            ok: true,
+            mode: 'mock',
+            database_config: maskedDatabaseConfig(dbCfg),
+            oss_config: maskedOssConfig(ossCfg),
+            note: 'oss.enabled is false; OSS upload and asset DB write were skipped.',
+          });
+        }
+
+        const handle = ctx.database?.handle && ctx.database.config.sourcePath === dbCfg.sourcePath
+          ? ctx.database.handle
+          : createPgClient(dbCfg);
+        const shouldClose = handle !== ctx.database?.handle;
+        try {
+          const upload = await readDevOssTestUpload(req);
+          const objectId = randomUUID();
+          const ossKey = [
+            ossCfg.prefix,
+            'asset-persistence-test',
+            objectId,
+            safeOssFileName(upload.fileName),
+          ].filter(Boolean).join('/');
+          const uploaded = await uploadToAliyunOss(ossCfg, {
+            key: ossKey,
+            body: upload.body,
+            contentType: upload.mimeType,
+          });
+
+          const repo = new AssetRepository(handle.db);
+          const checksumSha256 = createHash('sha256').update(upload.body).digest('hex');
+          const created = await repo.create({
+            id: objectId,
+            user_id: 'local-dev',
+            asset_type: assetTypeFromMime(upload.mimeType),
+            usage_type: 'source',
+            source: 'upload',
+            status: 'available',
+            oss_bucket: uploaded.bucket,
+            oss_key: uploaded.key,
+            url: uploaded.url,
+            file_name: upload.fileName,
+            mime_type: upload.mimeType,
+            file_ext: extname(upload.fileName) || null,
+            file_size_bytes: upload.body.byteLength,
+            checksum_sha256: checksumSha256,
+            metadata: {
+              test_route: '/api/dev/oss-asset-test',
+              uploaded_at: new Date().toISOString(),
+              oss_etag: uploaded.etag,
+            },
+            created_by: 'dev-test',
+            updated_by: 'dev-test',
+          });
+          const loaded = await repo.findById('local-dev', created.id);
+
+          return json(res, 200, {
+            ok: true,
+            mode: 'postgres',
+            database_config: maskedDatabaseConfig(dbCfg),
+            oss_config: maskedOssConfig(ossCfg),
+            uploaded: {
+              bucket: uploaded.bucket,
+              key: uploaded.key,
+              url: uploaded.url,
+              etag: uploaded.etag,
+            },
+            created: summarizeAssetRow(created),
+            loaded: loaded ? summarizeAssetRow(loaded) : null,
+          });
+        } catch (err) {
+          return json(res, 500, {
+            ok: false,
+            mode: 'postgres',
+            database_config: maskedDatabaseConfig(dbCfg),
+            oss_config: maskedOssConfig(ossCfg),
+            error: err instanceof Error ? err.message : String(err),
+          });
+        } finally {
+          if (shouldClose) await handle.close().catch(() => {});
+        }
+      }
+
+      const albumHealthMatch = url.pathname.match(/^\/api\/dev\/album-persistence-health\/([^/]+)$/);
+      if (albumHealthMatch && albumHealthMatch[1] && m === 'GET') {
+        const cfg = loadDatabaseConfig(ctx.projectRoot);
+        if (!cfg) {
+          return json(res, 500, {
+            ok: false,
+            error: 'Database config not found or invalid. Create .html-video/database.toml with a [database] section.',
+          });
+        }
+        if (!cfg.enabled) {
+          return json(res, 200, {
+            ok: true,
+            mode: 'mock',
+            config: maskedDatabaseConfig(cfg),
+            note: 'database.enabled is false; PostgreSQL health check was skipped.',
+          });
+        }
+
+        const handle = ctx.database?.handle && ctx.database.config.sourcePath === cfg.sourcePath
+          ? ctx.database.handle
+          : createPgClient(cfg);
+        const shouldClose = handle !== ctx.database?.handle;
+        try {
+          const projectId = decodeURIComponent(albumHealthMatch[1]);
+          const albums = new AlbumRepository(handle.db);
+          const album = await findProjectAlbum(albums, projectId);
+          if (!album) {
+            return json(res, 404, {
+              ok: false,
+              mode: 'postgres',
+              config: maskedDatabaseConfig(cfg),
+              error: `Album/project ${projectId} not found`,
+            });
+          }
+
+          const pages = await new AlbumPageRepository(handle.db)
+            .listByAlbum('local-dev', album.id, { includeDeleted: true });
+          const assets = await new AssetRepository(handle.db)
+            .listByAlbum('local-dev', album.id, { includeDeleted: true });
+          const contentGraphInSettings = isRecordValue(album.settings.content_graph);
+          const contentGraphInPages = pages.some((page) => isRecordValue(page.content.graph_node));
+          const rawHtmlPages = pages.filter((page) => Boolean(page.raw_html));
+
+          return json(res, 200, {
+            ok: true,
+            mode: 'postgres',
+            config: maskedDatabaseConfig(cfg),
+            album: {
+              id: album.id,
+              source_project_id: album.source_project_id,
+              user_id: album.user_id,
+              title: album.title,
+              status: album.status,
+              page_count: album.page_count,
+              duration_ms: album.duration_ms,
+              created_time: album.created_time,
+              updated_time: album.updated_time,
+            },
+            pages: {
+              count: pages.length,
+              active_count: pages.filter((page) => page.status !== 'deleted').length,
+              raw_html_count: rawHtmlPages.length,
+              has_raw_html: rawHtmlPages.length > 0,
+              has_content_graph: contentGraphInSettings || contentGraphInPages,
+              content_graph_source: contentGraphInSettings
+                ? 'album_settings'
+                : contentGraphInPages
+                  ? 'album_pages'
+                  : null,
+              items: pages.map((page) => ({
+                id: page.id,
+                node_id: page.node_id,
+                page_no: page.page_no,
+                title: page.title,
+                status: page.status,
+                has_raw_html: Boolean(page.raw_html),
+                raw_html_bytes: page.raw_html ? Buffer.byteLength(page.raw_html, 'utf8') : 0,
+                has_graph_node: isRecordValue(page.content.graph_node),
+                content_keys: Object.keys(page.content),
+                updated_time: page.updated_time,
+              })),
+            },
+            assets: {
+              count: assets.length,
+              active_count: assets.filter((asset) => asset.status !== 'deleted').length,
+              status_counts: countAssetsByStatus(assets),
+              items: assets.map((asset) => ({
+                id: asset.id,
+                asset_type: asset.asset_type,
+                usage_type: asset.usage_type,
+                source: asset.source,
+                status: asset.status,
+                oss_bucket: asset.oss_bucket,
+                oss_key: asset.oss_key,
+                has_url: Boolean(asset.url),
+                file_name: asset.file_name,
+                mime_type: asset.mime_type,
+                file_size_bytes: asset.file_size_bytes,
+                updated_time: asset.updated_time,
+              })),
+            },
+          });
+        } catch (err) {
+          return json(res, 500, {
+            ok: false,
+            mode: 'postgres',
+            config: maskedDatabaseConfig(cfg),
+            error: err instanceof Error ? err.message : String(err),
+          });
+        } finally {
+          if (shouldClose) await handle.close().catch(() => {});
+        }
+      }
+
       // List projects
       if (url.pathname === '/api/projects' && m === 'GET') {
         const list = await ctx.orchestrator.list();
@@ -77,6 +619,45 @@ export async function startStudioServer(ctx: CliContext, port: number): Promise<
           preferences: (body.preferences as Record<string, unknown>) ?? {},
         });
         return json(res, 200, { project });
+      }
+
+      const projectExportJobsMatch = url.pathname.match(/^\/api\/projects\/([^/]+)\/export-jobs$/);
+      if (projectExportJobsMatch && projectExportJobsMatch[1] && m === 'GET') {
+        if (ctx.database?.mode !== 'postgres' || !ctx.database.handle) {
+          return json(res, 503, {
+            error: 'PostgreSQL persistence is not enabled; export jobs are unavailable.',
+          });
+        }
+        const projectId = decodeURIComponent(projectExportJobsMatch[1]);
+        const albums = new AlbumRepository(ctx.database.handle.db);
+        const album = await findProjectAlbum(albums, projectId);
+        if (!album || album.status === 'deleted') {
+          return json(res, 404, { error: `Project ${projectId} not found` });
+        }
+        const limit = clampInteger(url.searchParams.get('limit'), 1, 100, 50);
+        const offset = clampInteger(url.searchParams.get('offset'), 0, 100_000, 0);
+        const jobs = await new ExportJobRepository(ctx.database.handle.db)
+          .listByAlbum('local-dev', album.id, { limit, offset });
+        return json(res, 200, {
+          project_id: projectId,
+          album_id: album.id,
+          jobs: jobs.map(exportJobResponse),
+          pagination: { limit, offset, count: jobs.length },
+        });
+      }
+
+      const exportJobMatch = url.pathname.match(/^\/api\/export-jobs\/([^/]+)$/);
+      if (exportJobMatch && exportJobMatch[1] && m === 'GET') {
+        if (ctx.database?.mode !== 'postgres' || !ctx.database.handle) {
+          return json(res, 503, {
+            error: 'PostgreSQL persistence is not enabled; export jobs are unavailable.',
+          });
+        }
+        const jobId = decodeURIComponent(exportJobMatch[1]);
+        const job = await new ExportJobRepository(ctx.database.handle.db)
+          .findById('local-dev', jobId);
+        if (!job) return json(res, 404, { error: `Export job ${jobId} not found` });
+        return json(res, 200, { job: exportJobResponse(job) });
       }
 
       // Get / update / delete single project
@@ -147,7 +728,11 @@ export async function startStudioServer(ctx: CliContext, port: number): Promise<
         if (ct.startsWith('multipart/form-data')) {
           // Save uploaded file to /tmp then add
           const saved = await receiveMultipartFile(req, ct);
-          project = await ctx.orchestrator.addFileAsset(id, saved.filePath);
+          if (shouldPersistUploadedAssetsToOss(ctx)) {
+            project = await addFileAssetToOss(ctx, id, saved.filePath, saved.filename);
+          } else {
+            project = await ctx.orchestrator.addFileAsset(id, saved.filePath);
+          }
         } else {
           const body = await readBody(req);
           if (body.kind === 'text') {
@@ -165,7 +750,11 @@ export async function startStudioServer(ctx: CliContext, port: number): Promise<
               body.caption as string | undefined,
             );
           } else if (body.kind === 'file' && body.path) {
-            project = await ctx.orchestrator.addFileAsset(id, body.path as string);
+            if (shouldPersistUploadedAssetsToOss(ctx)) {
+              project = await addFileAssetToOss(ctx, id, body.path as string);
+            } else {
+              project = await ctx.orchestrator.addFileAsset(id, body.path as string);
+            }
           } else {
             return json(res, 400, { error: 'Provide kind=text|data|file with content/path' });
           }
@@ -177,6 +766,7 @@ export async function startStudioServer(ctx: CliContext, port: number): Promise<
       const rmAssetMatch = url.pathname.match(/^\/api\/projects\/([^/]+)\/assets\/([^/]+)$/);
       if (rmAssetMatch && rmAssetMatch[1] && rmAssetMatch[2] && m === 'DELETE') {
         const project = await ctx.orchestrator.removeAsset(rmAssetMatch[1], rmAssetMatch[2]);
+        await softDeleteAssetInPostgres(ctx, rmAssetMatch[2]);
         return json(res, 200, { project });
       }
 
@@ -233,12 +823,32 @@ export async function startStudioServer(ctx: CliContext, port: number): Promise<
       // Get raw preview HTML (frontend reads to parse data-hv-text nodes)
       const rawGetMatch = url.pathname.match(/^\/api\/projects\/([^/]+)\/raw-html$/);
       if (rawGetMatch && rawGetMatch[1] && m === 'GET') {
-        const project = await ctx.orchestrator.load(rawGetMatch[1]);
-        if (!project.lastPreviewHtmlPath || !existsSync(project.lastPreviewHtmlPath)) {
+        const html = await ctx.orchestrator.readRawHtml(rawGetMatch[1]);
+        if (!html) {
           return json(res, 404, { error: 'No preview HTML yet — pick a template or send a chat first' });
         }
-        const html = await readFile(project.lastPreviewHtmlPath, 'utf8');
         res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8' });
+        res.end(html);
+        return;
+      }
+
+      // Download the latest preview as a standalone HTML deliverable. This is
+      // useful for interactive outputs such as electronic albums, where the
+      // HTML itself is the thing to share rather than an MP4 recording.
+      const htmlExportMatch = url.pathname.match(/^\/api\/projects\/([^/]+)\/export-html$/);
+      if (htmlExportMatch && htmlExportMatch[1] && m === 'GET') {
+        const project = await ctx.orchestrator.load(htmlExportMatch[1]);
+        const html = await ctx.orchestrator.readRawHtml(htmlExportMatch[1]);
+        if (!html) {
+          return json(res, 404, { error: 'No preview HTML yet - pick a template or send a chat first' });
+        }
+        const safeName = sanitizeDownloadName(project.name || project.id || 'album');
+        res.writeHead(200, {
+          'content-type': MIME['.html']!,
+          'content-disposition': contentDispositionForHtml(safeName),
+          'cache-control': 'no-store, no-cache, must-revalidate',
+          pragma: 'no-cache',
+        });
         res.end(html);
         return;
       }
@@ -269,12 +879,10 @@ export async function startStudioServer(ctx: CliContext, port: number): Promise<
         const projId = frameRawMatch[1];
         const nodeId = frameRawMatch[2];
         if (m === 'GET') {
-          const project = await ctx.orchestrator.load(projId);
-          const frame = (project.frames ?? []).find((f) => f.graphNodeId === nodeId);
-          if (!frame || !existsSync(frame.htmlPath)) {
+          const html = await ctx.orchestrator.readFrameHtml(projId, nodeId);
+          if (!html) {
             return json(res, 404, { error: `Frame ${nodeId} not found` });
           }
-          const html = await readFile(frame.htmlPath, 'utf8');
           res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8' });
           res.end(html);
           return;
@@ -367,13 +975,33 @@ export async function startStudioServer(ctx: CliContext, port: number): Promise<
         // The studio uses the SSE branch by default. A plain POST (curl /
         // tests) gets the legacy blocking response.
         const wantsStream = (req.headers.accept ?? '').includes('text/event-stream');
+        const exportTracker = ExportJobTracker.fromContext(ctx);
+        let exportJob = null;
+        try {
+          const project = await ctx.orchestrator.load(projectId);
+          exportJob = await exportTracker?.start(project, wantsStream) ?? null;
+        } catch {
+          // The existing export path reports project lookup/render errors.
+        }
         if (!wantsStream) {
           try {
-            const { project, outputPath } = await ctx.orchestrator.exportMp4({ projectId });
-            return json(res, 200, { project, output_path: outputPath });
+            const { project, outputPath } = await ctx.orchestrator.exportMp4({
+              projectId,
+              onProgress: (pct, stage) => exportTracker?.progress(exportJob, pct, stage),
+            });
+            await exportTracker?.succeed(exportJob, outputPath);
+            return json(res, 200, {
+              project,
+              output_path: outputPath,
+              ...(exportJob && { job_id: exportJob.id }),
+            });
           } catch (err) {
+            await exportTracker?.fail(exportJob, err);
             const msg = err instanceof Error ? err.message : String(err);
-            return json(res, 500, { error: msg });
+            return json(res, 500, {
+              error: msg,
+              ...(exportJob && { job_id: exportJob.id }),
+            });
           }
         }
         res.writeHead(200, {
@@ -387,22 +1015,38 @@ export async function startStudioServer(ctx: CliContext, port: number): Promise<
         };
         const t0 = Date.now();
         try {
-          sse({ type: 'export_started' });
+          sse({
+            type: 'export_started',
+            ...(exportJob && { job_id: exportJob.id }),
+          });
           const { project, outputPath } = await ctx.orchestrator.exportMp4({
             projectId,
             onProgress: (pct, stage) => {
+              exportTracker?.progress(exportJob, pct, stage);
               sse({ type: 'export_progress', pct, stage });
             },
           });
+          await exportTracker?.succeed(exportJob, outputPath);
           const ms = Date.now() - t0;
           process.stderr.write(
             `[studio:export] proj=${projectId} done in ${ms}ms → ${outputPath}\n`,
           );
-          sse({ type: 'export_done', output_path: outputPath, project, elapsed_ms: ms });
+          sse({
+            type: 'export_done',
+            output_path: outputPath,
+            project,
+            elapsed_ms: ms,
+            ...(exportJob && { job_id: exportJob.id }),
+          });
         } catch (err) {
+          await exportTracker?.fail(exportJob, err);
           const msg = err instanceof Error ? err.message : String(err);
           process.stderr.write(`[studio:export] proj=${projectId} failed: ${msg}\n`);
-          sse({ type: 'export_failed', message: msg });
+          sse({
+            type: 'export_failed',
+            message: msg,
+            ...(exportJob && { job_id: exportJob.id }),
+          });
         }
         res.end();
         return;
@@ -448,6 +1092,8 @@ export async function startStudioServer(ctx: CliContext, port: number): Promise<
           const soundtrack = { ...(project.soundtrack ?? {}) };
           const wantMusic = !!body.music?.prompt?.trim();
           const wantNarration = !!body.narration?.text?.trim();
+          const aiLogger = AiGenerationLogger.fromContext(ctx);
+          const operationId = randomUUID();
           if (!wantMusic && !wantNarration) {
             sse({ type: 'audio_failed', message: 'Nothing to generate — provide a music prompt and/or narration text.' });
             res.end();
@@ -456,42 +1102,101 @@ export async function startStudioServer(ctx: CliContext, port: number): Promise<
 
           if (wantMusic) {
             sse({ type: 'audio_progress', stage: 'music', message: 'generating background music…' });
-            const music = await generateMusic({
-              prompt: body.music!.prompt!.trim(),
-              instrumental: body.music!.instrumental ?? true,
-              creds,
-            });
-            const { asset } = await ctx.orchestrator.addBufferAsset(
+            const prompt = body.music!.prompt!.trim();
+            const musicLog = await aiLogger?.start({
               projectId,
-              music.bytes,
-              music.ext,
-              `background music · ${body.music!.prompt!.trim().slice(0, 60)}`,
-            );
-            soundtrack.musicAssetId = asset.id;
-            soundtrack.musicPrompt = body.music!.prompt!.trim();
-            if (body.music!.volumeDb !== undefined) soundtrack.musicVolumeDb = body.music!.volumeDb;
-            sse({ type: 'audio_progress', stage: 'music', message: music.providerNote, asset_id: asset.id });
+              generationType: 'music',
+              provider: 'minimax',
+              model: 'music-1.5',
+              prompt,
+              operationId,
+              attempt: 1,
+              requestPayload: {
+                operation: 'generate_background_music',
+                instrumental: body.music!.instrumental ?? true,
+              },
+            }) ?? null;
+            try {
+              const music = await generateMusic({
+                prompt,
+                instrumental: body.music!.instrumental ?? true,
+                creds,
+              });
+              const { asset } = await ctx.orchestrator.addBufferAsset(
+                projectId,
+                music.bytes,
+                music.ext,
+                `background music · ${prompt.slice(0, 60)}`,
+              );
+              soundtrack.musicAssetId = asset.id;
+              soundtrack.musicPrompt = prompt;
+              if (body.music!.volumeDb !== undefined) soundtrack.musicVolumeDb = body.music!.volumeDb;
+              await aiLogger?.succeed(musicLog, {
+                responsePayload: {
+                  project_asset_id: asset.id,
+                  file_size_bytes: music.bytes.length,
+                  file_ext: music.ext,
+                  provider_note: music.providerNote,
+                },
+              });
+              sse({ type: 'audio_progress', stage: 'music', message: music.providerNote, asset_id: asset.id });
+            } catch (error) {
+              await aiLogger?.fail(musicLog, error);
+              throw error;
+            }
           }
 
           if (wantNarration) {
             sse({ type: 'audio_progress', stage: 'narration', message: 'generating narration…' });
-            const nar = await generateTts({
-              text: body.narration!.text!.trim(),
-              ...(body.narration!.voiceId !== undefined && { voiceId: body.narration!.voiceId }),
-              ...(body.narration!.languageBoost !== undefined && { languageBoost: body.narration!.languageBoost }),
-              creds,
-            });
-            const { asset } = await ctx.orchestrator.addBufferAsset(
+            const text = body.narration!.text!.trim();
+            const narrationLog = await aiLogger?.start({
               projectId,
-              nar.bytes,
-              nar.ext,
-              `narration · ${body.narration!.text!.trim().slice(0, 60)}`,
-            );
-            soundtrack.narrationAssetId = asset.id;
-            soundtrack.narrationText = body.narration!.text!.trim();
-            if (body.narration!.byFrame) soundtrack.narrationByFrame = body.narration!.byFrame;
-            if (body.narration!.volumeDb !== undefined) soundtrack.narrationVolumeDb = body.narration!.volumeDb;
-            sse({ type: 'audio_progress', stage: 'narration', message: nar.providerNote, asset_id: asset.id });
+              generationType: 'audio',
+              provider: 'minimax',
+              model: 'speech-02-turbo',
+              prompt: text,
+              operationId,
+              attempt: 1,
+              requestPayload: {
+                operation: 'generate_narration_audio',
+                voice_id: body.narration!.voiceId ?? null,
+                language_boost: body.narration!.languageBoost ?? null,
+                frame_count: body.narration!.byFrame
+                  ? Object.keys(body.narration!.byFrame).length
+                  : null,
+              },
+            }) ?? null;
+            try {
+              const nar = await generateTts({
+                text,
+                ...(body.narration!.voiceId !== undefined && { voiceId: body.narration!.voiceId }),
+                ...(body.narration!.languageBoost !== undefined && { languageBoost: body.narration!.languageBoost }),
+                creds,
+              });
+              const { asset } = await ctx.orchestrator.addBufferAsset(
+                projectId,
+                nar.bytes,
+                nar.ext,
+                `narration · ${text.slice(0, 60)}`,
+              );
+              soundtrack.narrationAssetId = asset.id;
+              soundtrack.narrationText = text;
+              if (body.narration!.byFrame) soundtrack.narrationByFrame = body.narration!.byFrame;
+              if (body.narration!.volumeDb !== undefined) soundtrack.narrationVolumeDb = body.narration!.volumeDb;
+              await aiLogger?.succeed(narrationLog, {
+                responsePayload: {
+                  project_asset_id: asset.id,
+                  file_size_bytes: nar.bytes.length,
+                  file_ext: nar.ext,
+                  duration_sec: nar.durationSec ?? null,
+                  provider_note: nar.providerNote,
+                },
+              });
+              sse({ type: 'audio_progress', stage: 'narration', message: nar.providerNote, asset_id: asset.id });
+            } catch (error) {
+              await aiLogger?.fail(narrationLog, error);
+              throw error;
+            }
           }
 
           if (body.fadeInSec !== undefined) soundtrack.fadeInSec = body.fadeInSec;
@@ -538,6 +1243,7 @@ export async function startStudioServer(ctx: CliContext, port: number): Promise<
           const frameLines = allFrames.map((f) => `${f.idx + 1}. ${f.text}`).join('\n');
 
           const narrationByFrame: Record<string, string> = {};
+          const operationId = randomUUID();
 
           if (body.frameId) {
             // ---- single frame: narrate just this one, with the rest as context ----
@@ -554,7 +1260,15 @@ export async function startStudioServer(ctx: CliContext, port: number): Promise<
               `Write ONE short spoken sentence narrating frame ${target.idx + 1} ("${target.text}") specifically — distinct, not generic.`,
               `Same language as the frame text. Plain text only: just the sentence, no numbering, quotes, or markdown.`,
             ].filter((l) => l !== undefined).join('\n');
-            const raw = (await callAgentSimple(agentDef, prompt, projectDir)).trim();
+            const raw = (await callAgentSimple(agentDef, prompt, projectDir, undefined, {
+              ctx,
+              projectId,
+              generationType: 'narration',
+              operationId,
+              attempt: 1,
+              pageNodeId: target.id,
+              requestPayload: { operation: 'draft_narration', scope: 'frame' },
+            })).trim();
             const line = raw.split('\n').map((l) => l.replace(/^\s*(?:\d+[.)、]|[-*•])\s*/, '').trim()).find((l) => l.length > 0) ?? raw;
             narrationByFrame[target.id] = line;
           } else {
@@ -573,7 +1287,14 @@ export async function startStudioServer(ctx: CliContext, port: number): Promise<
               `- The lines should still flow as a continuous voiceover read top to bottom.`,
               `- Same language as the frame text. Plain text only: one sentence per line, no numbering, bullets, blank lines, or markdown.`,
             ].filter((l) => l !== undefined).join('\n');
-            const raw = (await callAgentSimple(agentDef, prompt, projectDir)).trim();
+            const raw = (await callAgentSimple(agentDef, prompt, projectDir, undefined, {
+              ctx,
+              projectId,
+              generationType: 'narration',
+              operationId,
+              attempt: 1,
+              requestPayload: { operation: 'draft_narration', scope: 'album' },
+            })).trim();
             const lines = raw.split('\n').map((l) => l.replace(/^\s*(?:\d+[.)、]|[-*•])\s*/, '').trim()).filter((l) => l.length > 0);
             // Map lines onto frames positionally; if the model under/over-produced,
             // pair as far as they line up and leave the rest blank.
@@ -936,6 +1657,7 @@ export async function startStudioServer(ctx: CliContext, port: number): Promise<
           focusFrameId,
         );
         const t0 = Date.now();
+        const operationId = randomUUID();
         // Save the prompt next to the project so we can inspect what we sent.
         // Also dump the previous one as .prev for diffing across turns.
         const promptDumpPath = join(projectDir, 'last-prompt.txt');
@@ -982,8 +1704,11 @@ export async function startStudioServer(ctx: CliContext, port: number): Promise<
         // to emit a graph and 4-6 full HTML pages in a single response. Each
         // call individually is reliable, so we orchestrate them ourselves and
         // stream progress events to the UI.
+        const routePickedType = phaseInfo.inputs.pickedType ?? lastCardPickByPhase(history, 'type') ?? '';
+        const isAlbumGenerate = isAlbumType(routePickedType) || project.templateId === 'album-scroll-story';
         const isMultiGenerate =
           phaseInfo.phase === 'generate' &&
+          !isAlbumGenerate &&
           Number(phaseInfo.inputs.collected?.frame_count ?? '1') > 1;
 
         // Post-generation iteration: the card-driven sub-flow resolved to a
@@ -1048,6 +1773,7 @@ export async function startStudioServer(ctx: CliContext, port: number): Promise<
               attachments,
               openingTopic: resolveOpeningTopic(project, history),
               restyleOnly,
+              operationId,
               onProgress: (msg) => {
                 assistantText += msg + '\n';
                 textChunks += 1;
@@ -1072,13 +1798,36 @@ export async function startStudioServer(ctx: CliContext, port: number): Promise<
           );
         } else {
           // ---- single-shot path (all other phases + single-frame generate) ----
-          const handle = spawnAgent({
-            def: agentDef,
-            prompt: fullPrompt,
-            context: { cwd: projectDir, ...(agentModel && { model: agentModel }) },
+          const htmlPhases = new Set(['generate', 'iterate', 'restyle', 'iterate-content', 'iterate-format']);
+          let successfulMainLog: AiGenerationLogHandle | null = null;
+          let successfulMainOutput = '';
+          const primaryText = await callAgentSimple(agentDef, fullPrompt, projectDir, agentModel, {
+            ctx,
+            projectId: id,
+            generationType: htmlPhases.has(phaseInfo.phase) ? 'page_html' : 'page_copy',
+            operationId,
+            attempt: 1,
+            ...(focusFrameId && { pageNodeId: focusFrameId }),
+            requestPayload: {
+              operation: 'studio_message',
+              phase: phaseInfo.phase,
+              attachment_count: attachments.length,
+              focused_frame: focusFrameId || null,
+            },
+            ...(htmlPhases.has(phaseInfo.phase) && {
+              validateOutput: (output: string) => (
+                extractHtmlDocument(output) || extractContentGraphAndFrames(output)
+                  ? null
+                  : 'Agent response did not contain valid HTML'
+              ),
+              invalidOutputCode: 'invalid_html',
+            }),
+            onSucceeded: (handle, output) => {
+              successfulMainLog = handle;
+              successfulMainOutput = output;
+            },
             onEvent: (ev) => {
               if (ev.type === 'text') {
-                assistantText += ev.chunk;
                 textChunks += 1;
                 sseWrite(ev);
               } else if (ev.type === 'error' || ev.type === 'message_end') {
@@ -1089,10 +1838,10 @@ export async function startStudioServer(ctx: CliContext, port: number): Promise<
               }
             },
           });
-          const exitInfo = await handle.done;
+          assistantText += primaryText;
           const elapsedMs = Date.now() - t0;
           process.stderr.write(
-            `[studio:msg] proj=${id} phase=${phaseInfo.phase} done in ${elapsedMs}ms exit=${exitInfo.exitCode} text=${assistantText.length}B chunks=${textChunks}\n`,
+            `[studio:msg] proj=${id} phase=${phaseInfo.phase} done in ${elapsedMs}ms text=${assistantText.length}B chunks=${textChunks}\n`,
           );
 
           // Empty-reply retry: if the agent returned almost nothing AND we
@@ -1116,14 +1865,29 @@ export async function startStudioServer(ctx: CliContext, port: number): Promise<
               ``,
               `Begin reply with \`\`\`html. Tag visible text with data-hv-text. No prose outside the block.`,
             ].filter(Boolean).join('\n');
-            let retryText = '';
-            const retryHandle = spawnAgent({
-              def: agentDef,
-              prompt: retryPrompt,
-              context: { cwd: projectDir },
+            const retryText = await callAgentSimple(agentDef, retryPrompt, projectDir, agentModel, {
+              ctx,
+              projectId: id,
+              generationType: 'page_html',
+              operationId,
+              attempt: 2,
+              ...(focusFrameId && { pageNodeId: focusFrameId }),
+              requestPayload: {
+                operation: 'studio_message',
+                phase: phaseInfo.phase,
+                retry_reason: 'empty_response',
+                focused_frame: focusFrameId || null,
+              },
+              validateOutput: (output) => (
+                extractHtmlDocument(output) ? null : 'Agent retry did not contain valid HTML'
+              ),
+              invalidOutputCode: 'invalid_html',
+              onSucceeded: (handle, output) => {
+                successfulMainLog = handle;
+                successfulMainOutput = output;
+              },
               onEvent: (ev) => {
                 if (ev.type === 'text') {
-                  retryText += ev.chunk;
                   textChunks += 1;
                   sseWrite(ev);
                 } else if (ev.type === 'error' || ev.type === 'message_end') {
@@ -1131,7 +1895,6 @@ export async function startStudioServer(ctx: CliContext, port: number): Promise<
                 }
               },
             });
-            await retryHandle.done;
             assistantText += retryText;
             process.stderr.write(
               `[studio:msg] proj=${id} retry done text=${retryText.length}B\n`,
@@ -1144,7 +1907,7 @@ export async function startStudioServer(ctx: CliContext, port: number): Promise<
             const extracted = extractHtmlDocument(assistantText);
             if (extracted) {
               try {
-                await ctx.orchestrator.writeFrameHtml(id, focusFrameId, extracted);
+                await ctx.orchestrator.writeFrameHtml(id, focusFrameId, isAlbumGenerate ? hardenAlbumHtml(extracted) : extracted);
                 sseWrite({ type: 'preview_ready', preview_url: `/preview/${id}`, focused_frame: focusFrameId });
                 summaryLine = `✓ frame ${focusFrameId} updated`;
               } catch (err) {
@@ -1171,11 +1934,20 @@ export async function startStudioServer(ctx: CliContext, port: number): Promise<
             } else {
               const extracted = extractHtmlDocument(assistantText);
               if (extracted) {
-                await ctx.orchestrator.writePreviewHtmlRaw(id, extracted);
+                await ctx.orchestrator.writePreviewHtmlRaw(id, isAlbumGenerate ? hardenAlbumHtml(extracted) : extracted);
                 sseWrite({ type: 'preview_ready', preview_url: `/preview/${id}` });
                 summaryLine = '✓ updated the HTML preview';
               }
             }
+          }
+          const persistedPageNodeId = focusFrameId
+            || (summaryLine === '✓ updated the HTML preview' ? 'preview' : '');
+          if (successfulMainLog && persistedPageNodeId) {
+            await AiGenerationLogger.fromContext(ctx)?.succeed(successfulMainLog, {
+              output: successfulMainOutput,
+              pageNodeId: persistedPageNodeId,
+              responsePayload: { persisted: true },
+            });
           }
         }
 
@@ -1187,13 +1959,19 @@ export async function startStudioServer(ctx: CliContext, port: number): Promise<
         if (phaseInfo.phase === 'content' && !/<!--\s*hv-phase:content-question\s*-->/i.test(assistantText)) {
           const autoPickedType = lastCardPickByPhase(history, 'type') ?? phaseInfo.inputs.pickedType ?? '';
           const stylePrompt = buildStylePhasePrompt(autoPickedType);
-          const styleHandle = spawnAgent({
-            def: agentDef,
-            prompt: stylePrompt,
-            context: { cwd: projectDir, ...(agentModel && { model: agentModel }) },
+          const styleText = await callAgentSimple(agentDef, stylePrompt, projectDir, agentModel, {
+            ctx,
+            projectId: id,
+            generationType: 'page_copy',
+            operationId,
+            attempt: 1,
+            requestPayload: {
+              operation: 'style_auto_advance',
+              phase: 'style',
+              picked_type: autoPickedType,
+            },
             onEvent: (ev) => {
               if (ev.type === 'text') {
-                assistantText += ev.chunk;
                 textChunks += 1;
                 sseWrite(ev);
               } else if (ev.type === 'error') {
@@ -1201,7 +1979,7 @@ export async function startStudioServer(ctx: CliContext, port: number): Promise<
               }
             },
           });
-          await styleHandle.done;
+          assistantText += styleText;
         }
 
         // Persist assistant message — strip the html / graph blocks when present (UI sees summary line)
@@ -1388,7 +2166,9 @@ export async function startStudioServer(ctx: CliContext, port: number): Promise<
           return res.end('missing ?path');
         }
         const safe = resolve(p);
-        if (!safe.includes('/.html-video/projects/')) {
+        const projectRoot = resolve(ctx.projectRoot);
+        const insideProjectRoot = safe === projectRoot || safe.startsWith(projectRoot + '\\') || safe.startsWith(projectRoot + '/');
+        if (!insideProjectRoot) {
           res.writeHead(403);
           return res.end('forbidden');
         }
@@ -1452,7 +2232,10 @@ export async function startStudioServer(ctx: CliContext, port: number): Promise<
       resolveFn({
         url: `http://127.0.0.1:${actualPort}`,
         port: actualPort,
-        close: () => server.close(),
+        close: () => {
+          server.close();
+          void ctx.database?.handle?.close().catch(() => {});
+        },
       });
     });
   });
@@ -1462,9 +2245,148 @@ export async function startStudioServer(ctx: CliContext, port: number): Promise<
 // helpers
 // ---------------------------------------------------------------------------
 
-function json(res: ServerResponse, code: number, body: unknown): void {
-  res.writeHead(code, { 'content-type': MIME['.json']! });
+function json(res: ServerResponse, code: number, body: unknown, headers: Record<string, string | string[]> = {}): void {
+  res.writeHead(code, { 'content-type': MIME['.json']!, ...headers });
   res.end(JSON.stringify(body));
+}
+
+function exportJobResponse(job: ExportJobRow): Record<string, unknown> {
+  return {
+    id: job.id,
+    album_id: job.album_id,
+    status: job.status,
+    export_format: job.export_format,
+    render_profile: job.render_profile,
+    width: job.width,
+    height: job.height,
+    fps: job.fps,
+    duration_ms: job.duration_ms,
+    progress_percent: Number(job.progress_percent),
+    attempt_count: job.attempt_count,
+    request_params: job.request_params,
+    local_output_path: job.local_output_path,
+    oss_bucket: job.oss_bucket,
+    oss_key: job.oss_key,
+    output_url: job.output_url,
+    file_size_bytes: job.file_size_bytes,
+    checksum_sha256: job.checksum_sha256,
+    error_code: job.error_code,
+    error_message: job.error_message,
+    queued_time: job.queued_time,
+    started_time: job.started_time,
+    finished_time: job.finished_time,
+    created_time: job.created_time,
+    updated_time: job.updated_time,
+  };
+}
+
+function clampInteger(value: string | null, min: number, max: number, fallback: number): number {
+  if (value === null || !/^\d+$/.test(value)) return fallback;
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) ? Math.max(min, Math.min(max, parsed)) : fallback;
+}
+
+function getRequestUser(req: IncomingMessage, authConfig: AuthConfig | null): {
+  user_id: string;
+  actor_id: string;
+  display_name: string;
+  source: 'header' | 'cookie' | 'default';
+  authenticated: boolean;
+} {
+  const headerUserId = headerValue(req.headers['x-user-id']);
+  const normalizedHeaderUserId = normalizeDevUserId(headerUserId);
+  if (normalizedHeaderUserId) {
+    return {
+      user_id: normalizedHeaderUserId,
+      actor_id: normalizedHeaderUserId,
+      display_name: headerValue(req.headers['x-user-name']) || normalizedHeaderUserId,
+      source: 'header',
+      authenticated: true,
+    };
+  }
+
+  const cookies = parseCookies(req.headers.cookie);
+  const cookieUserId = normalizeDevUserId(cookies.hv_user_id);
+  if (
+    authConfig
+    && cookieUserId === DEV_AUTH_USERNAME
+    && verifyDevAuthToken(authConfig, cookies.hv_auth)
+  ) {
+    return {
+      user_id: cookieUserId,
+      actor_id: cookieUserId,
+      display_name: cookies.hv_display_name || cookieUserId,
+      source: 'cookie',
+      authenticated: true,
+    };
+  }
+
+  return {
+    user_id: 'local-dev',
+    actor_id: 'local-dev',
+    display_name: 'Local Dev User',
+    source: 'default',
+    authenticated: false,
+  };
+}
+
+function headerValue(value: string | string[] | undefined): string {
+  return Array.isArray(value) ? value[0] ?? '' : value ?? '';
+}
+
+function parseCookies(header: string | undefined): Record<string, string> {
+  const out: Record<string, string> = {};
+  if (!header) return out;
+  for (const part of header.split(';')) {
+    const index = part.indexOf('=');
+    if (index === -1) continue;
+    const key = part.slice(0, index).trim();
+    if (!key) continue;
+    const value = part.slice(index + 1).trim();
+    try {
+      out[key] = decodeURIComponent(value);
+    } catch {
+      out[key] = value;
+    }
+  }
+  return out;
+}
+
+function normalizeDevUserId(value: string | undefined): string {
+  const trimmed = (value ?? '').trim();
+  if (!trimmed) return '';
+  const safe = trimmed.replace(/[^A-Za-z0-9_.:@-]/g, '_').slice(0, 64);
+  return safe || '';
+}
+
+function makeCookie(name: string, value: string): string {
+  return `${name}=${encodeURIComponent(value)}; Path=/; HttpOnly; SameSite=Lax`;
+}
+
+function clearCookie(name: string): string {
+  return `${name}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0`;
+}
+
+function sanitizeDownloadName(name: string): string {
+  const safe = name
+    .trim()
+    .replace(/[<>:"/\\|?*\x00-\x1F]/g, '-')
+    .replace(/\s+/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^-|-$/g, '')
+    .slice(0, 80);
+  return safe || 'album';
+}
+
+function contentDispositionForHtml(name: string): string {
+  const utf8Name = `${name}.html`;
+  let asciiName = utf8Name
+    .normalize('NFKD')
+    .replace(/[^\x20-\x7E]/g, '')
+    .replace(/[\\"]/g, '-')
+    .trim();
+  if (!asciiName || asciiName === '.html') asciiName = 'album.html';
+  return `attachment; filename="${asciiName}"; filename*=UTF-8''${encodeURIComponent(utf8Name)}`;
 }
 
 /**
@@ -1625,6 +2547,225 @@ async function readBodyText(req: IncomingMessage): Promise<string> {
     req.on('end', () => resolveFn(data));
     req.on('error', reject);
   });
+}
+
+async function readDevOssTestUpload(req: IncomingMessage): Promise<{
+  body: Buffer;
+  fileName: string;
+  mimeType: string;
+}> {
+  const contentType = req.headers['content-type'] ?? '';
+  if (contentType.startsWith('multipart/form-data')) {
+    const parts = await receiveMultipart(req, contentType);
+    const file = parts.find((p): p is Extract<MultipartPart, { kind: 'file' }> => p.kind === 'file');
+    if (!file) throw new Error('No file field in multipart body');
+    const mimePart = parts.find((p): p is Extract<MultipartPart, { kind: 'field' }> =>
+      p.kind === 'field' && p.name === 'mime_type',
+    );
+    return {
+      body: await readFile(file.tmpPath),
+      fileName: file.filename,
+      mimeType: mimePart?.value || mimeTypeFromFileName(file.filename),
+    };
+  }
+
+  if (contentType.includes('application/json')) {
+    const body = await readBody(req).catch(() => ({} as Record<string, unknown>));
+    const fileName = typeof body.file_name === 'string' && body.file_name.trim()
+      ? body.file_name.trim()
+      : 'oss-asset-test.txt';
+    const mimeType = typeof body.mime_type === 'string' && body.mime_type.trim()
+      ? body.mime_type.trim()
+      : mimeTypeFromFileName(fileName);
+    if (typeof body.content_base64 === 'string' && body.content_base64) {
+      return { body: Buffer.from(body.content_base64, 'base64'), fileName, mimeType };
+    }
+    if (typeof body.content === 'string') {
+      return { body: Buffer.from(body.content, 'utf8'), fileName, mimeType };
+    }
+  }
+
+  const now = new Date().toISOString();
+  return {
+    body: Buffer.from(`html-video OSS asset persistence test\ncreated_at=${now}\n`, 'utf8'),
+    fileName: `oss-asset-test-${now.replace(/[:.]/g, '-')}.txt`,
+    mimeType: 'text/plain; charset=utf-8',
+  };
+}
+
+function shouldPersistUploadedAssetsToOss(ctx: CliContext): boolean {
+  if (ctx.database?.mode !== 'postgres' || !ctx.database.handle) return false;
+  const oss = loadOssConfig(ctx.projectRoot);
+  return Boolean(oss?.enabled);
+}
+
+async function addFileAssetToOss(
+  ctx: CliContext,
+  projectId: string,
+  filePath: string,
+  originalFileName?: string,
+): Promise<Project> {
+  if (!ctx.database?.handle) {
+    throw new Error('PostgreSQL database handle is not available');
+  }
+  if (!existsSync(filePath)) {
+    throw new Error(`Source file not found: ${filePath}`);
+  }
+  const oss = loadOssConfig(ctx.projectRoot);
+  if (!oss?.enabled) {
+    throw new Error('OSS config is not enabled');
+  }
+
+  const project = await ctx.orchestrator.load(projectId);
+  const bytes = await readFile(filePath);
+  const fileName = originalFileName || basename(filePath);
+  const { mime, type } = AssetStore.guessMime(fileName);
+  const objectId = randomUUID();
+  const ossKey = [
+    oss.prefix,
+    'projects',
+    projectId,
+    'assets',
+    objectId,
+    safeOssFileName(fileName),
+  ].filter(Boolean).join('/');
+  const uploaded = await uploadToAliyunOss(oss, {
+    key: ossKey,
+    body: bytes,
+    contentType: mime,
+  });
+
+  const albums = new AlbumRepository(ctx.database.handle.db);
+  const album = await findProjectAlbum(albums, projectId);
+  const checksumSha256 = createHash('sha256').update(bytes).digest('hex');
+  const assets = new AssetRepository(ctx.database.handle.db);
+  const created = await assets.create({
+    id: objectId,
+    user_id: 'local-dev',
+    album_id: album?.id ?? null,
+    asset_type: assetTypeFromMime(mime),
+    usage_type: 'source',
+    source: 'upload',
+    status: 'available',
+    oss_bucket: uploaded.bucket,
+    oss_key: uploaded.key,
+    url: uploaded.url,
+    file_name: fileName,
+    mime_type: mime,
+    file_ext: extname(fileName) || null,
+    file_size_bytes: bytes.byteLength,
+    checksum_sha256: checksumSha256,
+    metadata: {
+      upload_route: '/api/projects/:id/assets',
+      uploaded_at: new Date().toISOString(),
+      oss_etag: uploaded.etag,
+      original_local_path: filePath,
+    },
+    created_by: 'local-dev',
+    updated_by: 'local-dev',
+  });
+
+  const asset: Asset = {
+    id: created.id,
+    type,
+    path: created.url,
+    metadata: {
+      filename: fileName,
+      mimeType: mime,
+      sizeBytes: bytes.byteLength,
+    },
+    userTags: [],
+  };
+  if (!project.assets.find((item) => item.id === asset.id)) {
+    project.assets.push(asset);
+  }
+  project.status = 'draft';
+  await ctx.projects.save(project);
+  return ctx.orchestrator.load(projectId);
+}
+
+async function softDeleteAssetInPostgres(ctx: CliContext, assetId: string): Promise<void> {
+  if (ctx.database?.mode !== 'postgres' || !ctx.database.handle) return;
+  const assets = new AssetRepository(ctx.database.handle.db);
+  await assets.softDelete('local-dev', assetId, 'local-dev');
+}
+
+async function findProjectAlbum(repo: AlbumRepository, projectId: string) {
+  const bySourceProjectId = await repo.findBySourceProjectId('local-dev', projectId);
+  if (bySourceProjectId) return bySourceProjectId;
+  if (!isUuid(projectId)) return null;
+  return repo.findById('local-dev', projectId);
+}
+
+function isUuid(value: string): boolean {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
+}
+
+function summarizeAssetRow(asset: AssetRow): Record<string, unknown> {
+  return {
+    id: asset.id,
+    user_id: asset.user_id,
+    album_id: asset.album_id,
+    page_id: asset.page_id,
+    asset_type: asset.asset_type,
+    usage_type: asset.usage_type,
+    source: asset.source,
+    status: asset.status,
+    oss_bucket: asset.oss_bucket,
+    oss_key: asset.oss_key,
+    url: asset.url,
+    file_name: asset.file_name,
+    mime_type: asset.mime_type,
+    file_ext: asset.file_ext,
+    file_size_bytes: asset.file_size_bytes,
+    checksum_sha256: asset.checksum_sha256,
+    metadata: asset.metadata,
+    created_time: asset.created_time,
+  };
+}
+
+function countAssetsByStatus(assets: AssetRow[]): Record<string, number> {
+  const counts: Record<string, number> = {};
+  for (const asset of assets) {
+    counts[asset.status] = (counts[asset.status] ?? 0) + 1;
+  }
+  return counts;
+}
+
+function isRecordValue(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function assetTypeFromMime(mimeType: string): DbAssetType {
+  if (mimeType.startsWith('image/')) return 'image';
+  if (mimeType.startsWith('video/')) return 'video';
+  if (mimeType.startsWith('audio/')) return 'audio';
+  if (mimeType.includes('json')) return 'data';
+  if (mimeType.startsWith('text/')) return 'text';
+  if (mimeType.includes('font')) return 'font';
+  return 'other';
+}
+
+function mimeTypeFromFileName(fileName: string): string {
+  const ext = extname(fileName).toLowerCase();
+  if (ext === '.png') return 'image/png';
+  if (ext === '.jpg' || ext === '.jpeg') return 'image/jpeg';
+  if (ext === '.webp') return 'image/webp';
+  if (ext === '.gif') return 'image/gif';
+  if (ext === '.svg') return 'image/svg+xml';
+  if (ext === '.mp4') return 'video/mp4';
+  if (ext === '.webm') return 'video/webm';
+  if (ext === '.mp3') return 'audio/mpeg';
+  if (ext === '.wav') return 'audio/wav';
+  if (ext === '.json') return 'application/json';
+  if (ext === '.txt' || ext === '.md') return 'text/plain; charset=utf-8';
+  return 'application/octet-stream';
+}
+
+function safeOssFileName(fileName: string): string {
+  const fallback = 'upload.bin';
+  const base = basename(fileName || fallback).replace(/[\\/:*?"<>|\u0000-\u001f]/g, '_').trim();
+  return base || fallback;
 }
 
 /**
@@ -2365,7 +3506,13 @@ function renderAttachment(a: Attachment): string[] {
       '```',
     ];
   }
-  return [`- [${a.kind}] ${a.filename} — ${a.path}`];
+  const rows = [`- [${a.kind}] ${a.filename} — ${a.path}`];
+  if (a.path && (a.kind === 'image' || a.kind === 'video' || a.kind === 'audio')) {
+    const assetUrl = /^https?:\/\//i.test(a.path) ? a.path : `/asset?path=${encodeURIComponent(a.path)}`;
+    rows.push(`  Browser URL for HTML src/href: ${assetUrl}`);
+    rows.push(`  IMPORTANT: when embedding this asset in generated HTML, use the Browser URL above exactly. Do not use the local filesystem path and do not use only the filename.`);
+  }
+  return rows;
 }
 
 /** A design.md / frame.md / DESIGN.md attachment is a brand + motion SPEC the
@@ -2444,8 +3591,13 @@ function parseGraphJsonTolerant(raw: string): unknown {
  *  Inverting the test makes new/renamed multi-frame types default correctly. */
 function isMultiFrameType(pickedType: string): boolean {
   if (!pickedType) return false;
+  if (isAlbumType(pickedType)) return false;
   const single = /单帧|单画面|标题卡|封面|logo|title.?card|single.?frame|cover|still/i.test(pickedType);
   return !single;
+}
+
+function isAlbumType(text: string): boolean {
+  return /电子相册|相册|画册|照片集|photo\s*album|photobook|photo\s*book|album|gallery|scroll\s*story/i.test(text);
 }
 
 function buildStylePhasePrompt(pickedType: string): string {
@@ -2520,7 +3672,7 @@ function buildHtmlGenerationPrompt(args: BuildPromptArgs): string {
     opener.push('');
     opener.push(`Reply with TWO things, in this exact order:`);
     opener.push(`1. ONE friendly opening sentence in the user's language (≤ 25 chars).`);
-    opener.push(`2. A fenced \`\`\`hv-options block with the 4 content-type choices below. JSON shape EXACTLY as shown — do not change keys or omit "meta":`);
+    opener.push(`2. A fenced \`\`\`hv-options block with the 5 content-type choices below. JSON shape EXACTLY as shown — do not change keys or omit "meta":`);
     opener.push('```hv-options');
     opener.push(JSON.stringify({
       meta: { phase: 'type' },
@@ -2529,6 +3681,7 @@ function buildHtmlGenerationPrompt(args: BuildPromptArgs): string {
         { label: '单帧标题卡',   hint: 'logo / 封面 / 单画面 - 5-10s' },
         { label: '多帧预告片',   hint: '产品 / 活动 teaser, 3-6 帧' },
         { label: '数据大字报',   hint: '1-2 个核心数字, 社媒爆款风' },
+        { label: '电子相册',     hint: 'HTML / 图片 / 素材变成可下滑浏览的交互相册' },
         { label: '概念解说短片', hint: '几帧讲清一个 idea / feature' },
       ],
       allow_freeform: true,
@@ -2777,9 +3930,13 @@ function buildHtmlGenerationPrompt(args: BuildPromptArgs): string {
     const contentTurns = inputs.contentTurns ?? [];
     const aspect = ((collected.aspect ?? '16:9').split(/\s+/)[0] ?? '16:9'); // strip "16:9 横屏" → "16:9"
     const [w, h] = aspect.includes(':') ? aspect.split(':').map(Number) : [16, 9];
-    const isMulti = isMultiFrameType(pickedType)
+    const wantsAlbum = isAlbumType(pickedType)
+      || tmpl?.id === 'album-scroll-story'
+      || isAlbumType(openingTopic ?? '')
+      || isAlbumType(userText);
+    const isMulti = !wantsAlbum && (isMultiFrameType(pickedType)
       || Number(collected.frame_count ?? '1') > 1
-      || Number(collected.per_frame ?? '0') > 0;
+      || Number(collected.per_frame ?? '0') > 0);
 
     // Pick a concrete pixel resolution that respects the aspect choice.
     let resolution = '1920×1080';
@@ -2825,6 +3982,18 @@ function buildHtmlGenerationPrompt(args: BuildPromptArgs): string {
         p.push(`Use binary attachments (images, data files) as actual assets where appropriate (logo, screenshot, data file). The inlined text/article/repo content above is the SOURCE MATERIAL — base the video's actual content (facts, names, numbers, narrative) on it, don't just decorate with it.`);
         p.push('');
       }
+    }
+    if (wantsAlbum) {
+      p.push(`Electronic album requirements (REQUIRED):`);
+      p.push(`- Output ONE standalone interactive HTML document, not a content-graph and not multiple html#frame blocks.`);
+      p.push(`- Treat the frame/page count as album page count. Prefer 4-6 pages unless the user specified otherwise.`);
+      p.push(`- Mobile interaction: vertical scroll with scroll-snap; each page fills one viewport and the next page is reached by swiping/down-scrolling.`);
+      p.push(`- Desktop interaction: visible Previous/Next controls, page dots or counter, and keyboard navigation for Arrow/Page keys.`);
+      p.push(`- Use uploaded images/screenshots/materials as real album media. For image attachments, put the provided "Browser URL for HTML src/href" into <img src="..."> exactly; never use a Windows/local filesystem path and never use only the filename.`);
+      p.push(`- If the user asks for image-to-album, preserve the uploaded image order: first image = first page, second image = second page, and so on.`);
+      p.push(`- If the source is HTML, extract its visible content and visual structure into album pages.`);
+      p.push(`- Tag visible text with data-hv-text keys so Studio can edit it after generation.`);
+      p.push('');
     }
     p.push(`Constraints: full-bleed ${resolution}, opens with an animation timeline, inline CSS + JS, single complete <!doctype html>...</html> document(s). CDN imports (Tailwind, GSAP) are fine. Tag every visible text node with data-hv-text set to a stable key (brand_name, headline, item_1, cta…). No prose outside code blocks.`);
     p.push('');
@@ -3047,6 +4216,33 @@ function extractHtmlDocument(text: string): string | null {
   return null;
 }
 
+function hardenAlbumHtml(html: string): string {
+  if (html.includes('id="hv-album-safety"') || html.includes("id='hv-album-safety'")) return html;
+  const css = `
+<style id="hv-album-safety">
+  /* Studio safety patch: generated album pages sometimes leave non-cover media
+     in the initial .reveal animation state, which makes uploaded photos look
+     like black panels. Keep generated visuals, but guarantee album media shows. */
+  .album-page:not(.cover) .reveal,
+  [data-page]:not(.cover) .reveal {
+    opacity: 1 !important;
+    transform: none !important;
+    visibility: visible !important;
+  }
+  .album-page img,
+  [data-page] img,
+  .media img,
+  figure img {
+    opacity: 1 !important;
+    visibility: visible !important;
+    display: block !important;
+  }
+</style>`;
+  if (/<\/head>/i.test(html)) return html.replace(/<\/head>/i, `${css}\n</head>`);
+  if (/<\/style>/i.test(html)) return html.replace(/<\/style>/i, `</style>\n${css}`);
+  return `${css}\n${html}`;
+}
+
 /**
  * v0.8: extract a content-graph JSON block + N tagged html#<nodeId> blocks
  * from a single agent response.
@@ -3125,6 +4321,7 @@ interface SplitGenerateArgs {
    * re-plan. Used by the post-generation "换风格 / 改时长" sub-flows.
    */
   restyleOnly?: boolean;
+  operationId: string;
   /** Called for human-readable progress lines. */
   onProgress: (msg: string) => void;
   /** Called for structured SSE events. */
@@ -3140,7 +4337,7 @@ interface SplitGenerateArgs {
 async function runSplitMultiFrameGenerate(
   args: SplitGenerateArgs,
 ): Promise<{ frameCount: number; intent: string }> {
-  const { ctx, projectId, projectDir, agentDef, agentModel, tmpl, priorHtml, inputs, attachments, openingTopic, restyleOnly, onProgress, onSse } = args;
+  const { ctx, projectId, projectDir, agentDef, agentModel, tmpl, priorHtml, inputs, attachments, openingTopic, restyleOnly, operationId, onProgress, onSse } = args;
   const collected = inputs.collected ?? {};
   const pickedType = inputs.pickedType ?? '';
   const pickedStyle = inputs.pickedStyle ?? '';
@@ -3289,7 +4486,19 @@ async function runSplitMultiFrameGenerate(
   graphPromptParts.push(`STRICT JSON: the block must be valid JSON. Inside string values do NOT use straight double-quotes ("…") — if you need to quote a term or title, use 「」 or 《》 or single quotes. No trailing commas. No comments.`);
 
   const graphPrompt = graphPromptParts.join('\n');
-  const graphText = await callAgentSimple(agentDef, graphPrompt, projectDir, agentModel);
+  const graphText = await callAgentSimple(agentDef, graphPrompt, projectDir, agentModel, {
+    ctx,
+    projectId,
+    generationType: 'album_outline',
+    operationId,
+    attempt: 1,
+    requestPayload: {
+      operation: restyleOnly ? 'reuse_content_graph' : 'generate_content_graph',
+      requested_frame_count: frameCountReq,
+    },
+    validateOutput: validateContentGraphOutput,
+    invalidOutputCode: 'invalid_content_graph',
+  });
   const graphMatch = /```json#content-graph\s*\n([\s\S]*?)```/i.exec(graphText)
     ?? /```json\s*\n([\s\S]*?)```/i.exec(graphText);
   if (!graphMatch || !graphMatch[1]) {
@@ -3388,7 +4597,23 @@ h1{font-size:8vw;letter-spacing:-.03em;animation:in 1s ease forwards;opacity:0;t
     fp.push(`Do NOT return an empty reply. Output the full HTML.`);
 
     const framePrompt = fp.join('\n');
-    let frameText = await callAgentSimple(agentDef, framePrompt, projectDir, agentModel);
+    let frameText = await callAgentSimple(agentDef, framePrompt, projectDir, agentModel, {
+      ctx,
+      projectId,
+      generationType: 'page_html',
+      operationId,
+      attempt: 1,
+      pageNodeId: nodeId,
+      requestPayload: {
+        operation: restyleOnly ? 'restyle_frame_html' : 'generate_frame_html',
+        frame_index: i,
+        frame_count: graph.nodes.length,
+      },
+      validateOutput: (output) => (
+        extractHtmlDocument(output) ? null : `Frame "${nodeId}" response did not contain valid HTML`
+      ),
+      invalidOutputCode: 'invalid_html',
+    });
     let extracted = /```html\s*\n([\s\S]*?)```/i.exec(frameText)?.[1]?.trim()
       ?? /<!doctype html[\s\S]*?<\/html>/i.exec(frameText)?.[0];
 
@@ -3396,7 +4621,24 @@ h1{font-size:8vw;letter-spacing:-.03em;animation:in 1s ease forwards;opacity:0;t
     if (!extracted) {
       onProgress(`  ↻ 第 ${i + 1} 帧首试为空，重试…`);
       const retryPrompt = `Output ONE complete HTML video frame in a fenced \`\`\`html block. Frame purpose: ${frameContext}. Style: ${styleLabel || 'tasteful default'}. Resolution: ${resolution}. ${contentTurns.length ? `Content: ${contentTurns.join(' / ').slice(0, 200)}` : ''} \n\nBegin your reply with \`\`\`html. Inline CSS, opens with animation, tag text with data-hv-text. No prose.`;
-      frameText = await callAgentSimple(agentDef, retryPrompt, projectDir, agentModel);
+      frameText = await callAgentSimple(agentDef, retryPrompt, projectDir, agentModel, {
+        ctx,
+        projectId,
+        generationType: 'page_html',
+        operationId,
+        attempt: 2,
+        pageNodeId: nodeId,
+        requestPayload: {
+          operation: restyleOnly ? 'restyle_frame_html' : 'generate_frame_html',
+          retry_reason: 'empty_or_invalid_html',
+          frame_index: i,
+          frame_count: graph.nodes.length,
+        },
+        validateOutput: (output) => (
+          extractHtmlDocument(output) ? null : `Frame "${nodeId}" retry did not contain valid HTML`
+        ),
+        invalidOutputCode: 'invalid_html',
+      });
       extracted = /```html\s*\n([\s\S]*?)```/i.exec(frameText)?.[1]?.trim()
         ?? /<!doctype html[\s\S]*?<\/html>/i.exec(frameText)?.[0];
     }
@@ -3457,16 +4699,84 @@ async function callAgentSimple(
   prompt: string,
   cwd: string,
   model?: string,
+  logging?: {
+    ctx: CliContext;
+    projectId: string;
+    generationType: import('@html-video/core').AiGenerationType;
+    operationId: string;
+    attempt: number;
+    pageNodeId?: string;
+    requestPayload?: Record<string, unknown>;
+    onEvent?: (event: import('@html-video/runtime').AgentEvent) => void;
+    validateOutput?: (output: string) => string | null;
+    invalidOutputCode?: string;
+    onSucceeded?: (handle: AiGenerationLogHandle | null, output: string) => void;
+  },
 ): Promise<string> {
   let buf = '';
+  let agentError = '';
+  const logger = logging ? AiGenerationLogger.fromContext(logging.ctx) : null;
+  const providerModel = aiProviderModel(def, model);
+  const logHandle = logging ? await logger?.start({
+    projectId: logging.projectId,
+    generationType: logging.generationType,
+    provider: providerModel.provider,
+    model: providerModel.model,
+    prompt,
+    operationId: logging.operationId,
+    attempt: logging.attempt,
+    ...(logging.pageNodeId && { pageNodeId: logging.pageNodeId }),
+    requestPayload: logging.requestPayload,
+  }) ?? null : null;
   const handle = spawnAgent({
     def,
     prompt,
     context: { cwd, ...(model && { model }) },
     onEvent: (ev) => {
       if (ev.type === 'text') buf += ev.chunk;
+      else if (ev.type === 'error') agentError = ev.message;
+      logging?.onEvent?.(ev);
     },
   });
-  await handle.done;
+  const exit = await handle.done;
+  const validationError = logging?.validateOutput?.(buf) ?? null;
+  if (agentError || exit.exitCode !== 0 || !buf.trim() || validationError) {
+    const code = agentError
+      ? 'agent_event_error'
+      : exit.exitCode !== 0
+        ? 'agent_exit_nonzero'
+        : !buf.trim()
+          ? 'empty_response'
+          : logging?.invalidOutputCode ?? 'invalid_response';
+    await logger?.fail(
+      logHandle,
+      agentError
+        || validationError
+        || `Agent exited with code ${exit.exitCode}${buf.trim() ? '' : ' and returned an empty response'}`,
+      code,
+      { exit_code: exit.exitCode, output_length: buf.length },
+    );
+  } else {
+    await logger?.succeed(logHandle, {
+      output: buf,
+      ...(logging?.pageNodeId && { pageNodeId: logging.pageNodeId }),
+      responsePayload: { exit_code: exit.exitCode },
+    });
+    logging?.onSucceeded?.(logHandle, buf);
+  }
   return buf;
+}
+
+function validateContentGraphOutput(output: string): string | null {
+  const match = /```json#content-graph\s*\n([\s\S]*?)```/i.exec(output)
+    ?? /```json\s*\n([\s\S]*?)```/i.exec(output);
+  if (!match?.[1]) return 'Agent response did not contain a content-graph';
+  try {
+    const graph = parseGraphJsonTolerant(match[1].trim()) as { nodes?: unknown[] };
+    return Array.isArray(graph.nodes) && graph.nodes.length > 0
+      ? null
+      : 'Agent content-graph did not contain any nodes';
+  } catch (error) {
+    return `Agent content-graph was invalid: ${error instanceof Error ? error.message : String(error)}`;
+  }
 }

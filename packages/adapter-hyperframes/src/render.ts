@@ -18,7 +18,7 @@ import { existsSync, readdirSync } from 'node:fs';
 import { spawn } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { pathToFileURL } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import type {
   HtmlSceneOutput,
   RenderContext,
@@ -28,6 +28,7 @@ import type {
 import { HtmlVideoError } from '@html-video/core';
 
 const ADAPTER_VERSION = '0.2.0-playwright';
+const here = dirname(fileURLToPath(import.meta.url));
 
 /** Real render: chromium records the page, ffmpeg transcodes to MP4. */
 export async function render(input: RenderInput, ctx: RenderContext): Promise<RenderOutput> {
@@ -70,6 +71,7 @@ export async function render(input: RenderInput, ctx: RenderContext): Promise<Re
   try {
     browser = await playwright.chromium.launch({
       headless: true,
+      executablePath: resolveChromiumExecutablePath(),
       args: ['--no-sandbox', '--disable-blink-features=AutomationControlled'],
     });
     // recordVideo starts capturing the moment the context exists, so this is
@@ -365,7 +367,7 @@ export async function render(input: RenderInput, ctx: RenderContext): Promise<Re
     '-crf', '20',
     '-movflags', '+faststart',
     input.config.outputPath,
-  ]);
+  ], input.template.sourcePath);
 
   // Clean tmp dir
   await rm(recordDir, { recursive: true, force: true }).catch(() => {});
@@ -387,9 +389,9 @@ export async function render(input: RenderInput, ctx: RenderContext): Promise<Re
   };
 }
 
-function runFfmpeg(args: string[]): Promise<void> {
+function runFfmpeg(args: string[], sourcePath?: string): Promise<void> {
   return new Promise((resolve, reject) => {
-    const proc = spawn('ffmpeg', args, { stdio: ['ignore', 'pipe', 'pipe'] });
+    const proc = spawn(resolveFfmpegExecutable(sourcePath), args, { stdio: ['ignore', 'pipe', 'pipe'] });
     let stderr = '';
     proc.stderr.on('data', (chunk: Buffer) => {
       stderr += chunk.toString('utf8');
@@ -397,7 +399,7 @@ function runFfmpeg(args: string[]): Promise<void> {
     proc.on('error', (err: NodeJS.ErrnoException) => {
       if (err.code === 'ENOENT') {
         reject(new HtmlVideoError('render-failed',
-          'ffmpeg not found on PATH. Install with `brew install ffmpeg` (macOS).'));
+          'ffmpeg not found. Install it on PATH, set HTML_VIDEO_FFMPEG_PATH, or place it at tools/ffmpeg/bin/ffmpeg.exe on Windows.'));
       } else reject(err);
     });
     proc.on('exit', (code) => {
@@ -408,6 +410,58 @@ function runFfmpeg(args: string[]): Promise<void> {
       ));
     });
   });
+}
+
+function resolveFfmpegExecutable(sourcePath?: string): string {
+  const envPath = process.env.HTML_VIDEO_FFMPEG_PATH || process.env.FFMPEG_PATH;
+  if (envPath) return envPath;
+  const binary = process.platform === 'win32' ? 'ffmpeg.exe' : 'ffmpeg';
+  const starts = [process.cwd(), sourcePath ? dirname(sourcePath) : undefined, here];
+  for (const start of starts) {
+    const found = start ? findUpLocalFfmpeg(start, binary) : undefined;
+    if (found) return found;
+  }
+  return 'ffmpeg';
+}
+
+function findUpLocalFfmpeg(start: string, binary: string): string | undefined {
+  let dir = start;
+  for (let i = 0; i < 12; i++) {
+    const candidate = join(dir, 'tools', 'ffmpeg', 'bin', binary);
+    if (existsSync(candidate)) return candidate;
+    const parent = dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  return undefined;
+}
+
+function resolveChromiumExecutablePath(): string | undefined {
+  const envPath = process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH || process.env.CHROME_PATH;
+  if (envPath && existsSync(envPath)) return envPath;
+
+  const candidates =
+    process.platform === 'win32'
+      ? [
+          join(process.env.ProgramFiles || 'C:\\Program Files', 'Google', 'Chrome', 'Application', 'chrome.exe'),
+          join(process.env['ProgramFiles(x86)'] || 'C:\\Program Files (x86)', 'Google', 'Chrome', 'Application', 'chrome.exe'),
+          join(process.env.ProgramFiles || 'C:\\Program Files', 'Microsoft', 'Edge', 'Application', 'msedge.exe'),
+          join(process.env['ProgramFiles(x86)'] || 'C:\\Program Files (x86)', 'Microsoft', 'Edge', 'Application', 'msedge.exe'),
+        ]
+      : process.platform === 'darwin'
+        ? [
+            '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+            '/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge',
+            '/Applications/Chromium.app/Contents/MacOS/Chromium',
+          ]
+        : [
+            '/usr/bin/chromium',
+            '/usr/bin/chromium-browser',
+            '/usr/bin/google-chrome',
+            '/usr/bin/microsoft-edge',
+          ];
+
+  return candidates.find((candidate) => existsSync(candidate));
 }
 
 /**

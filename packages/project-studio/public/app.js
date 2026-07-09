@@ -35,6 +35,16 @@ const NARRATION_VOICES = [
 ];
 
 const API = {
+  me: () => fetch('/api/auth/me').then(r => r.json()),
+  login: async b => {
+    const response = await fetch('/api/auth/dev-login', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(b),
+    });
+    return { ok: response.ok, status: response.status, data: await response.json() };
+  },
+  logout: () => fetch('/api/auth/logout', { method: 'POST' }).then(r => r.json()),
   projects: () => fetch('/api/projects').then(r => r.json()),
   createProject: b => fetch('/api/projects', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(b) }).then(r => r.json()),
   getProject: id => fetch(`/api/projects/${id}`).then(r => r.json()),
@@ -55,9 +65,11 @@ const API = {
 };
 
 const state = {
+  currentUser: null,
   projects: [],
   templates: [],
   agents: [],
+  activePage: 'create',
   selectedId: null,
   selected: null,
   messages: [],
@@ -79,6 +91,35 @@ const state = {
 
 // ============== boot ==============
 async function init() {
+  wireAuthForm();
+  try {
+    const result = await API.me();
+    if (result?.user?.authenticated) {
+      await enterStudio(result.user);
+      return;
+    }
+  } catch (error) {
+    console.warn('auth check failed:', error);
+  }
+  showLogin();
+}
+
+let studioInitialized = false;
+
+async function enterStudio(user) {
+  state.currentUser = user;
+  document.getElementById('auth-screen').hidden = true;
+  document.getElementById('studio-app').hidden = false;
+  if (studioInitialized) {
+    renderToolbar();
+    renderMain();
+    return;
+  }
+  studioInitialized = true;
+  await initStudio();
+}
+
+async function initStudio() {
   // Kick off agent detection in the background — `which` + `<bin> --version`
   // can take ~400ms+ cold and there's no point holding the whole UI for it.
   // Composer renders disabled-but-visible; we re-render it once agents land.
@@ -93,20 +134,61 @@ async function init() {
   // Don't block — but surface failures in the console.
   agentsPromise.catch((e) => console.warn('agent detection failed:', e));
 
-  // Empty list → spin up a default project so the user lands inside one
-  // instead of an empty gallery.
-  if (state.projects.length === 0) {
-    const r = await API.createProject({ name: defaultProjectName(0) });
-    if (r && r.project) {
-      await refreshProjects();
-      await selectProject(r.project.id);
-      return;
+  renderMain();
+}
+
+function wireAuthForm() {
+  const form = document.getElementById('auth-form');
+  if (!form || form.dataset.wired === '1') return;
+  form.dataset.wired = '1';
+  form.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const usernameInput = document.getElementById('auth-username');
+    const passwordInput = document.getElementById('auth-password');
+    const submit = document.getElementById('auth-submit');
+    const error = document.getElementById('auth-error');
+    error.textContent = '';
+    submit.disabled = true;
+    submit.textContent = '登录中…';
+    try {
+      const result = await API.login({
+        username: usernameInput.value.trim(),
+        password: passwordInput.value,
+      });
+      if (!result.ok || !result.data?.user?.authenticated) {
+        error.textContent = result.status === 503
+          ? '临时登录尚未配置，请先创建 .html-video/auth.toml'
+          : '用户名或密码错误';
+        passwordInput.select();
+        return;
+      }
+      passwordInput.value = '';
+      await enterStudio(result.data.user);
+    } catch {
+      error.textContent = '无法连接到服务，请稍后重试';
+    } finally {
+      submit.disabled = false;
+      submit.textContent = '登录';
     }
+  });
+}
+
+function showLogin() {
+  state.currentUser = null;
+  document.getElementById('studio-app').hidden = true;
+  document.getElementById('auth-screen').hidden = false;
+  const passwordInput = document.getElementById('auth-password');
+  passwordInput.value = '';
+  passwordInput.focus();
+}
+
+async function logout() {
+  try {
+    await API.logout();
+  } catch (error) {
+    console.warn('logout failed:', error);
   }
-  // First load with existing projects → open the most recently updated one.
-  if (!state.selected && state.projects.length > 0) {
-    await selectProject(state.projects[0].id);
-  }
+  showLogin();
 }
 
 function defaultProjectName(seed) {
@@ -129,6 +211,7 @@ function formatPct(value) {
 }
 
 async function createDefaultProject() {
+  state.activePage = 'workspace';
   const r = await API.createProject({ name: defaultProjectName(0) });
   if (!r?.project) {
     toast(t('modal.new.failed'), 'error');
@@ -347,9 +430,11 @@ async function refreshAgents() {
 async function refreshProjects() {
   state.projects = (await API.projects()).projects ?? [];
   renderSidebar();
+  if (state.activePage === 'history') renderProjectHistory();
 }
 
 async function selectProject(id) {
+  state.activePage = 'workspace';
   state.selectedId = id;
   state.selected = (await API.getProject(id)).project;
   state.activeFrameId = null;  // reset frame selection on project switch
@@ -394,9 +479,572 @@ async function selectProject(id) {
   await refreshTextFields();
 }
 
+const NAV_ITEMS = [
+  { id: 'create', label: '新建相册', desc: '输入主题生成', icon: 'plus' },
+  { id: 'album', label: '图片转相册', desc: '素材生成 HTML', icon: 'image' },
+  { id: 'workspace', label: '项目编辑', desc: '预览与导出', icon: 'edit' },
+  { id: 'history', label: '历史项目', desc: '管理已生成项目', icon: 'history' },
+  { id: 'templates', label: '样例库', desc: '浏览视觉模板', icon: 'templates' },
+  { id: 'settings', label: '系统设置', desc: 'Agent 与音频配置', icon: 'settings' },
+];
+
+function navIcon(name) {
+  const common = 'viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"';
+  const paths = {
+    plus: '<path d="M12 5v14"/><path d="M5 12h14"/>',
+    edit: '<path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"/>',
+    image: '<rect x="3" y="5" width="18" height="14" rx="2"/><path d="m7 15 3-3 2 2 3-4 2 5"/><circle cx="8" cy="9" r="1.4"/>',
+    album: '<rect x="4" y="4" width="16" height="16" rx="2"/><path d="M8 8h8M8 12h8M8 16h5"/>',
+    history: '<path d="M3 12a9 9 0 1 0 3-6.7"/><path d="M3 4v5h5"/><path d="M12 7v6l4 2"/>',
+    templates: '<rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/>',
+    settings: '<circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 0 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 0 1-4 0v-.2a1.7 1.7 0 0 0-1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 0 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 0 1 0-4h.2a1.7 1.7 0 0 0 1.5-1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 0 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3h.1a1.7 1.7 0 0 0 1-1.5V3a2 2 0 0 1 4 0v.2a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 0 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8v.1a1.7 1.7 0 0 0 1.5 1H21a2 2 0 0 1 0 4h-.2a1.7 1.7 0 0 0-1.4 1Z"/>',
+  };
+  return `<svg ${common}>${paths[name] ?? paths.edit}</svg>`;
+}
+
+function renderFeatureNav() {
+  const nav = document.getElementById('app-nav');
+  if (!nav) return;
+  const user = state.currentUser ?? {};
+  const displayName = user.display_name || user.user_id || '用户';
+  const avatarText = Array.from(displayName)[0]?.toUpperCase() || 'U';
+  nav.innerHTML = `
+    <div class="app-nav-brand">
+      <div class="brand-mark">H</div>
+      <div>
+        <div class="brand-name">AI相册助手</div>
+        <div class="brand-sub">html-video · v0.7</div>
+      </div>
+    </div>
+    <div class="app-nav-section">
+      <div class="app-nav-label">功能菜单</div>
+      ${NAV_ITEMS.map((item) => `
+        <button type="button" class="app-nav-item ${state.activePage === item.id ? 'active' : ''}" data-page="${item.id}">
+          ${navIcon(item.icon)}
+          <span><span class="nav-title">${esc(item.label)}</span><span class="nav-desc">${esc(item.desc)}</span></span>
+        </button>
+      `).join('')}
+    </div>
+    <div class="app-nav-foot">
+      <div class="app-nav-user">
+        <div class="avatar">${esc(avatarText)}</div>
+        <div class="app-nav-user-copy">
+          <div class="app-nav-user-name" title="${esc(displayName)}">${esc(displayName)}</div>
+          <div class="brand-sub">${state.projects.length} 个项目</div>
+        </div>
+        <button type="button" class="app-nav-logout" id="btn-logout" title="退出登录" aria-label="退出登录">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M10 17l5-5-5-5"/><path d="M15 12H3"/><path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4"/>
+          </svg>
+        </button>
+      </div>
+    </div>
+  `;
+  nav.querySelectorAll('[data-page]').forEach((btn) => {
+    btn.onclick = () => setActivePage(btn.dataset.page);
+  });
+  const logoutButton = nav.querySelector('#btn-logout');
+  if (logoutButton) logoutButton.onclick = logout;
+}
+
+function setActivePage(page) {
+  state.activePage = page || 'create';
+  renderMain();
+  renderToolbar();
+}
+
+async function createAlbumProject() {
+  state.activePage = 'workspace';
+  const r = await API.createProject({ name: '电子相册' });
+  if (!r?.project) {
+    toast(t('modal.new.failed'), 'error');
+    return;
+  }
+  await refreshProjects();
+  let project = r.project;
+  try {
+    const applied = await API.setTemplate(project.id, 'album-scroll-story');
+    project = applied.project ?? project;
+  } catch (e) {
+    toast(`电子相册模板应用失败：${e?.message ?? e}`, 'error');
+  }
+  await selectProject(project.id);
+}
+
+const CREATE_TOPIC_EXAMPLES = [
+  '公司介绍电子相册：封面、公司简介、核心业务、团队优势、联系方式',
+  '产品发布相册：痛点、方案、亮点、使用场景、购买方式',
+  '活动回顾相册：开场、现场瞬间、嘉宾观点、精彩数据、结束致谢',
+  '个人作品集：简介、代表作品、项目故事、能力标签、联系方式',
+];
+
+function makeAlbumProjectName(raw) {
+  const first = String(raw || '').split(/\r?\n/).find((line) => line.trim())?.trim() || '电子相册';
+  return first.replace(/[<>:"/\\|?*\x00-\x1f]/g, '').slice(0, 18) || '电子相册';
+}
+
+function buildAlbumPromptFromCreatePage() {
+  const pick = (id) => document.getElementById(id)?.value || '';
+  const raw = document.getElementById('create-topic-input')?.value.trim() || '';
+  const wantsThinking = document.getElementById('btn-create-thinking')?.classList.contains('active');
+  const attachmentNote = state.pendingAttachments.length
+    ? `\n已上传 ${state.pendingAttachments.length} 个素材，请优先使用这些素材安排画面。`
+    : '';
+  return `帮我生成一个电子相册。
+
+主题和素材说明：
+${raw}
+
+生成要求：
+1. 页数：${pick('create-pages')}。
+2. 受众：${pick('create-audience')}。
+3. 场景：${pick('create-scene')}。
+4. 语气：${pick('create-tone')}。
+5. 比例：${pick('create-ratio')}。
+6. 风格：${pick('create-style')}。
+7. 必须是手机端下滑翻页、PC 端点击下一页查看下一页的交互式 HTML 电子相册。
+8. 页面文案要适合直接对外展示，整体简洁、科技感、适合宣传。
+9. ${wantsThinking ? '请先梳理内容结构，再生成最终 HTML。' : '直接生成最终 HTML。'}${attachmentNote}`;
+}
+
+function renderLandingAttachments() {
+  const el = document.getElementById('create-attachment-state');
+  if (!el) return;
+  if (!state.pendingAttachments.length) {
+    el.textContent = '未选择素材';
+    return;
+  }
+  const names = state.pendingAttachments.map((a) => a.name).slice(0, 2).join('、');
+  el.textContent = `${state.pendingAttachments.length} 个素材：${names}${state.pendingAttachments.length > 2 ? ' 等' : ''}`;
+}
+
+function renderImageAlbumAttachments() {
+  const list = document.getElementById('image-album-list');
+  const count = document.getElementById('image-album-count');
+  if (count) count.textContent = `${state.pendingAttachments.length} 张图片`;
+  if (!list) return;
+  if (!state.pendingAttachments.length) {
+    list.innerHTML = `
+      <div class="image-upload-empty">
+        <strong>先上传图片</strong>
+        <span>可一次选择多张，系统会按选择顺序生成相册页。</span>
+      </div>
+    `;
+    return;
+  }
+  list.innerHTML = state.pendingAttachments.map((a, i) => `
+    <div class="image-upload-item">
+      <div class="image-upload-thumb">
+        ${a.dataUrl ? `<img src="${a.dataUrl}" alt="" />` : navIcon('image')}
+      </div>
+      <div class="image-upload-meta">
+        <b>第 ${i + 1} 页</b>
+        <span title="${esc(a.name)}">${esc(a.name)}</span>
+      </div>
+      <button type="button" data-remove-image="${i}" title="移除">×</button>
+    </div>
+  `).join('');
+  list.querySelectorAll('[data-remove-image]').forEach((btn) => {
+    btn.onclick = () => {
+      removeAttachment(Number(btn.dataset.removeImage));
+      renderImageAlbumAttachments();
+    };
+  });
+}
+
+function buildImageAlbumPrompt() {
+  const note = document.getElementById('image-album-note')?.value.trim() || '请根据图片内容组织简洁文案。';
+  const title = document.getElementById('image-album-title')?.value.trim() || '图片电子相册';
+  const style = document.getElementById('image-album-style')?.value || '清爽留白';
+  const ratio = document.getElementById('image-album-ratio')?.value || '16:9 横屏';
+  const names = state.pendingAttachments.map((a, i) => `${i + 1}. ${a.name}`).join('\n');
+  return `请根据我上传的图片生成一个电子相册。
+
+相册标题：${title}
+补充说明：${note}
+
+图片顺序：
+${names}
+
+生成要求：
+1. 必须严格按照上传图片顺序生成页面，第 1 张图片对应第 1 页，第 2 张图片对应第 2 页，以此类推。
+2. 每一页以对应图片为主体，搭配一句简短标题和一段不超过 40 字的说明。
+3. 风格：${style}。
+4. 比例：${ratio}。
+5. 生成可独立运行的交互式 HTML 电子相册。
+6. 手机端下滑翻页，PC 端点击下一页或使用键盘翻页。
+7. 不要编造图片中看不出的具体事实；不确定的内容用中性表达。`;
+}
+
+async function startImageAlbumFromUploadPage() {
+  if (!state.pendingAttachments.length) {
+    toast('请先上传至少一张图片。', 'error');
+    return;
+  }
+  const invalid = state.pendingAttachments.find((a) => a.kind !== 'image');
+  if (invalid) {
+    toast('图片转相册只支持图片文件，请移除非图片素材。', 'error');
+    return;
+  }
+  const btn = document.getElementById('btn-image-album-send');
+  if (btn) btn.disabled = true;
+  try {
+    const title = document.getElementById('image-album-title')?.value.trim() || '图片电子相册';
+    const r = await API.createProject({ name: makeAlbumProjectName(title) });
+    if (!r?.project) throw new Error('project create failed');
+    await refreshProjects();
+    try {
+      await API.setTemplate(r.project.id, 'album-scroll-story');
+    } catch (e) {
+      toast(`电子相册模板应用失败：${e?.message ?? e}`, 'error');
+    }
+    const prompt = buildImageAlbumPrompt();
+    await selectProject(r.project.id);
+    const input = document.getElementById('composer-input');
+    if (input) {
+      input.value = prompt;
+      await sendMessage();
+    }
+  } catch (e) {
+    toast(`图片转相册失败：${e?.message ?? e}`, 'error');
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+async function startAlbumFromCreatePage() {
+  const raw = document.getElementById('create-topic-input')?.value.trim() || '';
+  if (!raw && !state.pendingAttachments.length) {
+    toast('请输入相册主题，或先上传素材。', 'error');
+    return;
+  }
+  const btn = document.getElementById('btn-create-send');
+  if (btn) btn.disabled = true;
+  try {
+    const r = await API.createProject({ name: makeAlbumProjectName(raw) });
+    if (!r?.project) throw new Error('project create failed');
+    await refreshProjects();
+    try {
+      await API.setTemplate(r.project.id, 'album-scroll-story');
+    } catch (e) {
+      toast(`电子相册模板应用失败：${e?.message ?? e}`, 'error');
+    }
+    const prompt = buildAlbumPromptFromCreatePage();
+    await selectProject(r.project.id);
+    const input = document.getElementById('composer-input');
+    if (input) {
+      input.value = prompt;
+      await sendMessage();
+    }
+  } catch (e) {
+    toast(`创建电子相册失败：${e?.message ?? e}`, 'error');
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+function renderCreatePage() {
+  return `
+    <main class="create-page">
+      <section class="create-hero">
+        <h2>基于 Agent 的<span>电子相册工具</span></h2>
+        <p>输入主题、上传素材，生成可下滑浏览的 HTML 电子相册</p>
+      </section>
+
+      <section class="generator-panel">
+        <div class="generator-tabs" role="tablist" aria-label="creation mode">
+          <button class="active" type="button" id="tab-create-topic">${navIcon('edit')}<span>输入主题</span></button>
+        </div>
+
+        <div class="generator-controls">
+          <label><span>页数</span><select id="create-pages"><option>5 页</option><option>3 页</option><option>8 页</option><option>10 页</option></select></label>
+          <label><span>受众</span><select id="create-audience"><option>大众</option><option>客户</option><option>投资人</option><option>内部团队</option></select></label>
+          <label><span>场景</span><select id="create-scene"><option>企业宣传</option><option>产品介绍</option><option>活动回顾</option><option>作品展示</option></select></label>
+          <label><span>语气</span><select id="create-tone"><option>温柔</option><option>专业</option><option>活泼</option><option>克制</option></select></label>
+          <label><span>比例</span><select id="create-ratio"><option>16:9 横屏</option><option>9:16 竖屏</option><option>1:1 方形</option></select></label>
+          <label><span>风格</span><select id="create-style"><option>科技深蓝</option><option>清爽留白</option><option>杂志感</option><option>暖色商务</option></select></label>
+        </div>
+
+        <div class="prompt-field">
+          <textarea id="create-topic-input" rows="8" placeholder="请输入电子相册主题，例如：大米科技有限公司公司介绍，包含封面、公司简介、核心业务、团队优势、联系方式。"></textarea>
+          <div class="prompt-bottom">
+            <div class="prompt-tools">
+              <button type="button" class="tool-btn" id="btn-create-attach">${navIcon('image')}<span>参考素材</span></button>
+              <input type="file" id="create-file-input" multiple hidden />
+              <span class="attachment-state" id="create-attachment-state">未选择素材</span>
+            </div>
+            <div class="prompt-actions">
+              <button type="button" class="mini-action" id="btn-create-thinking">${navIcon('settings')}<span>深度思考</span></button>
+              <button type="button" class="send-orb" id="btn-create-send" title="生成电子相册">${navIcon('plus')}</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="topic-row">
+          <span>热门主题：</span>
+          ${CREATE_TOPIC_EXAMPLES.map((x) => `<button type="button" data-topic="${esc(x)}">${esc(x.split('：')[0])}</button>`).join('')}
+        </div>
+        <p class="create-note">创建后会自动进入项目编辑页，可继续修改文字、预览交互并导出 HTML 或 MP4。</p>
+      </section>
+    </main>
+  `;
+}
+
+function wireCreatePage() {
+  document.querySelectorAll('[data-topic]').forEach((btn) => {
+    btn.onclick = () => {
+      const input = document.getElementById('create-topic-input');
+      if (input) {
+        input.value = btn.dataset.topic || '';
+        input.focus();
+      }
+    };
+  });
+  const attachBtn = document.getElementById('btn-create-attach');
+  const fileInput = document.getElementById('create-file-input');
+  if (attachBtn && fileInput) {
+    attachBtn.onclick = () => fileInput.click();
+    fileInput.onchange = (e) => {
+      addAttachments([...e.target.files]);
+      renderLandingAttachments();
+    };
+  }
+  const thinkingBtn = document.getElementById('btn-create-thinking');
+  if (thinkingBtn) {
+    thinkingBtn.onclick = () => {
+      thinkingBtn.classList.toggle('active');
+      toast(thinkingBtn.classList.contains('active') ? '已加入深度思考要求。' : '已取消深度思考要求。');
+    };
+  }
+  const sendBtn = document.getElementById('btn-create-send');
+  if (sendBtn) sendBtn.onclick = startAlbumFromCreatePage;
+  renderLandingAttachments();
+}
+
+function renderAlbumPage() {
+  return `
+    <main class="feature-page">
+      <div class="feature-page-inner">
+        <section class="feature-hero">
+          <div class="kicker">Image To Album</div>
+          <h2>图片转相册</h2>
+          <p>先上传多张图片，再补充一句说明，系统会按图片顺序生成可翻页的 HTML 电子相册。</p>
+        </section>
+
+        <section class="image-album-flow">
+          <div class="image-album-main">
+            <div class="upload-drop" id="image-album-drop">
+              <input type="file" id="image-album-input" accept="image/*" multiple hidden />
+              <div class="upload-icon">${navIcon('image')}</div>
+              <h3>上传相册图片</h3>
+              <p>支持一次选择多张图片，生成时会严格按这里展示的顺序安排页面。</p>
+              <button type="button" class="feature-btn primary" id="btn-image-album-pick">选择图片</button>
+            </div>
+
+            <div class="image-upload-list" id="image-album-list"></div>
+          </div>
+
+          <aside class="image-album-side">
+            <div class="side-panel">
+              <div class="feature-panel-head compact">
+                <div>
+                  <h3>相册设置</h3>
+                  <p id="image-album-count">0 张图片</p>
+                </div>
+              </div>
+
+              <label class="stack-field">
+                <span>相册标题</span>
+                <input id="image-album-title" value="图片电子相册" />
+              </label>
+
+              <label class="stack-field">
+                <span>补充说明</span>
+                <textarea id="image-album-note" rows="5" placeholder="例如：这是公司年会现场照片，整体风格温暖、有纪念感。"></textarea>
+              </label>
+
+              <div class="side-grid">
+                <label class="stack-field">
+                  <span>比例</span>
+                  <select id="image-album-ratio">
+                    <option>16:9 横屏</option>
+                    <option>9:16 竖屏</option>
+                    <option>1:1 方形</option>
+                  </select>
+                </label>
+                <label class="stack-field">
+                  <span>风格</span>
+                  <select id="image-album-style">
+                    <option>清爽留白</option>
+                    <option>杂志感</option>
+                    <option>科技深蓝</option>
+                    <option>温暖纪实</option>
+                  </select>
+                </label>
+              </div>
+
+              <div class="feature-actions">
+                <button type="button" class="feature-btn primary wide" id="btn-image-album-send">按图片顺序生成</button>
+                <button type="button" class="feature-btn wide" id="btn-image-album-clear">清空图片</button>
+              </div>
+            </div>
+
+            <div class="side-panel muted">
+              <div>
+                <h3>生成规则</h3>
+                <p>每张图片生成一页，图片作为页面主体；Agent 会补充短标题和说明文案。生成完成后可在项目编辑页继续预览、改字和导出。</p>
+              </div>
+            </div>
+        </section>
+      </div>
+    </main>
+  `;
+}
+
+function wireAlbumPage() {
+  const input = document.getElementById('image-album-input');
+  const pick = document.getElementById('btn-image-album-pick');
+  const drop = document.getElementById('image-album-drop');
+  if (pick && input) pick.onclick = () => input.click();
+  if (input) {
+    input.onchange = (e) => {
+      addAttachments([...e.target.files].filter((f) => (f.type || '').startsWith('image/')));
+      renderImageAlbumAttachments();
+    };
+  }
+  if (drop) {
+    drop.ondragover = (e) => {
+      e.preventDefault();
+      drop.classList.add('dragging');
+    };
+    drop.ondragleave = () => drop.classList.remove('dragging');
+    drop.ondrop = (e) => {
+      e.preventDefault();
+      drop.classList.remove('dragging');
+      const files = [...(e.dataTransfer?.files || [])].filter((f) => (f.type || '').startsWith('image/'));
+      if (files.length) {
+        addAttachments(files);
+        renderImageAlbumAttachments();
+      }
+    };
+  }
+  const clearBtn = document.getElementById('btn-image-album-clear');
+  if (clearBtn) {
+    clearBtn.onclick = () => {
+      state.pendingAttachments = [];
+      renderImageAlbumAttachments();
+    };
+  }
+  const sendBtn = document.getElementById('btn-image-album-send');
+  if (sendBtn) sendBtn.onclick = startImageAlbumFromUploadPage;
+  renderImageAlbumAttachments();
+}
+
+function renderProjectHistoryPage() {
+  return `
+    <main class="feature-page">
+      <div class="feature-page-inner">
+        <section class="feature-hero">
+          <div class="kicker">Project History</div>
+          <h2>项目历史</h2>
+          <p>集中查看和继续编辑已经创建的 HTML 视频与电子相册项目。</p>
+        </section>
+        <section class="feature-panel">
+          <div class="feature-panel-head">
+            <div>
+              <h3>全部项目</h3>
+              <p>${state.projects.length} 个项目</p>
+            </div>
+            <button class="feature-btn primary" id="btn-history-new">新建项目</button>
+          </div>
+          <div class="history-list" id="history-list"></div>
+        </section>
+      </div>
+    </main>
+  `;
+}
+
+function renderProjectHistory() {
+  const list = document.getElementById('history-list');
+  if (!list) return;
+  if (!state.projects.length) {
+    list.innerHTML = `<div class="empty-list">还没有项目，点击上方新建一个。</div>`;
+    return;
+  }
+  list.innerHTML = state.projects.map((p) => `
+    <div class="history-row">
+      <div>
+        <div class="name">${esc(p.name)}</div>
+        <div class="meta">${p.template_id ? esc(p.template_id) : 'no template'} · ${esc(p.status ?? '')}</div>
+      </div>
+      <div class="actions">
+        <button class="feature-btn" data-open-project="${esc(p.id)}">打开</button>
+      </div>
+    </div>
+  `).join('');
+  list.querySelectorAll('[data-open-project]').forEach((btn) => {
+    btn.onclick = () => selectProject(btn.dataset.openProject);
+  });
+}
+
+function renderTemplatesPage() {
+  return `
+    <main class="feature-page">
+      <div class="feature-page-inner">
+        <section class="feature-hero">
+          <div class="kicker">Template Library</div>
+          <h2>模板库</h2>
+          <p>先浏览模板效果，再决定是否应用到当前项目。</p>
+        </section>
+        <section class="feature-panel">
+          <div class="feature-panel-head">
+            <div>
+              <h3>可用模板</h3>
+              <p>${state.templates.length} 个模板</p>
+            </div>
+            <button class="feature-btn primary" id="btn-template-new">新建项目</button>
+          </div>
+          <div class="gallery feature-template-grid" id="feature-template-grid"></div>
+        </section>
+      </div>
+    </main>
+  `;
+}
+
+function renderSettingsPage() {
+  return `
+    <main class="feature-page">
+      <div class="feature-page-inner">
+        <section class="feature-hero">
+          <div class="kicker">Settings</div>
+          <h2>系统设置</h2>
+          <p>集中配置 Agent、模型、语言和音频生成能力。</p>
+        </section>
+        <section class="feature-panel">
+          <div class="feature-panel-head">
+            <div>
+              <h3>配置入口</h3>
+              <p>保留原设置面板，减少改动风险。</p>
+            </div>
+          </div>
+          <div class="quick-grid">
+            <div class="quick-card"><h4>Agent</h4><p>配置 Codex、Claude、AMR 等生成代理。</p></div>
+            <div class="quick-card"><h4>音频</h4><p>配置背景音乐和旁白所需的 MiniMax API 信息。</p></div>
+            <div class="quick-card"><h4>语言</h4><p>切换 Studio 界面语言。</p></div>
+          </div>
+          <div class="feature-actions" style="margin-top:18px">
+            <button class="feature-btn primary" id="btn-open-settings-page">打开设置面板</button>
+          </div>
+        </section>
+      </div>
+    </main>
+  `;
+}
+
 // ============== sidebar ==============
 function renderSidebar() {
   const list = document.getElementById('project-list');
+  if (!list) return;
   if (!state.projects.length) {
     list.innerHTML = `<div class="empty-list">${t('sidebar.empty_list')}</div>`;
     return;
@@ -501,6 +1149,7 @@ function renderToolbar() {
   const nameInput = document.getElementById('proj-name');
   const pickBtn = document.getElementById('btn-pick-template');
   const exportBtn = document.getElementById('btn-export');
+  const exportHtmlBtn = document.getElementById('btn-export-html');
 
   nameInput.disabled = !p;
   nameInput.placeholder = p ? '' : t('app.no_project');
@@ -530,6 +1179,13 @@ function renderToolbar() {
       : t('export.starting');
   } else {
     exportBtn.textContent = t('toolbar.export_mp4');
+  }
+  if (exportHtmlBtn) {
+    exportHtmlBtn.disabled = !p || !p.lastPreviewHtmlPath;
+    exportHtmlBtn.textContent = 'Export HTML';
+    exportHtmlBtn.title = p?.lastPreviewHtmlPath
+      ? 'Download the current preview as standalone HTML'
+      : 'Generate or pick a template first';
   }
   renderAgentPill();
 
@@ -727,6 +1383,13 @@ function wireToolbar() {
       startExportStream();
     };
   }
+  const exportHtmlBtn = document.getElementById('btn-export-html');
+  if (exportHtmlBtn) {
+    exportHtmlBtn.onclick = () => {
+      if (!state.selected || !state.selected.lastPreviewHtmlPath) return;
+      window.location.href = `/api/projects/${state.selected.id}/export-html`;
+    };
+  }
   const nameInput = document.getElementById('proj-name');
   if (nameInput) {
     nameInput.onblur = () => {
@@ -744,6 +1407,41 @@ function wireToolbar() {
 // ============== main: 4-column body ==============
 function renderMain() {
   const body = document.getElementById('body');
+  renderFeatureNav();
+  const page = state.activePage || 'create';
+  document.body.dataset.page = page;
+  body.className = page === 'workspace' ? 'body workspace-body' : 'body feature-body';
+  if (page === 'create') {
+    body.innerHTML = renderCreatePage();
+    wireCreatePage();
+    return;
+  }
+  if (page === 'album') {
+    body.innerHTML = renderAlbumPage();
+    wireAlbumPage();
+    return;
+  }
+  if (page === 'history') {
+    body.innerHTML = renderProjectHistoryPage();
+    renderProjectHistory();
+    const newBtn = document.getElementById('btn-history-new');
+    if (newBtn) newBtn.onclick = createDefaultProject;
+    return;
+  }
+  if (page === 'templates') {
+    body.innerHTML = renderTemplatesPage();
+    const grid = document.getElementById('feature-template-grid');
+    if (grid) renderTemplateGrid(grid);
+    const newBtn = document.getElementById('btn-template-new');
+    if (newBtn) newBtn.onclick = createDefaultProject;
+    return;
+  }
+  if (page === 'settings') {
+    body.innerHTML = renderSettingsPage();
+    const openBtn = document.getElementById('btn-open-settings-page');
+    if (openBtn) openBtn.onclick = openSettingsModal;
+    return;
+  }
   body.innerHTML = `
     <aside class="sidebar">
       <div class="sidebar-head">
@@ -1201,11 +1899,18 @@ function addAttachments(files) {
     state.pendingAttachments.push(att);
     if (kind === 'image') {
       const r = new FileReader();
-      r.onload = (e) => { att.dataUrl = e.target.result; renderAttachments(); };
+      r.onload = (e) => {
+        att.dataUrl = e.target.result;
+        renderAttachments();
+        renderImageAlbumAttachments();
+        renderLandingAttachments();
+      };
       r.readAsDataURL(f);
     }
   }
   renderAttachments();
+  renderImageAlbumAttachments();
+  renderLandingAttachments();
 }
 
 function removeAttachment(i) {
@@ -2676,6 +3381,43 @@ function openGallery() {
   grid.querySelectorAll('.gallery-card .preview').forEach((p) => galleryResizeObserver.observe(p));
 }
 
+function renderTemplateGrid(grid) {
+  if (!grid) return;
+  grid.innerHTML = state.templates.map((tpl) => templateCardHtml(tpl)).join('');
+  grid.querySelectorAll('.gallery-card').forEach((card) => {
+    card.onclick = () => {
+      const tid = card.dataset.id;
+      const tpl = state.templates.find((x) => x.id === tid);
+      if (tpl) openTemplatePreviewModal(tpl);
+    };
+  });
+  setTimeout(() => applyGalleryScales(grid), 0);
+  if (galleryResizeObserver) galleryResizeObserver.disconnect();
+  galleryResizeObserver = new ResizeObserver(() => applyGalleryScales(grid));
+  grid.querySelectorAll('.gallery-card .preview').forEach((p) => galleryResizeObserver.observe(p));
+}
+
+function templateCardHtml(t) {
+  const sel = state.selected?.templateId === t.id ? ' selected' : '';
+  const tags = (t.tags || []).slice(0, 4).map((tg) => `<span class="tag">${esc(tg)}</span>`).join('');
+  const portrait = isPortraitTemplate(t);
+  const entry = templateEntryPath(t);
+  const inner =
+    t.preview_mode === 'poster' && t.poster_url
+      ? `<img class="poster" src="${esc(t.poster_url)}" alt="${esc(t.name ?? t.id)}" loading="lazy" />`
+      : `<iframe sandbox="allow-scripts allow-same-origin" src="/template-asset/${esc(t.id)}/${esc(entry)}" loading="lazy"></iframe>`;
+  return `<div class="gallery-card${sel}" data-id="${esc(t.id)}">
+    <div class="preview ${portrait ? 'portrait' : ''}" data-portrait="${portrait}">
+      ${inner}
+    </div>
+    <div class="meta">
+      <div class="name">${esc(t.name)}</div>
+      <div class="desc">${esc(t.description ?? '')}</div>
+      <div class="tags">${tags}</div>
+    </div>
+  </div>`;
+}
+
 let galleryResizeObserver = null;
 function applyGalleryScales(grid) {
   grid.querySelectorAll('.gallery-card .preview').forEach((p) => {
@@ -2776,25 +3518,33 @@ function openTemplatePreviewModal(tpl) {
   // If the project already has this template applied, downgrade the primary
   // action to a no-op "in use" label so the user doesn't reapply needlessly.
   const isCurrent = state.selected?.templateId === tpl.id;
-  useBtn.textContent = isCurrent
-    ? t('settings.agent.in_use')
-    : t('tpl_preview.use');
+  useBtn.textContent = !state.selected
+    ? '新建项目并使用'
+    : isCurrent
+      ? t('settings.agent.in_use')
+      : t('tpl_preview.use');
   useBtn.disabled = isCurrent;
 
   useBtn.onclick = async () => {
-    if (!state.selected) return;
+    let projectId = state.selected?.id ?? '';
+    if (!projectId) {
+      const r = await API.createProject({ name: tpl.name ?? 'Untitled' });
+      if (!r?.project?.id) return;
+      projectId = r.project.id;
+      await refreshProjects();
+    }
     // If the project already has a different template applied, confirm
     // before replacing — the user may have been just exploring.
-    const current = state.selected.templateId;
+    const current = state.selected?.templateId;
     if (current && current !== tpl.id) {
       if (!confirm(t('tpl_preview.replace_confirm', { name: tpl.name ?? tpl.id }))) return;
     }
     useBtn.disabled = true;
     try {
-      await API.setTemplate(state.selected.id, tpl.id);
+      await API.setTemplate(projectId, tpl.id);
       closeTemplatePreviewModal();
       closeGallery();
-      await selectProject(state.selected.id);
+      await selectProject(projectId);
       toast(t('tpl_preview.applied', { name: tpl.name ?? tpl.id }), 'success');
     } finally {
       useBtn.disabled = false;
@@ -2948,6 +3698,7 @@ const AGENT_DESC = {
   'codex': 'Codex CLI (codex exec)',
   'hermes': 'Hermes ACP CLI',
   'qoder-cli': 'Qoder CLI (qodercli -p)',
+  'pi-agent': 'Pi Coding Agent (pi -p)',
 };
 
 function openSettingsModal(tab = 'agent') {

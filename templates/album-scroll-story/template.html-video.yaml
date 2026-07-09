@@ -1,0 +1,110 @@
+spec_version: 1
+id: album-scroll-story
+name: Scroll Story Album
+description: >
+  Interactive digital album for photos, pasted HTML, or described material.
+  Mobile users scroll down between pages; desktop users can click next/previous
+  controls or use the keyboard.
+
+engine: hyperframes
+engine_version: ^0.4.0
+source_entry: source/index.html
+
+category: presentation
+subcategory: interactive-album
+tags: [album, gallery, interactive, mobile-scroll, desktop-paging, photos, portfolio]
+
+best_for:
+  - "Electronic photo albums"
+  - "Event recaps"
+  - "Product or company story decks"
+  - "Mobile-first page-by-page browsing"
+
+output:
+  formats: [mp4, webm]
+  default_format: mp4
+  resolution:
+    default: { width: 1080, height: 1920 }
+    supported_aspects: ["9:16", "16:9", "1:1"]
+  fps:
+    default: 60
+    supported: [30, 60]
+  duration:
+    type: variable
+    min_sec: 8
+    max_sec: 30
+  alpha: false
+  audio:
+    supported: true
+    expected_inputs: [bgm, narration]
+
+inputs:
+  schema:
+    type: object
+    required: [title, pages]
+    properties:
+      title:
+        type: "string"
+        maxLength: 80
+        description: "Album cover title"
+      subtitle:
+        type: "string"
+        maxLength: 160
+        description: "Cover subtitle or event context"
+      pages:
+        type: "array"
+        minItems: 3
+        maxItems: 10
+        items:
+          type: object
+          required: ["title", "caption"]
+          properties:
+            eyebrow: { type: string }
+            title: { type: string }
+            caption: { type: string }
+            image_path:
+              type: string
+              description: "Optional local uploaded image path to place in the page media slot"
+            accent: { type: string }
+      duration_sec:
+        type: "number"
+        minimum: 8
+        maximum: 30
+        default: 12
+  examples:
+    - {
+        "title": "Aoki Company Album",
+        "subtitle": "Four pages about people, products, milestones, and future plans",
+        "pages": [
+          { "eyebrow": "01 / origin", "title": "Built around dependable delivery", "caption": "A compact opening page for the brand story." },
+          { "eyebrow": "02 / team", "title": "A practical team with product taste", "caption": "Use uploaded people or workspace photos here." },
+          { "eyebrow": "03 / milestones", "title": "From first client to repeatable service", "caption": "Summarize proof points without turning the album into a report." }
+        ],
+        "duration_sec": 12
+      }
+
+license:
+  spdx: Apache-2.0
+  attribution_required: false
+  redistribution_allowed: true
+  commercial_use: true
+
+author:
+  name: html-video
+  url: https://github.com/nexu-io/html-video
+  contact: open-design@nexu.io
+
+version: 0.1.0
+changelog:
+  - version: 0.1.0
+    date: 2026-07-07
+    notes: Added interactive electronic-album template with mobile scroll and desktop paging.
+
+preview:
+  poster: poster.svg
+
+performance:
+  reference_render:
+    duration_sec: 12
+    render_wall_clock_sec: 12
+    machine: "Windows dev workstation"

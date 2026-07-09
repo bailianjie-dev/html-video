@@ -107,11 +107,12 @@ export function spawnAgent(opts: SpawnOptions): SpawnHandle {
       if (resolved) command = resolved;
     }
 
+    const needsShell = isWin && /\.(?:cmd|bat)$/i.test(command);
     const child = cpSpawn(command, args, {
       cwd: context.cwd,
       env,
       stdio: ['pipe', 'pipe', 'pipe'],
-      ...(isWin && { shell: true }),
+      ...(needsShell && { shell: true }),
       windowsHide: true,
     });
     childKill = () => {

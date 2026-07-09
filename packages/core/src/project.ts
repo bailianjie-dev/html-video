@@ -26,7 +26,8 @@ import {
 } from '@html-video/content-graph';
 import { HtmlVideoError } from './errors.js';
 import type { AssetStore } from './asset-store.js';
-import type { EngineRegistry, ProjectStore, TemplateRegistry } from './registry.js';
+import type { EngineRegistry, TemplateRegistry } from './registry.js';
+import type { ProjectPersistence } from './services/project-persistence.js';
 
 export interface CreateProjectInput {
   name: string;
@@ -38,7 +39,7 @@ export interface ProjectOrchestratorDeps {
   projectRoot: string;
   engines: EngineRegistry;
   templates: TemplateRegistry;
-  projects: ProjectStore;
+  projects: ProjectPersistence;
   assets: AssetStore;
 }
 
@@ -186,6 +187,9 @@ export class ProjectOrchestrator {
    * Single-frame fast-path. Clears any prior multi-frame graph state.
    */
   async writePreviewHtmlRaw(projectId: string, html: string): Promise<{ project: Project; htmlPath: string }> {
+    if (this.deps.projects.writeRawHtml) {
+      return this.deps.projects.writeRawHtml(projectId, html);
+    }
     const project = await this.deps.projects.load(projectId);
     const projectDir = await this.deps.projects.ensureDir(projectId);
     const { writeFile } = await import('node:fs/promises');
@@ -210,6 +214,18 @@ export class ProjectOrchestrator {
     return { project, htmlPath };
   }
 
+  async readRawHtml(projectId: string): Promise<string | null> {
+    if (this.deps.projects.readRawHtml) {
+      return this.deps.projects.readRawHtml(projectId);
+    }
+    const project = await this.deps.projects.load(projectId);
+    if (!project.lastPreviewHtmlPath) return null;
+    const { readFile } = await import('node:fs/promises');
+    const { existsSync } = await import('node:fs');
+    if (!existsSync(project.lastPreviewHtmlPath)) return null;
+    return readFile(project.lastPreviewHtmlPath, 'utf8');
+  }
+
   // ---------------- v0.8: ContentGraph + multi-frame ----------------
 
   /**
@@ -227,6 +243,9 @@ export class ProjectOrchestrator {
         'invalid-input',
         `ContentGraph invalid: ${result.errors.map((e) => e.message).join('; ')}`,
       );
+    }
+    if (this.deps.projects.writeContentGraph) {
+      return this.deps.projects.writeContentGraph(projectId, graph, opts);
     }
     const project = await this.deps.projects.load(projectId);
     const projectDir = await this.deps.projects.ensureDir(projectId);
@@ -258,6 +277,9 @@ export class ProjectOrchestrator {
    * Read the persisted content graph. Returns null if none.
    */
   async readContentGraph(projectId: string): Promise<ContentGraph | null> {
+    if (this.deps.projects.readContentGraph) {
+      return this.deps.projects.readContentGraph(projectId);
+    }
     const project = await this.deps.projects.load(projectId);
     if (!project.contentGraphPath) return null;
     const { readFile } = await import('node:fs/promises');
@@ -299,11 +321,9 @@ export class ProjectOrchestrator {
     const { writeFile, mkdir } = await import('node:fs/promises');
     const { join } = await import('node:path');
     const framesDir = join(projectDir, 'frames');
-    await mkdir(framesDir, { recursive: true });
     const safeId = graphNodeId.replace(/[^a-z0-9_-]/gi, '_');
     const filename = `${String(idx + 1).padStart(2, '0')}-${safeId}.html`;
     const htmlPath = join(framesDir, filename);
-    await writeFile(htmlPath, html, 'utf8');
 
     const frame: FrameRecord = {
       graphNodeId,
@@ -311,6 +331,11 @@ export class ProjectOrchestrator {
       durationSec: node.durationSec ?? DEFAULT_FRAME_DURATION_SEC,
       order: idx,
     };
+    if (this.deps.projects.writeFrameHtml) {
+      return this.deps.projects.writeFrameHtml(projectId, graphNodeId, html, frame);
+    }
+    await mkdir(framesDir, { recursive: true });
+    await writeFile(htmlPath, html, 'utf8');
     project.frames = (project.frames ?? []).filter((f) => f.graphNodeId !== graphNodeId);
     project.frames.push(frame);
     project.frames.sort((a, b) => a.order - b.order);
@@ -321,6 +346,19 @@ export class ProjectOrchestrator {
     if (project.status === 'draft') project.status = 'previewed';
     await this.deps.projects.save(project);
     return { project, frame };
+  }
+
+  async readFrameHtml(projectId: string, graphNodeId: string): Promise<string | null> {
+    if (this.deps.projects.readFrameHtml) {
+      return this.deps.projects.readFrameHtml(projectId, graphNodeId);
+    }
+    const project = await this.deps.projects.load(projectId);
+    const frame = (project.frames ?? []).find((f) => f.graphNodeId === graphNodeId);
+    if (!frame) return null;
+    const { readFile } = await import('node:fs/promises');
+    const { existsSync } = await import('node:fs');
+    if (!existsSync(frame.htmlPath)) return null;
+    return readFile(frame.htmlPath, 'utf8');
   }
 
   // ---------------- Render: preview HTML / export MP4 ----------------
