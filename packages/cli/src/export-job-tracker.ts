@@ -25,6 +25,12 @@ export interface ExportJobHandle {
   pendingUpdate: Promise<void>;
 }
 
+export interface ExportArtifactLocation {
+  ossBucket: string;
+  ossKey: string;
+  outputUrl: string;
+}
+
 type ExportJobAccess = Pick<
   ExportJobRepository,
   'create' | 'update' | 'findById' | 'listByAlbum'
@@ -140,7 +146,11 @@ export class ExportJobTracker {
       });
   }
 
-  async succeed(handle: ExportJobHandle | null, outputPath: string): Promise<void> {
+  async succeed(
+    handle: ExportJobHandle | null,
+    outputPath: string,
+    artifact?: ExportArtifactLocation,
+  ): Promise<void> {
     if (!handle) return;
     await handle.pendingUpdate;
     let fileSizeBytes: number | null = null;
@@ -157,6 +167,11 @@ export class ExportJobTracker {
         status: 'succeeded',
         progress_percent: 100,
         local_output_path: outputPath,
+        ...(artifact && {
+          oss_bucket: artifact.ossBucket,
+          oss_key: artifact.ossKey,
+          output_url: artifact.outputUrl,
+        }),
         file_size_bytes: fileSizeBytes,
         checksum_sha256: checksumSha256,
         error_code: null,
@@ -168,13 +183,35 @@ export class ExportJobTracker {
     }
   }
 
-  async fail(handle: ExportJobHandle | null, error: unknown): Promise<void> {
+  async fail(
+    handle: ExportJobHandle | null,
+    error: unknown,
+    outputPath?: string,
+  ): Promise<void> {
     if (!handle) return;
     await handle.pendingUpdate;
     const code = errorCode(error);
+    let outputPatch: {
+      local_output_path: string;
+      file_size_bytes: number;
+      checksum_sha256: string;
+    } | undefined;
+    if (outputPath) {
+      try {
+        const metadata = await outputMetadata(outputPath);
+        outputPatch = {
+          local_output_path: outputPath,
+          file_size_bytes: metadata.fileSizeBytes,
+          checksum_sha256: metadata.checksumSha256,
+        };
+      } catch (metadataError) {
+        this.warn(`failed output metadata failed for ${handle.id}: ${errorMessage(metadataError)}`);
+      }
+    }
     try {
       await this.opts.jobs.update(handle.userId, handle.id, {
         status: code === 'cancelled' ? 'cancelled' : 'failed',
+        ...outputPatch,
         error_code: code,
         error_message: errorMessage(error).slice(0, MAX_ERROR_LENGTH),
         finished_time: new Date(),

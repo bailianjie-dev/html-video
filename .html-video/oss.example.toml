@@ -1,5 +1,5 @@
 [oss]
-# Set to true to enable the dev OSS upload test.
+# Set to true to enable OSS uploads and garbage collection.
 enabled = true
 
 # MVP implementation currently supports Aliyun OSS.
@@ -16,5 +16,10 @@ access_key_secret = "YOUR_ACCESS_KEY_SECRET"
 # Optional. Defaults to https://<bucket>.<endpoint>
 public_base_url = "https://your-bucket-name.oss-cn-example.aliyuncs.com"
 
-# Uploaded test objects will be written under this prefix.
+# Uploaded objects will be written under this prefix.
 prefix = "html-video/dev"
+
+# Garbage collection defaults. `html-video oss-gc` is dry-run unless
+# `--execute` is provided.
+garbage_retention_days = 7
+garbage_batch_size = 100

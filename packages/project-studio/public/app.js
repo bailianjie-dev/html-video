@@ -752,8 +752,8 @@ function renderCreatePage() {
       </section>
 
       <section class="generator-panel">
-        <div class="generator-tabs" role="tablist" aria-label="creation mode">
-          <button class="active" type="button" id="tab-create-topic">${navIcon('edit')}<span>输入主题</span></button>
+        <div class="generator-tabs">
+          <div class="generator-mode-label">${navIcon('edit')}<span>主题与生成要求</span></div>
         </div>
 
         <div class="generator-controls">

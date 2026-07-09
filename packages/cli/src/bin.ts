@@ -19,6 +19,7 @@ import {
   projectRender,
 } from './commands/project.js';
 import { startStudioServer } from './studio-server.js';
+import { runOssGarbageCollector } from './oss-garbage-collector.js';
 
 // cac is a CJS default export; ESM interop sometimes wraps it in `.default`
 // biome-ignore lint/suspicious/noExplicitAny: cac's types don't expose this shape
@@ -185,6 +186,28 @@ cli
       output: opts.output,
       streamProgress: !!opts.streamProgress,
     });
+  });
+
+cli
+  .command('oss-gc', 'Clean expired soft-deleted objects from Aliyun OSS')
+  .option('--execute', 'Delete objects; without this flag the command is a dry run')
+  .option('--retention-days <n>', 'Override the configured soft-delete retention period')
+  .option('--limit <n>', 'Maximum candidates per object category')
+  .action(async (opts: any) => {
+    setJsonMode(!!opts.json);
+    const ctx = await bootstrap({ cwd: opts.cwd });
+    try {
+      const result = await runOssGarbageCollector(ctx, {
+        execute: !!opts.execute,
+        ...(opts.retentionDays !== undefined && { retentionDays: Number(opts.retentionDays) }),
+        ...(opts.limit !== undefined && { limit: Number(opts.limit) }),
+      });
+      ok(result);
+    } catch (error) {
+      fail('oss-gc-failed', error instanceof Error ? error.message : String(error));
+    } finally {
+      await ctx.database?.handle?.close().catch(() => {});
+    }
   });
 
 // ====== Studio (HTML Anything-style three-pane UI) ======

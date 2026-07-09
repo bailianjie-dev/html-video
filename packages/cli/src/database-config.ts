@@ -51,7 +51,8 @@ export function createPgClient(config: DatabaseConfig): PgClientHandle {
     db: {
       async query<T = unknown>(sql: string, params?: readonly unknown[]): Promise<DbQueryResult<T>> {
         const result = await pool.query(sql, params ? [...params] : undefined);
-        return { rows: result.rows as T[], rowCount: result.rowCount ?? result.rows.length };
+        const rows = Array.isArray(result.rows) ? result.rows as T[] : [];
+        return { rows, rowCount: result.rowCount ?? rows.length };
       },
     },
     close: () => pool.end(),

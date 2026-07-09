@@ -122,4 +122,33 @@ export class ExportJobRepository {
   async updateStatus(userId: string, id: string, status: JobStatus, updatedBy: string): Promise<ExportJobRow | null> {
     return this.update(userId, id, { status }, updatedBy);
   }
+
+  /**
+   * System-maintenance query for OSS exports whose owning album has been
+   * soft-deleted. User-facing queries remain user-scoped.
+   */
+  async listOssGarbageCandidates(deletedBefore: Date, limit = 100): Promise<ExportJobRow[]> {
+    const result = await this.db.query<ExportJobRow>(
+      `SELECT job.*
+       FROM ai_album_export_jobs job
+       JOIN ai_album_albums album
+         ON album.id = job.album_id AND album.user_id = job.user_id
+       WHERE album.status = 'deleted'
+         AND album.updated_time <= $1
+         AND job.oss_bucket IS NOT NULL
+         AND job.oss_key IS NOT NULL
+       ORDER BY album.updated_time ASC, job.created_time ASC, job.id ASC
+       LIMIT $2`,
+      [deletedBefore, limit],
+    );
+    return result.rows;
+  }
+
+  async clearOssArtifact(userId: string, id: string, updatedBy: string): Promise<ExportJobRow | null> {
+    return this.update(userId, id, {
+      oss_bucket: null,
+      oss_key: null,
+      output_url: null,
+    }, updatedBy);
+  }
 }

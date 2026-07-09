@@ -25,6 +25,7 @@ import {
   type DatabaseConfig,
   type PgClientHandle,
 } from './database-config.js';
+import { createHtmlOssPublisher } from './html-oss-publisher.js';
 
 export interface CliContext {
   projectRoot: string;
@@ -95,6 +96,7 @@ export async function bootstrap(opts: { cwd?: string } = {}): Promise<CliContext
       db: databaseHandle.db,
       projectRoot,
       getUserContext: () => requestContexts.getRequiredUser(),
+      publishHtml: createHtmlOssPublisher(projectRoot),
     });
     database = { config: databaseConfig, handle: databaseHandle, mode: 'postgres' };
   } else if (databaseConfig) {

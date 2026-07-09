@@ -417,6 +417,7 @@ export interface Project {
   status: ProjectStatus;
   /** Path to the latest agent-generated HTML (v0.3 chat-to-HTML pipeline; single-frame fast path) */
   lastPreviewHtmlPath?: string;
+  lastPreviewHtmlUrl?: string;
   lastPreviewPosterPath?: string;
   lastOutputMp4Path?: string;
   /** Export history — every MP4 exported for this project, newest last. Each

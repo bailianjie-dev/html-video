@@ -7,17 +7,18 @@
 已接入的核心链路：
 
 - 项目主表：`ai_album_albums`
-- 页面与 HTML：`ai_album_album_pages`
+- 页面与 HTML：`ai_album_album_pages`，HTML 同时发布到 OSS
 - 上传素材：`ai_album_assets`
 - OSS 文件上传：当前实现支持阿里云 OSS
+- AI 生成日志：`ai_album_ai_generation_logs`
+- MP4 导出任务：`ai_album_export_jobs`
+- MP4 导出产物：PostgreSQL 与 OSS 同时启用时上传 OSS，并在任务中记录访问地址
 
 暂未接入或暂不处理：
 
-- `ai_album_ai_generation_logs`：AI 生成过程日志暂未写入数据库
-- `ai_album_export_jobs`：MP4 导出任务暂未接入，因为导出 MP4 功能是否保留尚未确定
 - 内联 text/data 素材：当前仍沿用原本本地/Project settings 行为
 - 页面与素材的精确 page_id 绑定：当前素材上传会绑定 `album_id`，暂未绑定到具体页面
-- OSS 文件删除：删除素材时只软删除数据库记录，不删除 OSS 对象
+- OSS 文件删除：业务接口先软删除，垃圾清理任务在保留期后删除 OSS 对象
 
 ## 配置文件
 
@@ -132,6 +133,10 @@ PUT /api/projects/:id/frames/:nodeId/raw-html
 - `content_graph` 元信息保存在 `ai_album_albums.settings.content_graph`
 - graph node 保存在 `ai_album_album_pages.content.graph_node`
 - 页面 HTML 保存在 `ai_album_album_pages.raw_html`
+- PostgreSQL 与 OSS 同时启用时，preview/frame HTML 同步上传 OSS
+- 页面行的 `html_oss_bucket`、`html_oss_key`、`html_url` 和
+  `html_checksum_sha256` 保存发布位置和校验值
+- 相册的 `last_preview_html_url` 保存最近预览页面 URL
 
 ### 素材上传
 
@@ -297,6 +302,8 @@ Invoke-RestMethod -Method Get http://127.0.0.1:3071/api/dev/album-persistence-he
 排查：
 
 - 确认已执行 `migrations/001_init_album_tables.sql`
+- 使用 OSS 垃圾清理任务前执行 `migrations/004_add_oss_cleanup_indexes.sql`
+- 使用 HTML OSS 发布前执行 `migrations/005_add_album_page_html_oss.sql`
 - 确认数据库客户端里看到的库名和 `database.toml` 的 `name` 一致
 - 确认表在 `public` schema 下
 
@@ -393,14 +400,45 @@ enabled = false
 
 ### 删除素材后 OSS 文件还在
 
-这是当前设计行为。
+这是保留期内的设计行为。
 
 删除接口只做：
 
 - 从 `project.assets[]` 移除
 - `ai_album_assets.status = 'deleted'`
 
-不会删除 OSS 对象。这样可以避免误删正在被历史相册、页面或生成结果引用的文件。
+不会立即删除 OSS 对象。这样可以提供恢复窗口，并避免业务请求同步删除外部对象。
+
+垃圾清理命令默认只预览候选项：
+
+```powershell
+node packages/cli/dist/bin.js --cwd . oss-gc
+```
+
+确认候选数量后显式执行：
+
+```powershell
+node packages/cli/dist/bin.js --cwd . oss-gc --execute
+```
+
+可用 `--retention-days <n>` 和 `--limit <n>` 临时覆盖配置。默认值可写入
+`.html-video/oss.toml`：
+
+```toml
+[oss]
+garbage_retention_days = 7
+garbage_batch_size = 100
+```
+
+清理规则：
+
+- 只处理超过保留期的 `status = 'deleted'` 素材或已删除相册所属素材
+- 活跃素材仍引用同一 bucket/key 时不会列为候选
+- 已删除相册关联的 HTML 和 MP4 OSS 产物也会清理
+- OSS 删除成功或对象已不存在后，才硬删除素材行或清空页面/导出任务 OSS 字段
+- 删除失败和 bucket 不匹配会保留数据库记录，供下次任务重试
+
+生产环境可用 Windows 任务计划、cron 或 CI 定时调用。建议始终先运行 dry-run。
 
 ## 当前实现边界
 
@@ -422,14 +460,23 @@ enabled = false
 
 后续如果要进一步收敛，可以把 text/data 也写入 `ai_album_assets`，并让项目加载时从 `ai_album_assets` 重建 `project.assets[]`。
 
-### AI 日志尚未入库
+### AI 生成日志
 
-当前 AI 生成过程还没有写入 `ai_album_ai_generation_logs`。
+正式 AI 生成流程已写入 `ai_album_ai_generation_logs`。每次真实模型调用先记录
+`running`，完成后更新为 `succeeded` 或 `failed`；日志写入失败不会中断生成流程。
 
-如果后续需要排查生成失败、统计 token、保存 prompt/response 快照，再接入该表。
+日志使用请求级用户上下文，异步完成回写时保留发起用户身份。
 
-### MP4 导出暂不处理
+### MP4 导出任务与 OSS 产物
 
-当前不接 `ai_album_export_jobs`，因为 MP4 导出功能是否保留尚未确定。
+MP4 导出已接入 `ai_album_export_jobs`，记录 queued/running/succeeded/failed 状态、
+进度、本地输出路径、文件大小和 SHA-256。
 
-如果未来要保留导出，再设计任务状态流转和导出产物 OSS 存储。
+当 PostgreSQL 与 OSS 同时启用时，渲染完成的 MP4 会上传到：
+
+```text
+<prefix>/projects/<projectId>/exports/<jobId>/output.mp4
+```
+
+任务成功后写入 `oss_bucket`、`oss_key` 和 `output_url`。OSS 未启用时保留本地导出；
+OSS 上传失败时任务标记为失败，但仍记录已生成的本地 MP4 路径、文件大小和 SHA-256。

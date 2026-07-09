@@ -10,6 +10,10 @@ const ALBUM_PAGE_UPDATE_COLUMNS = [
   'template_key',
   'duration_ms',
   'raw_html',
+  'html_oss_bucket',
+  'html_oss_key',
+  'html_url',
+  'html_checksum_sha256',
   'preview_asset_id',
   'poster_asset_id',
   'content',
@@ -26,13 +30,14 @@ export class AlbumPageRepository {
     const result = await this.db.query<AlbumPageRow>(
       `INSERT INTO ai_album_album_pages (
         id, user_id, album_id, node_id, page_no, title, status, template_key,
-        duration_ms, raw_html, preview_asset_id, poster_asset_id,
+        duration_ms, raw_html, html_oss_bucket, html_oss_key, html_url,
+        html_checksum_sha256, preview_asset_id, poster_asset_id,
         content, style, transition, created_by, updated_by
       ) VALUES (
         $1, $2, $3, $4, $5, $6, COALESCE($7, 'draft'), $8,
-        COALESCE($9, 3000), $10, $11, $12,
-        COALESCE($13, '{}'::jsonb), COALESCE($14, '{}'::jsonb), COALESCE($15, '{}'::jsonb),
-        $16, $17
+        COALESCE($9, 3000), $10, $11, $12, $13, $14, $15, $16,
+        COALESCE($17, '{}'::jsonb), COALESCE($18, '{}'::jsonb), COALESCE($19, '{}'::jsonb),
+        $20, $21
       ) RETURNING *`,
       [
         input.id,
@@ -45,6 +50,10 @@ export class AlbumPageRepository {
         input.template_key ?? null,
         input.duration_ms ?? null,
         input.raw_html ?? null,
+        input.html_oss_bucket ?? null,
+        input.html_oss_key ?? null,
+        input.html_url ?? null,
+        input.html_checksum_sha256 ?? null,
         input.preview_asset_id ?? null,
         input.poster_asset_id ?? null,
         input.content ?? {},
@@ -61,13 +70,14 @@ export class AlbumPageRepository {
     const result = await this.db.query<AlbumPageRow>(
       `INSERT INTO ai_album_album_pages (
         id, user_id, album_id, node_id, page_no, title, status, template_key,
-        duration_ms, raw_html, preview_asset_id, poster_asset_id,
+        duration_ms, raw_html, html_oss_bucket, html_oss_key, html_url,
+        html_checksum_sha256, preview_asset_id, poster_asset_id,
         content, style, transition, created_by, updated_by
       ) VALUES (
         $1, $2, $3, $4, $5, $6, COALESCE($7, 'draft'), $8,
-        COALESCE($9, 3000), $10, $11, $12,
-        COALESCE($13, '{}'::jsonb), COALESCE($14, '{}'::jsonb), COALESCE($15, '{}'::jsonb),
-        $16, $17
+        COALESCE($9, 3000), $10, $11, $12, $13, $14, $15, $16,
+        COALESCE($17, '{}'::jsonb), COALESCE($18, '{}'::jsonb), COALESCE($19, '{}'::jsonb),
+        $20, $21
       )
       ON CONFLICT (album_id, page_no) DO UPDATE SET
         node_id = EXCLUDED.node_id,
@@ -76,6 +86,10 @@ export class AlbumPageRepository {
         template_key = EXCLUDED.template_key,
         duration_ms = EXCLUDED.duration_ms,
         raw_html = EXCLUDED.raw_html,
+        html_oss_bucket = EXCLUDED.html_oss_bucket,
+        html_oss_key = EXCLUDED.html_oss_key,
+        html_url = EXCLUDED.html_url,
+        html_checksum_sha256 = EXCLUDED.html_checksum_sha256,
         preview_asset_id = EXCLUDED.preview_asset_id,
         poster_asset_id = EXCLUDED.poster_asset_id,
         content = EXCLUDED.content,
@@ -95,6 +109,10 @@ export class AlbumPageRepository {
         input.template_key ?? null,
         input.duration_ms ?? null,
         input.raw_html ?? null,
+        input.html_oss_bucket ?? null,
+        input.html_oss_key ?? null,
+        input.html_url ?? null,
+        input.html_checksum_sha256 ?? null,
         input.preview_asset_id ?? null,
         input.poster_asset_id ?? null,
         input.content ?? {},
@@ -111,13 +129,14 @@ export class AlbumPageRepository {
     const result = await this.db.query<AlbumPageRow>(
       `INSERT INTO ai_album_album_pages (
         id, user_id, album_id, node_id, page_no, title, status, template_key,
-        duration_ms, raw_html, preview_asset_id, poster_asset_id,
+        duration_ms, raw_html, html_oss_bucket, html_oss_key, html_url,
+        html_checksum_sha256, preview_asset_id, poster_asset_id,
         content, style, transition, created_by, updated_by
       ) VALUES (
         $1, $2, $3, $4, $5, $6, COALESCE($7, 'draft'), $8,
-        COALESCE($9, 3000), $10, $11, $12,
-        COALESCE($13, '{}'::jsonb), COALESCE($14, '{}'::jsonb), COALESCE($15, '{}'::jsonb),
-        $16, $17
+        COALESCE($9, 3000), $10, $11, $12, $13, $14, $15, $16,
+        COALESCE($17, '{}'::jsonb), COALESCE($18, '{}'::jsonb), COALESCE($19, '{}'::jsonb),
+        $20, $21
       )
       ON CONFLICT (album_id, node_id) DO UPDATE SET
         page_no = EXCLUDED.page_no,
@@ -126,6 +145,10 @@ export class AlbumPageRepository {
         template_key = EXCLUDED.template_key,
         duration_ms = EXCLUDED.duration_ms,
         raw_html = EXCLUDED.raw_html,
+        html_oss_bucket = EXCLUDED.html_oss_bucket,
+        html_oss_key = EXCLUDED.html_oss_key,
+        html_url = EXCLUDED.html_url,
+        html_checksum_sha256 = EXCLUDED.html_checksum_sha256,
         preview_asset_id = EXCLUDED.preview_asset_id,
         poster_asset_id = EXCLUDED.poster_asset_id,
         content = EXCLUDED.content,
@@ -145,6 +168,10 @@ export class AlbumPageRepository {
         input.template_key ?? null,
         input.duration_ms ?? null,
         input.raw_html ?? null,
+        input.html_oss_bucket ?? null,
+        input.html_oss_key ?? null,
+        input.html_url ?? null,
+        input.html_checksum_sha256 ?? null,
         input.preview_asset_id ?? null,
         input.poster_asset_id ?? null,
         input.content ?? {},
@@ -218,5 +245,35 @@ export class AlbumPageRepository {
       [userId, albumId, updatedBy],
     );
     return result.rowCount;
+  }
+
+  async listHtmlOssGarbageCandidates(deletedBefore: Date, limit = 100): Promise<AlbumPageRow[]> {
+    const result = await this.db.query<AlbumPageRow>(
+      `SELECT page.*
+       FROM ai_album_album_pages page
+       JOIN ai_album_albums album
+         ON album.id = page.album_id AND album.user_id = page.user_id
+       WHERE album.status = 'deleted'
+         AND album.updated_time <= $1
+         AND page.html_oss_bucket IS NOT NULL
+         AND page.html_oss_key IS NOT NULL
+       ORDER BY album.updated_time ASC, page.page_no ASC, page.id ASC
+       LIMIT $2`,
+      [deletedBefore, limit],
+    );
+    return result.rows;
+  }
+
+  async clearHtmlOssLocation(
+    userId: string,
+    id: string,
+    updatedBy: string,
+  ): Promise<AlbumPageRow | null> {
+    return this.update(userId, id, {
+      html_oss_bucket: null,
+      html_oss_key: null,
+      html_url: null,
+      html_checksum_sha256: null,
+    }, updatedBy);
   }
 }

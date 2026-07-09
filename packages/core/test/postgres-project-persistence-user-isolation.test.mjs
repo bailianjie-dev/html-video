@@ -114,6 +114,10 @@ class MemoryAlbumPageRepository {
       template_key: input.template_key ?? null,
       duration_ms: input.duration_ms ?? 3000,
       raw_html: input.raw_html ?? null,
+      html_oss_bucket: input.html_oss_bucket ?? null,
+      html_oss_key: input.html_oss_key ?? null,
+      html_url: input.html_url ?? null,
+      html_checksum_sha256: input.html_checksum_sha256 ?? null,
       preview_asset_id: input.preview_asset_id ?? null,
       poster_asset_id: input.poster_asset_id ?? null,
       content: input.content ?? {},
@@ -166,7 +170,7 @@ function graph(text) {
   };
 }
 
-async function fixture(t) {
+async function fixture(t, publishHtml) {
   const projectRoot = await mkdtemp(join(tmpdir(), 'html-video-user-isolation-'));
   t.after(() => rm(projectRoot, { recursive: true, force: true }));
   const contexts = new RequestContextStorage();
@@ -178,6 +182,7 @@ async function fixture(t) {
     getUserContext: () => contexts.getRequiredUser(),
     albums,
     pages,
+    ...(publishHtml && { publishHtml }),
   });
   const runAs = (userId, callback) => contexts.run({
     requestId: `request-${userId}`,
@@ -186,6 +191,49 @@ async function fixture(t) {
   }, callback);
   return { albums, pages, persistence, projectRoot, runAs };
 }
+
+test('publishes preview and frame HTML with request-scoped user identity', async (t) => {
+  const publications = [];
+  const { albums, pages, persistence, runAs } = await fixture(t, async (input) => {
+    publications.push(input);
+    return {
+      bucket: 'html-bucket',
+      key: `${input.userId}/${input.projectId}/${input.nodeId}.html`,
+      url: `https://example.test/${input.userId}/${input.projectId}/${input.nodeId}.html`,
+      checksumSha256: 'a'.repeat(64),
+    };
+  });
+  await runAs('alice', () => persistence.save(project('proj_html', 'HTML album')));
+
+  const preview = await runAs(
+    'alice',
+    () => persistence.writeRawHtml('proj_html', '<html>Alice preview</html>'),
+  );
+  const frame = await runAs(
+    'alice',
+    () => persistence.writeFrameHtml('proj_html', 'intro', '<html>Alice frame</html>', {
+      graphNodeId: 'intro',
+      htmlPath: '',
+      durationSec: 3,
+      order: 0,
+    }),
+  );
+
+  assert.deepEqual(publications.map((item) => [item.userId, item.nodeId]), [
+    ['alice', 'preview'],
+    ['alice', 'intro'],
+  ]);
+  assert.equal(preview.htmlUrl, 'https://example.test/alice/proj_html/preview.html');
+  assert.equal(frame.htmlUrl, 'https://example.test/alice/proj_html/intro.html');
+  assert.equal(
+    pages.rows.find((row) => row.node_id === 'intro').html_oss_key,
+    'alice/proj_html/intro.html',
+  );
+  assert.equal(
+    albums.rows.find((row) => row.user_id === 'alice').last_preview_html_url,
+    'https://example.test/alice/proj_html/intro.html',
+  );
+});
 
 test('isolates projects and page content for two concurrent users', async (t) => {
   const { albums, pages, persistence, runAs } = await fixture(t);

@@ -18,7 +18,7 @@ import {
   projectStatusToAlbumStatus,
   projectToAlbumSettings,
 } from './project-mapper.js';
-import type { ProjectPersistence } from './project-persistence.js';
+import type { HtmlPublication, HtmlPublisher, ProjectPersistence } from './project-persistence.js';
 import type { UserContext } from './user-context.js';
 import { safeWorkDirectorySegment } from './work-directory.js';
 
@@ -28,6 +28,7 @@ export interface PostgresProjectPersistenceOptions {
   getUserContext: () => Readonly<UserContext>;
   albums?: AlbumRepository;
   pages?: AlbumPageRepository;
+  publishHtml?: HtmlPublisher;
 }
 
 export class PostgresProjectPersistence implements ProjectPersistence {
@@ -127,13 +128,18 @@ export class PostgresProjectPersistence implements ProjectPersistence {
     return readLocalFile(asString(album.settings.local_last_preview_html_path));
   }
 
-  async writeRawHtml(projectId: string, html: string): Promise<{ project: Project; htmlPath: string }> {
+  async writeRawHtml(projectId: string, html: string): Promise<{
+    project: Project;
+    htmlPath: string;
+    htmlUrl?: string;
+  }> {
     const user = this.opts.getUserContext();
     const album = await this.requireAlbum(projectId, user);
     const project = albumRowToProject(album);
     const projectDir = await this.ensureDir(project.id);
     const htmlPath = join(projectDir, 'preview.html');
     await writeFile(htmlPath, html, 'utf8');
+    const publication = await this.publishHtml(user, project.id, 'preview', html);
 
     project.lastPreviewHtmlPath = htmlPath;
     if ((project.frames?.length ?? 0) === 0) {
@@ -157,12 +163,22 @@ export class PostgresProjectPersistence implements ProjectPersistence {
       status: 'ready',
       duration_ms: projectDurationMs(project) || 3000,
       raw_html: html,
+      ...publicationFields(publication),
       content: { kind: 'single_preview', local_html_path: htmlPath },
       created_by: user.actorId,
       updated_by: user.actorId,
     });
+    if (publication) {
+      await this.albums.update(user.userId, album.id, {
+        last_preview_html_url: publication.url,
+      }, user.actorId);
+    }
     await this.saveForUser(project, user);
-    return { project: await this.loadForUser(project.id, user), htmlPath };
+    return {
+      project: await this.loadForUser(project.id, user),
+      htmlPath,
+      ...(publication && { htmlUrl: publication.url }),
+    };
   }
 
   async readFrameHtml(projectId: string, nodeId: string): Promise<string | null> {
@@ -180,7 +196,7 @@ export class PostgresProjectPersistence implements ProjectPersistence {
     nodeId: string,
     html: string,
     frame: FrameRecord,
-  ): Promise<{ project: Project; frame: FrameRecord }> {
+  ): Promise<{ project: Project; frame: FrameRecord; htmlUrl?: string }> {
     const user = this.opts.getUserContext();
     const album = await this.requireAlbum(projectId, user);
     const project = albumRowToProject(album);
@@ -190,6 +206,7 @@ export class PostgresProjectPersistence implements ProjectPersistence {
     const safeId = nodeId.replace(/[^a-z0-9_-]/gi, '_');
     const htmlPath = join(framesDir, `${String(frame.order + 1).padStart(2, '0')}-${safeId}.html`);
     await writeFile(htmlPath, html, 'utf8');
+    const publication = await this.publishHtml(user, project.id, nodeId, html);
 
     const nextFrame: FrameRecord = {
       ...frame,
@@ -218,6 +235,7 @@ export class PostgresProjectPersistence implements ProjectPersistence {
       template_key: frame.nativeTemplateId ?? null,
       duration_ms: Math.max(1, Math.round(frame.durationSec * 1000)),
       raw_html: html,
+      ...publicationFields(publication),
       content: {
         ...(existingPage?.content ?? {}),
         ...stripUndefined({
@@ -234,8 +252,32 @@ export class PostgresProjectPersistence implements ProjectPersistence {
       created_by: user.actorId,
       updated_by: user.actorId,
     });
+    if (publication && frame.order === 0) {
+      await this.albums.update(user.userId, album.id, {
+        last_preview_html_url: publication.url,
+      }, user.actorId);
+    }
     await this.saveForUser(project, user);
-    return { project: await this.loadForUser(project.id, user), frame: nextFrame };
+    return {
+      project: await this.loadForUser(project.id, user),
+      frame: nextFrame,
+      ...(publication && { htmlUrl: publication.url }),
+    };
+  }
+
+  private async publishHtml(
+    user: Readonly<UserContext>,
+    projectId: string,
+    nodeId: string,
+    html: string,
+  ): Promise<HtmlPublication | null> {
+    if (!this.opts.publishHtml) return null;
+    return this.opts.publishHtml({
+      userId: user.userId,
+      projectId,
+      nodeId,
+      html,
+    });
   }
 
   async readContentGraph(projectId: string): Promise<ContentGraph | null> {
@@ -299,6 +341,10 @@ export class PostgresProjectPersistence implements ProjectPersistence {
         status: existing?.raw_html ? 'ready' : 'draft',
         duration_ms: Math.max(1, Math.round((node.durationSec ?? 3) * 1000)),
         raw_html: opts.preserveFrames ? existing?.raw_html ?? null : null,
+        html_oss_bucket: existing?.html_oss_bucket ?? null,
+        html_oss_key: existing?.html_oss_key ?? null,
+        html_url: existing?.html_url ?? null,
+        html_checksum_sha256: existing?.html_checksum_sha256 ?? null,
         content: {
           ...(existing?.content ?? {}),
           graph_node: node as unknown as JsonValue,
@@ -370,6 +416,17 @@ async function readLocalFile(path: string | undefined): Promise<string | null> {
 async function readJsonFile<T>(path: string | undefined): Promise<T | null> {
   const raw = await readLocalFile(path);
   return raw ? JSON.parse(raw) as T : null;
+}
+
+function publicationFields(publication: HtmlPublication | null) {
+  return publication
+    ? {
+        html_oss_bucket: publication.bucket,
+        html_oss_key: publication.key,
+        html_url: publication.url,
+        html_checksum_sha256: publication.checksumSha256,
+      }
+    : {};
 }
 
 function asString(value: unknown): string | undefined {

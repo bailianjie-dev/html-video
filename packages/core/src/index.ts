@@ -26,7 +26,12 @@ export {
 export { LOCAL_DEV_USER_CONTEXT } from './services/user-context.js';
 export { RequestContextStorage } from './services/request-context.js';
 export { safeWorkDirectorySegment } from './services/work-directory.js';
-export type { ProjectPersistence } from './services/project-persistence.js';
+export type {
+  HtmlPublication,
+  HtmlPublisher,
+  HtmlPublishInput,
+  ProjectPersistence,
+} from './services/project-persistence.js';
 export type { PostgresProjectPersistenceOptions } from './services/postgres-project-persistence.js';
 export type {
   CreateProjectAssetInput,

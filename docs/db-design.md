@@ -69,7 +69,9 @@
 - `status`：`draft`、`ready`、`disabled`、`deleted`。
 - `template_key`：页面使用的模板标识，可映射 `Project.templateId` 或 `FrameRecord.nativeTemplateId`。
 - `duration_ms`：该页面在视频中的持续时长，映射 `FrameRecord.durationSec * 1000`。
-- `raw_html`：迁移当前 `frames/*.html` 或 `preview.html` 的 HTML 文本。MVP 可直接入库；如果 HTML 很大或需要静态分发，后续可改为 OSS asset 引用。
+- `raw_html`：保留完整 HTML 源码，供编辑和渲染读取。
+- `html_oss_bucket`、`html_oss_key`、`html_url`、`html_checksum_sha256`：
+  记录同步发布到 OSS 的 standalone HTML 位置和校验值；object key 包含用户、项目和页面标识。
 - `preview_asset_id`、`poster_asset_id`：页面级预览 MP4、缩略图或海报素材 ID。当前不强加外键，避免与 `ai_album_assets.page_id` 形成循环关系；应用层校验归属。
 - `content`：保存 content graph node、页面文案、结构化数据、`FrameRecord.data` 等内容。
 - `style`：保存页面样式、引擎、增强状态等信息。

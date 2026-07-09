@@ -24,6 +24,9 @@ export function albumRowToProject(album: AlbumRow): Project {
     const value = asOptionalString(settings.local_last_preview_html_path);
     if (value !== undefined) project.lastPreviewHtmlPath = value;
   }
+  if (album.last_preview_html_url) {
+    project.lastPreviewHtmlUrl = album.last_preview_html_url;
+  }
   if (settings.local_last_preview_poster_path !== undefined) {
     const value = asOptionalString(settings.local_last_preview_poster_path);
     if (value !== undefined) project.lastPreviewPosterPath = value;

@@ -124,4 +124,63 @@ export class AssetRepository {
   async softDelete(userId: string, id: string, updatedBy: string): Promise<AssetRow | null> {
     return this.updateStatus(userId, id, 'deleted', updatedBy);
   }
+
+  /**
+   * System-maintenance query. User-facing reads must continue to use the
+   * user-scoped methods above.
+   */
+  async listOssGarbageCandidates(deletedBefore: Date, limit = 100): Promise<AssetRow[]> {
+    const result = await this.db.query<AssetRow>(
+      `SELECT candidate.*
+       FROM ai_album_assets candidate
+       LEFT JOIN ai_album_albums candidate_album
+         ON candidate_album.id = candidate.album_id
+        AND candidate_album.user_id = candidate.user_id
+       WHERE (
+           (candidate.status = 'deleted' AND candidate.updated_time <= $1)
+           OR
+           (candidate_album.status = 'deleted' AND candidate_album.updated_time <= $1)
+         )
+         AND candidate.oss_bucket IS NOT NULL
+         AND NOT EXISTS (
+           SELECT 1
+           FROM ai_album_assets active
+           LEFT JOIN ai_album_albums active_album
+             ON active_album.id = active.album_id
+            AND active_album.user_id = active.user_id
+           WHERE active.status <> 'deleted'
+             AND (active_album.status IS NULL OR active_album.status <> 'deleted')
+             AND active.oss_bucket = candidate.oss_bucket
+             AND active.oss_key = candidate.oss_key
+         )
+       ORDER BY COALESCE(candidate_album.updated_time, candidate.updated_time) ASC, candidate.id ASC
+       LIMIT $2`,
+      [deletedBefore, limit],
+    );
+    return result.rows;
+  }
+
+  /**
+   * Permanently removes a row only while it is still soft-deleted. Intended
+   * for the OSS garbage collector after the corresponding object is gone.
+   */
+  async deleteGarbageCandidate(userId: string, id: string): Promise<AssetRow | null> {
+    return firstRow(await this.db.query<AssetRow>(
+      `DELETE FROM ai_album_assets candidate
+       WHERE candidate.user_id = $1
+         AND candidate.id = $2
+         AND (
+           candidate.status = 'deleted'
+           OR EXISTS (
+             SELECT 1
+             FROM ai_album_albums album
+             WHERE album.id = candidate.album_id
+               AND album.user_id = candidate.user_id
+               AND album.status = 'deleted'
+           )
+         )
+       RETURNING candidate.*`,
+      [userId, id],
+    ));
+  }
 }

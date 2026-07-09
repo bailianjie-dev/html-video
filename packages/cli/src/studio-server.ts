@@ -36,7 +36,12 @@ import type { ContentGraph } from '@html-video/content-graph';
 import { extractUrls, fetchSource } from './fetch-source.js';
 import { detectAll, findAgent, spawnAgent } from '@html-video/runtime';
 import { createPgClient, loadDatabaseConfig, maskedDatabaseConfig } from './database-config.js';
-import { loadOssConfig, maskedOssConfig, uploadToAliyunOss } from './oss-config.js';
+import {
+  loadOssConfig,
+  maskedOssConfig,
+  uploadFileToAliyunOss,
+  uploadToAliyunOss,
+} from './oss-config.js';
 import {
   createDevAuthToken,
   DEV_AUTH_USERNAME,
@@ -50,7 +55,12 @@ import {
   aiProviderModel,
   type AiGenerationLogHandle,
 } from './ai-generation-logger.js';
-import { ExportJobTracker } from './export-job-tracker.js';
+import {
+  ExportJobTracker,
+  type ExportArtifactLocation,
+  type ExportJobHandle,
+} from './export-job-tracker.js';
+import { createHtmlOssPublisher } from './html-oss-publisher.js';
 
 interface StudioHandle {
   url: string;
@@ -182,22 +192,23 @@ export async function startStudioServer(ctx: CliContext, port: number): Promise<
           : createPgClient(cfg);
         const shouldClose = handle !== ctx.database?.handle;
         try {
+          const user = ctx.requestContexts.getRequiredUser();
           const repo = new AlbumRepository(handle.db);
           const now = new Date().toISOString();
           const id = randomUUID();
           const sourceProjectId = `dev_persistence_${id.slice(0, 8)}`;
           const created = await repo.create({
             id,
-            user_id: 'local-dev',
+            user_id: user.userId,
             source_project_id: sourceProjectId,
             title: `Persistence Test ${now}`,
             description: 'Created by POST /api/dev/persistence-test',
             status: 'draft',
             settings: { test_route: '/api/dev/persistence-test', created_at: now },
-            created_by: 'dev-test',
-            updated_by: 'dev-test',
+            created_by: user.actorId,
+            updated_by: user.actorId,
           });
-          const loaded = await repo.findById('local-dev', created.id);
+          const loaded = await repo.findById(user.userId, created.id);
           return json(res, 200, {
             ok: true,
             mode: 'postgres',
@@ -255,6 +266,7 @@ export async function startStudioServer(ctx: CliContext, port: number): Promise<
             db: handle.db,
             projectRoot: ctx.projectRoot,
             getUserContext: () => ctx.requestContexts.getRequiredUser(),
+            publishHtml: createHtmlOssPublisher(ctx.projectRoot),
           });
           const user = ctx.requestContexts.getRequiredUser();
           const albums = new AlbumRepository(handle.db);
@@ -349,9 +361,12 @@ export async function startStudioServer(ctx: CliContext, port: number): Promise<
             },
             writes: {
               raw_html_path: rawWrite.htmlPath,
+              raw_html_url: rawWrite.htmlUrl ?? null,
               content_graph_path: graphWrite.graphPath,
               intro_frame_path: introWrite.frame.htmlPath,
+              intro_frame_url: introWrite.htmlUrl ?? null,
               details_frame_path: detailsWrite.frame.htmlPath,
+              details_frame_url: detailsWrite.htmlUrl ?? null,
             },
             reads: {
               raw_html: loadedRawHtml,
@@ -377,6 +392,8 @@ export async function startStudioServer(ctx: CliContext, port: number): Promise<
                 status: page.status,
                 duration_ms: page.duration_ms,
                 has_raw_html: Boolean(page.raw_html),
+                has_html_oss: Boolean(page.html_oss_bucket && page.html_oss_key),
+                html_url: page.html_url,
                 content_keys: Object.keys(page.content),
               })),
             },
@@ -432,6 +449,7 @@ export async function startStudioServer(ctx: CliContext, port: number): Promise<
           : createPgClient(dbCfg);
         const shouldClose = handle !== ctx.database?.handle;
         try {
+          const user = ctx.requestContexts.getRequiredUser();
           const upload = await readDevOssTestUpload(req);
           const objectId = randomUUID();
           const ossKey = [
@@ -450,7 +468,7 @@ export async function startStudioServer(ctx: CliContext, port: number): Promise<
           const checksumSha256 = createHash('sha256').update(upload.body).digest('hex');
           const created = await repo.create({
             id: objectId,
-            user_id: 'local-dev',
+            user_id: user.userId,
             asset_type: assetTypeFromMime(upload.mimeType),
             usage_type: 'source',
             source: 'upload',
@@ -468,10 +486,10 @@ export async function startStudioServer(ctx: CliContext, port: number): Promise<
               uploaded_at: new Date().toISOString(),
               oss_etag: uploaded.etag,
             },
-            created_by: 'dev-test',
-            updated_by: 'dev-test',
+            created_by: user.actorId,
+            updated_by: user.actorId,
           });
-          const loaded = await repo.findById('local-dev', created.id);
+          const loaded = await repo.findById(user.userId, created.id);
 
           return json(res, 200, {
             ok: true,
@@ -523,9 +541,10 @@ export async function startStudioServer(ctx: CliContext, port: number): Promise<
           : createPgClient(cfg);
         const shouldClose = handle !== ctx.database?.handle;
         try {
+          const user = ctx.requestContexts.getRequiredUser();
           const projectId = decodeURIComponent(albumHealthMatch[1]);
           const albums = new AlbumRepository(handle.db);
-          const album = await findProjectAlbum(albums, projectId);
+          const album = await findProjectAlbum(albums, projectId, user.userId);
           if (!album) {
             return json(res, 404, {
               ok: false,
@@ -536,9 +555,9 @@ export async function startStudioServer(ctx: CliContext, port: number): Promise<
           }
 
           const pages = await new AlbumPageRepository(handle.db)
-            .listByAlbum('local-dev', album.id, { includeDeleted: true });
+            .listByAlbum(user.userId, album.id, { includeDeleted: true });
           const assets = await new AssetRepository(handle.db)
-            .listByAlbum('local-dev', album.id, { includeDeleted: true });
+            .listByAlbum(user.userId, album.id, { includeDeleted: true });
           const contentGraphInSettings = isRecordValue(album.settings.content_graph);
           const contentGraphInPages = pages.some((page) => isRecordValue(page.content.graph_node));
           const rawHtmlPages = pages.filter((page) => Boolean(page.raw_html));
@@ -577,6 +596,8 @@ export async function startStudioServer(ctx: CliContext, port: number): Promise<
                 status: page.status,
                 has_raw_html: Boolean(page.raw_html),
                 raw_html_bytes: page.raw_html ? Buffer.byteLength(page.raw_html, 'utf8') : 0,
+                has_html_oss: Boolean(page.html_oss_bucket && page.html_oss_key),
+                html_url: page.html_url,
                 has_graph_node: isRecordValue(page.content.graph_node),
                 content_keys: Object.keys(page.content),
                 updated_time: page.updated_time,
@@ -1002,19 +1023,24 @@ export async function startStudioServer(ctx: CliContext, port: number): Promise<
           // The existing export path reports project lookup/render errors.
         }
         if (!wantsStream) {
+          let renderedOutputPath: string | undefined;
           try {
             const { project, outputPath } = await ctx.orchestrator.exportMp4({
               projectId,
               onProgress: (pct, stage) => exportTracker?.progress(exportJob, pct, stage),
             });
-            await exportTracker?.succeed(exportJob, outputPath);
+            renderedOutputPath = outputPath;
+            exportTracker?.progress(exportJob, 99, 'uploading to OSS');
+            const artifact = await uploadExportMp4ToOss(ctx, projectId, outputPath, exportJob);
+            await exportTracker?.succeed(exportJob, outputPath, artifact ?? undefined);
             return json(res, 200, {
               project,
               output_path: outputPath,
+              ...(artifact && { output_url: artifact.outputUrl }),
               ...(exportJob && { job_id: exportJob.id }),
             });
           } catch (err) {
-            await exportTracker?.fail(exportJob, err);
+            await exportTracker?.fail(exportJob, err, renderedOutputPath);
             const msg = err instanceof Error ? err.message : String(err);
             return json(res, 500, {
               error: msg,
@@ -1032,6 +1058,7 @@ export async function startStudioServer(ctx: CliContext, port: number): Promise<
           catch { /* client gone — generation keeps running, result is persisted */ }
         };
         const t0 = Date.now();
+        let renderedOutputPath: string | undefined;
         try {
           sse({
             type: 'export_started',
@@ -1044,7 +1071,11 @@ export async function startStudioServer(ctx: CliContext, port: number): Promise<
               sse({ type: 'export_progress', pct, stage });
             },
           });
-          await exportTracker?.succeed(exportJob, outputPath);
+          renderedOutputPath = outputPath;
+          exportTracker?.progress(exportJob, 99, 'uploading to OSS');
+          sse({ type: 'export_progress', pct: 99, stage: 'uploading to OSS' });
+          const artifact = await uploadExportMp4ToOss(ctx, projectId, outputPath, exportJob);
+          await exportTracker?.succeed(exportJob, outputPath, artifact ?? undefined);
           const ms = Date.now() - t0;
           process.stderr.write(
             `[studio:export] proj=${projectId} done in ${ms}ms → ${outputPath}\n`,
@@ -1052,12 +1083,13 @@ export async function startStudioServer(ctx: CliContext, port: number): Promise<
           sse({
             type: 'export_done',
             output_path: outputPath,
+            ...(artifact && { output_url: artifact.outputUrl }),
             project,
             elapsed_ms: ms,
             ...(exportJob && { job_id: exportJob.id }),
           });
         } catch (err) {
-          await exportTracker?.fail(exportJob, err);
+          await exportTracker?.fail(exportJob, err, renderedOutputPath);
           const msg = err instanceof Error ? err.message : String(err);
           process.stderr.write(`[studio:export] proj=${projectId} failed: ${msg}\n`);
           sse({
@@ -2729,6 +2761,36 @@ async function addFileAssetToOss(
   return ctx.orchestrator.load(projectId);
 }
 
+async function uploadExportMp4ToOss(
+  ctx: CliContext,
+  projectId: string,
+  outputPath: string,
+  exportJob: ExportJobHandle | null,
+): Promise<ExportArtifactLocation | null> {
+  if (ctx.database?.mode !== 'postgres' || !ctx.database.handle || !exportJob) return null;
+  const oss = loadOssConfig(ctx.projectRoot);
+  if (!oss?.enabled) return null;
+
+  const ossKey = [
+    oss.prefix,
+    'projects',
+    projectId,
+    'exports',
+    exportJob.id,
+    'output.mp4',
+  ].filter(Boolean).join('/');
+  const uploaded = await uploadFileToAliyunOss(oss, {
+    key: ossKey,
+    filePath: outputPath,
+    contentType: MIME['.mp4']!,
+  });
+  return {
+    ossBucket: uploaded.bucket,
+    ossKey: uploaded.key,
+    outputUrl: uploaded.url,
+  };
+}
+
 async function softDeleteAssetInPostgres(
   ctx: CliContext,
   projectId: string,
@@ -2752,11 +2814,11 @@ function projectAssetPersistence(ctx: CliContext): PostgresAssetPersistence {
   });
 }
 
-async function findProjectAlbum(repo: AlbumRepository, projectId: string) {
-  const bySourceProjectId = await repo.findBySourceProjectId('local-dev', projectId);
+async function findProjectAlbum(repo: AlbumRepository, projectId: string, userId: string) {
+  const bySourceProjectId = await repo.findBySourceProjectId(userId, projectId);
   if (bySourceProjectId) return bySourceProjectId;
   if (!isUuid(projectId)) return null;
-  return repo.findById('local-dev', projectId);
+  return repo.findById(userId, projectId);
 }
 
 function isUuid(value: string): boolean {

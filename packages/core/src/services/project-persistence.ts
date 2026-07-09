@@ -1,6 +1,22 @@
 import type { ContentGraph } from '@html-video/content-graph';
 import type { FrameRecord, Project } from '../types/index.js';
 
+export interface HtmlPublication {
+  bucket: string;
+  key: string;
+  url: string;
+  checksumSha256: string;
+}
+
+export interface HtmlPublishInput {
+  userId: string;
+  projectId: string;
+  nodeId: string;
+  html: string;
+}
+
+export type HtmlPublisher = (input: HtmlPublishInput) => Promise<HtmlPublication>;
+
 /**
  * Persistence boundary for project metadata and project-local working files.
  *
@@ -16,7 +32,11 @@ export interface ProjectPersistence {
   remove(id: string): Promise<void>;
 
   readRawHtml?(projectId: string): Promise<string | null>;
-  writeRawHtml?(projectId: string, html: string): Promise<{ project: Project; htmlPath: string }>;
+  writeRawHtml?(projectId: string, html: string): Promise<{
+    project: Project;
+    htmlPath: string;
+    htmlUrl?: string;
+  }>;
 
   readFrameHtml?(projectId: string, nodeId: string): Promise<string | null>;
   writeFrameHtml?(
@@ -24,7 +44,7 @@ export interface ProjectPersistence {
     nodeId: string,
     html: string,
     frame: FrameRecord,
-  ): Promise<{ project: Project; frame: FrameRecord }>;
+  ): Promise<{ project: Project; frame: FrameRecord; htmlUrl?: string }>;
 
   readContentGraph?(projectId: string): Promise<ContentGraph | null>;
   writeContentGraph?(

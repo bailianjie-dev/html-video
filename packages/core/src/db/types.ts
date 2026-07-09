@@ -107,6 +107,10 @@ export interface AlbumPageRow extends AuditColumns {
   template_key: string | null;
   duration_ms: number;
   raw_html: string | null;
+  html_oss_bucket: string | null;
+  html_oss_key: string | null;
+  html_url: string | null;
+  html_checksum_sha256: string | null;
   preview_asset_id: string | null;
   poster_asset_id: string | null;
   content: JsonObject;
@@ -127,6 +131,10 @@ export type CreateAlbumPageInput = {
   template_key?: string | null;
   duration_ms?: number;
   raw_html?: string | null;
+  html_oss_bucket?: string | null;
+  html_oss_key?: string | null;
+  html_url?: string | null;
+  html_checksum_sha256?: string | null;
   preview_asset_id?: string | null;
   poster_asset_id?: string | null;
   content?: JsonObject;
@@ -142,6 +150,10 @@ export type UpdateAlbumPagePatch = Partial<{
   template_key: string | null;
   duration_ms: number;
   raw_html: string | null;
+  html_oss_bucket: string | null;
+  html_oss_key: string | null;
+  html_url: string | null;
+  html_checksum_sha256: string | null;
   preview_asset_id: string | null;
   poster_asset_id: string | null;
   content: JsonObject;
