@@ -12,21 +12,26 @@ import { HtmlVideoError } from './errors.js';
 
 export interface AssetStoreOptions {
   projectRoot: string;
+  resolveProjectDir?: (projectId: string) => Promise<string>;
 }
 
 export class AssetStore {
   private readonly projectsDir: string;
+  private readonly resolveProjectDir?: (projectId: string) => Promise<string>;
 
   constructor(opts: AssetStoreOptions) {
     this.projectsDir = join(opts.projectRoot, '.html-video', 'projects');
+    this.resolveProjectDir = opts.resolveProjectDir;
   }
 
-  private projectDir(projectId: string): string {
-    return join(this.projectsDir, projectId);
+  private async projectDir(projectId: string): Promise<string> {
+    return this.resolveProjectDir
+      ? this.resolveProjectDir(projectId)
+      : join(this.projectsDir, projectId);
   }
 
-  private assetsDir(projectId: string): string {
-    return join(this.projectDir(projectId), 'assets');
+  private async assetsDir(projectId: string): Promise<string> {
+    return join(await this.projectDir(projectId), 'assets');
   }
 
   static async computeId(filePath: string): Promise<string> {
@@ -75,7 +80,7 @@ export class AssetStore {
     const id = await AssetStore.computeId(sourcePath);
     const { mime, type } = AssetStore.guessMime(sourcePath);
     const ext = extname(sourcePath);
-    const dir = this.assetsDir(projectId);
+    const dir = await this.assetsDir(projectId);
     await mkdir(dir, { recursive: true });
     const destPath = join(dir, `${id}${ext}`);
     if (!existsSync(destPath)) {
@@ -105,7 +110,7 @@ export class AssetStore {
     userCaption?: string,
   ): Promise<Asset> {
     const id = AssetStore.computeInlineId(content);
-    const dir = this.assetsDir(projectId);
+    const dir = await this.assetsDir(projectId);
     await mkdir(dir, { recursive: true });
     const ext = type === 'data' ? '.json' : '.txt';
     const destPath = join(dir, `${id}${ext}`);
@@ -145,7 +150,7 @@ export class AssetStore {
     const normExt = ext.startsWith('.') ? ext.toLowerCase() : `.${ext.toLowerCase()}`;
     const id = createHash('sha1').update(bytes).digest('hex');
     const { mime, type } = AssetStore.guessMime(`x${normExt}`);
-    const dir = this.assetsDir(projectId);
+    const dir = await this.assetsDir(projectId);
     await mkdir(dir, { recursive: true });
     const destPath = join(dir, `${id}${normExt}`);
     if (!existsSync(destPath)) {

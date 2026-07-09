@@ -6,10 +6,10 @@ import {
   type AiGenerationType,
   type JsonObject,
   type JsonValue,
+  type UserContext,
 } from '@html-video/core';
 import type { CliContext } from './context.js';
 
-const USER_ID = 'local-dev';
 const MAX_PROMPT_LENGTH = 64 * 1024;
 const MAX_RESPONSE_EXCERPT_LENGTH = 2 * 1024;
 const MAX_ERROR_LENGTH = 4 * 1024;
@@ -29,6 +29,8 @@ export interface AiGenerationLogStart {
 export interface AiGenerationLogHandle {
   id: string;
   albumId: string;
+  userId: string;
+  actorId: string;
   pageNodeId?: string;
   startedAtMs: number;
 }
@@ -40,38 +42,51 @@ export interface AiGenerationLogSuccess {
   responsePayload?: Record<string, unknown>;
 }
 
-export class AiGenerationLogger {
-  private readonly logs;
-  private readonly albums;
-  private readonly pages;
+type AiGenerationLogAccess = Pick<AiGenerationLogRepository, 'create' | 'update'>;
+type AlbumAccess = Pick<AlbumRepository, 'findById' | 'findBySourceProjectId'>;
+type AlbumPageAccess = Pick<AlbumPageRepository, 'findByNodeId'>;
 
-  private constructor(ctx: CliContext) {
-    const db = ctx.database!.handle!.db;
-    this.logs = new AiGenerationLogRepository(db);
-    this.albums = new AlbumRepository(db);
-    this.pages = new AlbumPageRepository(db);
+export interface AiGenerationLoggerOptions {
+  getUserContext: () => Readonly<UserContext>;
+  logs: AiGenerationLogAccess;
+  albums: AlbumAccess;
+  pages: AlbumPageAccess;
+}
+
+export class AiGenerationLogger {
+  private readonly opts: AiGenerationLoggerOptions;
+
+  constructor(opts: AiGenerationLoggerOptions) {
+    this.opts = opts;
   }
 
   static fromContext(ctx: CliContext): AiGenerationLogger | null {
     if (ctx.database?.mode !== 'postgres' || !ctx.database.handle) return null;
-    return new AiGenerationLogger(ctx);
+    const db = ctx.database.handle.db;
+    return new AiGenerationLogger({
+      getUserContext: () => ctx.requestContexts.getRequiredUser(),
+      logs: new AiGenerationLogRepository(db),
+      albums: new AlbumRepository(db),
+      pages: new AlbumPageRepository(db),
+    });
   }
 
   async start(input: AiGenerationLogStart): Promise<AiGenerationLogHandle | null> {
     try {
-      const album = await this.findAlbum(input.projectId);
+      const user = this.opts.getUserContext();
+      const album = await this.findAlbum(user.userId, input.projectId);
       if (!album) {
         this.warn(`album not found for project ${input.projectId}; log skipped`);
         return null;
       }
       const page = input.pageNodeId
-        ? await this.pages.findByNodeId(USER_ID, album.id, input.pageNodeId)
+        ? await this.opts.pages.findByNodeId(user.userId, album.id, input.pageNodeId)
         : null;
       const now = new Date();
       const id = randomUUID();
-      await this.logs.create({
+      await this.opts.logs.create({
         id,
-        user_id: USER_ID,
+        user_id: user.userId,
         album_id: album.id,
         page_id: page?.id ?? null,
         generation_type: input.generationType,
@@ -86,12 +101,14 @@ export class AiGenerationLogger {
           ...(input.pageNodeId && { page_node_id: input.pageNodeId }),
         }),
         started_time: now,
-        created_by: USER_ID,
-        updated_by: USER_ID,
+        created_by: user.actorId,
+        updated_by: user.actorId,
       });
       return {
         id,
         albumId: album.id,
+        userId: user.userId,
+        actorId: user.actorId,
         ...(input.pageNodeId && { pageNodeId: input.pageNodeId }),
         startedAtMs: now.getTime(),
       };
@@ -106,11 +123,11 @@ export class AiGenerationLogger {
     try {
       const pageNodeId = result.pageNodeId ?? handle.pageNodeId;
       const page = pageNodeId
-        ? await this.pages.findByNodeId(USER_ID, handle.albumId, pageNodeId)
+        ? await this.opts.pages.findByNodeId(handle.userId, handle.albumId, pageNodeId)
         : null;
       const output = result.output ?? '';
       const htmlOutput = isHtmlOutput(output);
-      await this.logs.update(USER_ID, handle.id, {
+      await this.opts.logs.update(handle.userId, handle.id, {
         status: 'succeeded',
         ...(page?.id && { page_id: page.id }),
         ...(result.generatedAssetId && { generated_asset_id: result.generatedAssetId }),
@@ -127,7 +144,7 @@ export class AiGenerationLogger {
         finished_time: new Date(),
         error_code: null,
         error_message: null,
-      }, USER_ID);
+      }, handle.actorId);
     } catch (error) {
       this.warn(`success update failed for ${handle.id}: ${errorMessage(error)}`);
     }
@@ -141,7 +158,7 @@ export class AiGenerationLogger {
   ): Promise<void> {
     if (!handle) return;
     try {
-      await this.logs.update(USER_ID, handle.id, {
+      await this.opts.logs.update(handle.userId, handle.id, {
         status: 'failed',
         response_payload: toJsonObject({
           duration_ms: Date.now() - handle.startedAtMs,
@@ -150,17 +167,17 @@ export class AiGenerationLogger {
         error_code: truncate(errorCode, 128) ?? 'generation_failed',
         error_message: truncate(errorMessage(error), MAX_ERROR_LENGTH),
         finished_time: new Date(),
-      }, USER_ID);
+      }, handle.actorId);
     } catch (logError) {
       this.warn(`failure update failed for ${handle.id}: ${errorMessage(logError)}`);
     }
   }
 
-  private async findAlbum(projectId: string) {
-    const bySourceId = await this.albums.findBySourceProjectId(USER_ID, projectId);
+  private async findAlbum(userId: string, projectId: string) {
+    const bySourceId = await this.opts.albums.findBySourceProjectId(userId, projectId);
     if (bySourceId) return bySourceId;
     if (!isUuid(projectId)) return null;
-    return this.albums.findById(USER_ID, projectId);
+    return this.opts.albums.findById(userId, projectId);
   }
 
   private warn(message: string): void {

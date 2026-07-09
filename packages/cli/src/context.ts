@@ -12,6 +12,7 @@ import {
   PostgresProjectPersistence,
   ProjectOrchestrator,
   ProjectStore,
+  RequestContextStorage,
   TemplateRegistry,
 } from '@html-video/core';
 import type { ProjectPersistence } from '@html-video/core';
@@ -34,6 +35,7 @@ export interface CliContext {
   orchestrator: ProjectOrchestrator;
   templatesDir: string;
   mediaConfig: MediaConfigStore;
+  requestContexts: RequestContextStorage;
   database?: {
     config: DatabaseConfig;
     handle?: PgClientHandle;
@@ -82,6 +84,7 @@ export async function bootstrap(opts: { cwd?: string } = {}): Promise<CliContext
   await templates.scan(templatesDir);
 
   const projectStore = new ProjectStore(projectRoot);
+  const requestContexts = new RequestContextStorage();
   const databaseConfig = loadDatabaseConfig(projectRoot);
   let databaseHandle: PgClientHandle | undefined;
   let projects: ProjectPersistence = new FileProjectPersistence(projectStore);
@@ -91,12 +94,16 @@ export async function bootstrap(opts: { cwd?: string } = {}): Promise<CliContext
     projects = new PostgresProjectPersistence({
       db: databaseHandle.db,
       projectRoot,
+      getUserContext: () => requestContexts.getRequiredUser(),
     });
     database = { config: databaseConfig, handle: databaseHandle, mode: 'postgres' };
   } else if (databaseConfig) {
     database = { config: databaseConfig, mode: 'file' };
   }
-  const assets = new AssetStore({ projectRoot });
+  const assets = new AssetStore({
+    projectRoot,
+    resolveProjectDir: (projectId) => projects.ensureDir(projectId),
+  });
 
   const orchestrator = new ProjectOrchestrator({
     projectRoot,
@@ -117,6 +124,7 @@ export async function bootstrap(opts: { cwd?: string } = {}): Promise<CliContext
     orchestrator,
     templatesDir,
     mediaConfig,
+    requestContexts,
     ...(database !== undefined && { database }),
   };
 }

@@ -15,6 +15,8 @@ export type {
 } from './project.js';
 export { FileProjectPersistence } from './services/file-project-persistence.js';
 export { PostgresProjectPersistence } from './services/postgres-project-persistence.js';
+export { PostgresAssetPersistence } from './services/postgres-asset-persistence.js';
+export { PostgresChatPersistence } from './services/postgres-chat-persistence.js';
 export {
   albumRowToProject,
   albumStatusToProjectStatus,
@@ -22,9 +24,23 @@ export {
   projectToAlbumSettings,
 } from './services/project-mapper.js';
 export { LOCAL_DEV_USER_CONTEXT } from './services/user-context.js';
+export { RequestContextStorage } from './services/request-context.js';
+export { safeWorkDirectorySegment } from './services/work-directory.js';
 export type { ProjectPersistence } from './services/project-persistence.js';
 export type { PostgresProjectPersistenceOptions } from './services/postgres-project-persistence.js';
+export type {
+  CreateProjectAssetInput,
+  PostgresAssetPersistenceOptions,
+} from './services/postgres-asset-persistence.js';
+export type {
+  PersistedChatMessageInput,
+  PostgresChatPersistenceOptions,
+} from './services/postgres-chat-persistence.js';
 export type { UserContext } from './services/user-context.js';
+export type {
+  RequestContext,
+  RequestUserSource,
+} from './services/request-context.js';
 export type {
   DbClient,
   DbQueryResult,
@@ -37,6 +53,8 @@ export { AlbumPageRepository } from './repositories/album-page-repository.js';
 export { AssetRepository } from './repositories/asset-repository.js';
 export { AiGenerationLogRepository } from './repositories/ai-generation-log-repository.js';
 export { ExportJobRepository } from './repositories/export-job-repository.js';
+export { ChatSessionRepository } from './repositories/chat-session-repository.js';
+export { ChatMessageRepository } from './repositories/chat-message-repository.js';
 export {
   resolveMinimaxCredentials,
   generateTts,

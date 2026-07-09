@@ -4,40 +4,60 @@ import { stat } from 'node:fs/promises';
 import {
   AlbumRepository,
   ExportJobRepository,
+  HtmlVideoError,
+  type AlbumRow,
+  type ExportJobRow,
   type JsonObject,
   type Project,
+  type UserContext,
 } from '@html-video/core';
 import type { CliContext } from './context.js';
 
-const USER_ID = 'local-dev';
 const MAX_ERROR_LENGTH = 4 * 1024;
 
 export interface ExportJobHandle {
   id: string;
+  userId: string;
+  actorId: string;
   lastProgress: number;
   lastProgressWriteMs: number;
   requestParams: JsonObject;
   pendingUpdate: Promise<void>;
 }
 
-export class ExportJobTracker {
-  private readonly jobs;
-  private readonly albums;
+type ExportJobAccess = Pick<
+  ExportJobRepository,
+  'create' | 'update' | 'findById' | 'listByAlbum'
+>;
+type AlbumAccess = Pick<AlbumRepository, 'findById' | 'findBySourceProjectId'>;
 
-  private constructor(ctx: CliContext) {
-    const db = ctx.database!.handle!.db;
-    this.jobs = new ExportJobRepository(db);
-    this.albums = new AlbumRepository(db);
+export interface ExportJobTrackerOptions {
+  getUserContext: () => Readonly<UserContext>;
+  jobs: ExportJobAccess;
+  albums: AlbumAccess;
+}
+
+export class ExportJobTracker {
+  private readonly opts: ExportJobTrackerOptions;
+
+  constructor(opts: ExportJobTrackerOptions) {
+    this.opts = opts;
   }
 
   static fromContext(ctx: CliContext): ExportJobTracker | null {
     if (ctx.database?.mode !== 'postgres' || !ctx.database.handle) return null;
-    return new ExportJobTracker(ctx);
+    const db = ctx.database.handle.db;
+    return new ExportJobTracker({
+      getUserContext: () => ctx.requestContexts.getRequiredUser(),
+      jobs: new ExportJobRepository(db),
+      albums: new AlbumRepository(db),
+    });
   }
 
   async start(project: Project, streaming: boolean): Promise<ExportJobHandle | null> {
     try {
-      const album = await this.findAlbum(project.id);
+      const user = this.opts.getUserContext();
+      const album = await this.findAlbum(user.userId, project.id);
       if (!album) {
         this.warn(`album not found for project ${project.id}; export job skipped`);
         return null;
@@ -55,9 +75,9 @@ export class ExportJobTracker {
         has_music: Boolean(project.soundtrack?.musicAssetId),
         has_narration: Boolean(project.soundtrack?.narrationAssetId),
       };
-      await this.jobs.create({
+      await this.opts.jobs.create({
         id,
-        user_id: USER_ID,
+        user_id: user.userId,
         album_id: album.id,
         status: 'queued',
         export_format: 'mp4',
@@ -70,22 +90,24 @@ export class ExportJobTracker {
         attempt_count: 0,
         request_params: requestParams,
         queued_time: now,
-        created_by: USER_ID,
-        updated_by: USER_ID,
+        created_by: user.actorId,
+        updated_by: user.actorId,
       });
       const handle: ExportJobHandle = {
         id,
+        userId: user.userId,
+        actorId: user.actorId,
         lastProgress: 0,
         lastProgressWriteMs: now.getTime(),
         requestParams,
         pendingUpdate: Promise.resolve(),
       };
       try {
-        await this.jobs.update(USER_ID, id, {
+        await this.opts.jobs.update(user.userId, id, {
           status: 'running',
           attempt_count: 1,
           started_time: new Date(),
-        }, USER_ID);
+        }, user.actorId);
       } catch (error) {
         this.warn(`could not mark ${id} running: ${errorMessage(error)}`);
       }
@@ -105,13 +127,13 @@ export class ExportJobTracker {
     handle.lastProgressWriteMs = now;
     handle.pendingUpdate = handle.pendingUpdate
       .then(async () => {
-        await this.jobs.update(USER_ID, handle.id, {
+        await this.opts.jobs.update(handle.userId, handle.id, {
           progress_percent: normalized,
           request_params: {
             ...handle.requestParams,
             progress_stage: stage.slice(0, 256),
           },
-        }, USER_ID);
+        }, handle.actorId);
       })
       .catch((error) => {
         this.warn(`progress update failed for ${handle.id}: ${errorMessage(error)}`);
@@ -131,7 +153,7 @@ export class ExportJobTracker {
       this.warn(`output metadata failed for ${handle.id}: ${errorMessage(error)}`);
     }
     try {
-      await this.jobs.update(USER_ID, handle.id, {
+      await this.opts.jobs.update(handle.userId, handle.id, {
         status: 'succeeded',
         progress_percent: 100,
         local_output_path: outputPath,
@@ -140,7 +162,7 @@ export class ExportJobTracker {
         error_code: null,
         error_message: null,
         finished_time: new Date(),
-      }, USER_ID);
+      }, handle.actorId);
     } catch (error) {
       this.warn(`success update failed for ${handle.id}: ${errorMessage(error)}`);
     }
@@ -151,22 +173,40 @@ export class ExportJobTracker {
     await handle.pendingUpdate;
     const code = errorCode(error);
     try {
-      await this.jobs.update(USER_ID, handle.id, {
+      await this.opts.jobs.update(handle.userId, handle.id, {
         status: code === 'cancelled' ? 'cancelled' : 'failed',
         error_code: code,
         error_message: errorMessage(error).slice(0, MAX_ERROR_LENGTH),
         finished_time: new Date(),
-      }, USER_ID);
+      }, handle.actorId);
     } catch (updateError) {
       this.warn(`failure update failed for ${handle.id}: ${errorMessage(updateError)}`);
     }
   }
 
-  private async findAlbum(projectId: string) {
-    const bySourceId = await this.albums.findBySourceProjectId(USER_ID, projectId);
+  async listForProject(
+    projectId: string,
+    opts: { limit?: number; offset?: number } = {},
+  ): Promise<{ album: AlbumRow; jobs: ExportJobRow[] }> {
+    const user = this.opts.getUserContext();
+    const album = await this.findAlbum(user.userId, projectId);
+    if (!album || album.status === 'deleted') {
+      throw new HtmlVideoError('project-not-found', `Project ${projectId} not found`);
+    }
+    const jobs = await this.opts.jobs.listByAlbum(user.userId, album.id, opts);
+    return { album, jobs };
+  }
+
+  async findForCurrentUser(jobId: string): Promise<ExportJobRow | null> {
+    const user = this.opts.getUserContext();
+    return this.opts.jobs.findById(user.userId, jobId);
+  }
+
+  private async findAlbum(userId: string, projectId: string) {
+    const bySourceId = await this.opts.albums.findBySourceProjectId(userId, projectId);
     if (bySourceId) return bySourceId;
     if (!isUuid(projectId)) return null;
-    return this.albums.findById(USER_ID, projectId);
+    return this.opts.albums.findById(userId, projectId);
   }
 
   private warn(message: string): void {

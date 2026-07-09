@@ -1,8 +1,12 @@
 # 电子相册 MVP 数据库设计
 
-本文档描述第一版电子相册 MVP 的 PostgreSQL 持久化模型。范围只覆盖电子相册、页面、OSS 素材、大模型生成记录和 MP4 导出任务，不包含复杂会员、支付、模板市场和分享链接。
+本文档描述第一版电子相册 MVP 的 PostgreSQL 持久化模型。范围覆盖电子相册、页面、OSS 素材、聊天会话与消息、大模型生成记录和 MP4 导出任务，不包含复杂会员、支付、模板市场和分享链接。
 
-对应迁移文件：[../migrations/001_init_album_tables.sql](../migrations/001_init_album_tables.sql)
+对应迁移文件：
+
+- [../migrations/001_init_album_tables.sql](../migrations/001_init_album_tables.sql)
+- [../migrations/002_add_album_table_comments.sql](../migrations/002_add_album_table_comments.sql)
+- [../migrations/003_add_album_chat_tables.sql](../migrations/003_add_album_chat_tables.sql)
 
 ## 通用约定
 
@@ -17,13 +21,15 @@
 
 ## 当前 Project 模型映射
 
-当前代码里的持久化模型是 `Project`，文件落在 `.html-video/projects/<project_id>/project.json`、`content-graph.json`、`frames/*.html`、`assets/*` 和 `output-*.mp4`。数据库化后建议继续保持现有 `/api/projects...` 接口契约，对内把数据映射到 `ai_album_*` 表。
+当前代码里的持久化模型是 `Project`。文件模式仍使用 `.html-video/projects/<project_id>/`；PostgreSQL 模式的本地工作文件使用 `.html-video/projects/<safe_user_id>/<safe_project_id>/`。对外继续保持现有 `/api/projects...` 接口契约，对内把结构化数据映射到 `ai_album_*` 表。
 
 | 当前模型 | 数据库表 |
 | --- | --- |
 | `Project` | `ai_album_albums` |
 | `Project.frames[]` / `content-graph.json.nodes[]` | `ai_album_album_pages` |
 | `Project.assets[]` | `ai_album_assets` |
+| 聊天历史 / `messages.json` | `ai_album_chat_sessions`、`ai_album_chat_messages` |
+| 选项卡、表单和确认操作 | `ai_album_chat_messages.payload` |
 | Agent / AI / 音频生成过程 | `ai_album_ai_generation_logs` |
 | `Project.exports[]` / `lastOutputMp4Path` | `ai_album_export_jobs` |
 
@@ -106,6 +112,24 @@
 - `(user_id, page_id)`：读取页面关联素材。
 - `(user_id, asset_type, status)`：按类型和状态筛选素材。
 - `checksum_sha256` partial index：非空时支持去重或秒传判断。
+
+### ai_album_chat_sessions / ai_album_chat_messages
+
+聊天数据拆为会话和消息两层。每个用户相册同一时间最多有一个 `active` 会话；文件模式继续使用 `messages.json`。
+
+关键字段：
+
+- 会话的 `last_message_seq` 通过原子更新分配消息序号，避免同一会话并发请求产生重复顺序。
+- 消息保存 `role`、`message_type`、`sequence_no`、`request_id`、`content`、Agent/工具标识和 `payload`。
+- `message_type` 包括普通文本、选项选择、表单提交、确认、工具结果和系统事件。
+- 选项卡、表单、确认和聚焦帧等结构化交互保存在对应消息的 `payload` 中，包括 `selection_type`、`phase`、`selection_key` 和 `value`。
+- 会话和消息均通过 `(user_id, ...)` 组合外键约束到同一用户的相册或上级记录。
+
+主要索引：
+
+- `(user_id, album_id)` 上的活动会话唯一 partial index。
+- `(user_id, album_id, sequence_no)`：按顺序加载相册聊天历史。
+- `(user_id, request_id)` partial index：按请求关联 ID 排查一次交互产生的消息。
 
 ### ai_album_ai_generation_logs
 

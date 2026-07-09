@@ -23,6 +23,15 @@ export type AiGenerationType =
   | 'other';
 export type JobStatus = 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled';
 export type ExportFormat = 'mp4';
+export type ChatSessionStatus = 'active' | 'closed' | 'archived';
+export type ChatMessageRole = 'user' | 'assistant' | 'system' | 'tool';
+export type ChatMessageType =
+  | 'text'
+  | 'option_selection'
+  | 'form_submission'
+  | 'confirmation'
+  | 'tool_result'
+  | 'system_event';
 
 export interface AuditColumns {
   created_by: string;
@@ -211,6 +220,62 @@ export type UpdateAssetPatch = Partial<{
   checksum_sha256: string | null;
   metadata: JsonObject;
 }>;
+
+export interface ChatSessionRow extends AuditColumns {
+  id: string;
+  user_id: string;
+  album_id: string;
+  status: ChatSessionStatus;
+  title: string | null;
+  last_message_seq: number;
+  metadata: JsonObject;
+}
+
+export type CreateChatSessionInput = {
+  id: string;
+  user_id: string;
+  album_id: string;
+  created_by: string;
+  updated_by: string;
+  status?: ChatSessionStatus;
+  title?: string | null;
+  last_message_seq?: number;
+  metadata?: JsonObject;
+};
+
+export interface ChatMessageRow extends AuditColumns {
+  id: string;
+  user_id: string;
+  album_id: string;
+  session_id: string;
+  role: ChatMessageRole;
+  message_type: ChatMessageType;
+  sequence_no: number;
+  request_id: string | null;
+  content: string;
+  agent: string | null;
+  tool: string | null;
+  payload: JsonObject;
+  occurred_time: TimestampValue;
+}
+
+export type CreateChatMessageInput = {
+  id: string;
+  user_id: string;
+  album_id: string;
+  session_id: string;
+  role: ChatMessageRole;
+  message_type: ChatMessageType;
+  sequence_no: number;
+  content: string;
+  created_by: string;
+  updated_by: string;
+  request_id?: string | null;
+  agent?: string | null;
+  tool?: string | null;
+  payload?: JsonObject;
+  occurred_time?: TimestampValue;
+};
 
 export interface AiGenerationLogRow extends AuditColumns {
   id: string;

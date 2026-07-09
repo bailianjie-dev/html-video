@@ -6,7 +6,7 @@
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { readFile, copyFile, mkdir } from 'node:fs/promises';
 import { existsSync, statSync } from 'node:fs';
-import { dirname, extname, join, resolve, basename } from 'node:path';
+import { dirname, extname, isAbsolute, join, relative, resolve, basename, sep } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { tmpdir } from 'node:os';
@@ -16,14 +16,20 @@ import {
   AlbumRepository,
   AssetRepository,
   AssetStore,
-  ExportJobRepository,
+  ChatMessageRepository,
+  ChatSessionRepository,
   generateTts,
   generateMusic,
+  PostgresAssetPersistence,
+  PostgresChatPersistence,
   PostgresProjectPersistence,
+  safeWorkDirectorySegment,
   type Asset,
   type AssetRow,
+  type ChatMessageRow,
   type DbAssetType,
   type ExportJobRow,
+  type JsonObject,
   type Project,
 } from '@html-video/core';
 import type { ContentGraph } from '@html-video/content-graph';
@@ -51,6 +57,8 @@ interface StudioHandle {
   port: number;
   close: () => void;
 }
+
+const REQUIRED_AGENT_ID = 'pi-agent';
 
 const MIME: Record<string, string> = {
   '.html': 'text/html; charset=utf-8',
@@ -81,7 +89,7 @@ function resolveUiRoot(): string {
 export async function startStudioServer(ctx: CliContext, port: number): Promise<StudioHandle> {
   const uiRoot = resolveUiRoot();
 
-  const server = createServer(async (req, res) => {
+  const handleRequest = async (req: IncomingMessage, res: ServerResponse): Promise<unknown> => {
     try {
       if (!req.url) {
         res.writeHead(400);
@@ -246,7 +254,9 @@ export async function startStudioServer(ctx: CliContext, port: number): Promise<
           const persistence = new PostgresProjectPersistence({
             db: handle.db,
             projectRoot: ctx.projectRoot,
+            getUserContext: () => ctx.requestContexts.getRequiredUser(),
           });
+          const user = ctx.requestContexts.getRequiredUser();
           const albums = new AlbumRepository(handle.db);
           const pages = new AlbumPageRepository(handle.db);
           const now = new Date().toISOString();
@@ -318,8 +328,8 @@ export async function startStudioServer(ctx: CliContext, port: number): Promise<
           const loadedGraph = await persistence.readContentGraph(project.id);
           const loadedIntroFrameHtml = await persistence.readFrameHtml(project.id, 'intro');
           const loadedDetailsFrameHtml = await persistence.readFrameHtml(project.id, 'details');
-          const album = await albums.findBySourceProjectId('local-dev', project.id);
-          const pageRows = album ? await pages.listByAlbum('local-dev', album.id) : [];
+          const album = await albums.findBySourceProjectId(user.userId, project.id);
+          const pageRows = album ? await pages.listByAlbum(user.userId, album.id) : [];
 
           return json(res, 200, {
             ok: true,
@@ -629,15 +639,10 @@ export async function startStudioServer(ctx: CliContext, port: number): Promise<
           });
         }
         const projectId = decodeURIComponent(projectExportJobsMatch[1]);
-        const albums = new AlbumRepository(ctx.database.handle.db);
-        const album = await findProjectAlbum(albums, projectId);
-        if (!album || album.status === 'deleted') {
-          return json(res, 404, { error: `Project ${projectId} not found` });
-        }
         const limit = clampInteger(url.searchParams.get('limit'), 1, 100, 50);
         const offset = clampInteger(url.searchParams.get('offset'), 0, 100_000, 0);
-        const jobs = await new ExportJobRepository(ctx.database.handle.db)
-          .listByAlbum('local-dev', album.id, { limit, offset });
+        const tracker = ExportJobTracker.fromContext(ctx)!;
+        const { album, jobs } = await tracker.listForProject(projectId, { limit, offset });
         return json(res, 200, {
           project_id: projectId,
           album_id: album.id,
@@ -654,8 +659,7 @@ export async function startStudioServer(ctx: CliContext, port: number): Promise<
           });
         }
         const jobId = decodeURIComponent(exportJobMatch[1]);
-        const job = await new ExportJobRepository(ctx.database.handle.db)
-          .findById('local-dev', jobId);
+        const job = await ExportJobTracker.fromContext(ctx)!.findForCurrentUser(jobId);
         if (!job) return json(res, 404, { error: `Export job ${jobId} not found` });
         return json(res, 200, { job: exportJobResponse(job) });
       }
@@ -721,6 +725,15 @@ export async function startStudioServer(ctx: CliContext, port: number): Promise<
 
       // Add asset (multipart-style via JSON for v0.1: paths or inline content)
       const addAssetMatch = url.pathname.match(/^\/api\/projects\/([^/]+)\/assets$/);
+      if (addAssetMatch && addAssetMatch[1] && m === 'GET') {
+        const id = addAssetMatch[1];
+        const project = await ctx.orchestrator.load(id);
+        if (ctx.database?.mode !== 'postgres' || !ctx.database.handle) {
+          return json(res, 200, { assets: project.assets });
+        }
+        const assets = await projectAssetPersistence(ctx).listForProject(id);
+        return json(res, 200, { assets: assets.map(summarizeAssetRow) });
+      }
       if (addAssetMatch && addAssetMatch[1] && m === 'POST') {
         const id = addAssetMatch[1];
         const ct = req.headers['content-type'] ?? '';
@@ -765,8 +778,14 @@ export async function startStudioServer(ctx: CliContext, port: number): Promise<
       // Remove asset
       const rmAssetMatch = url.pathname.match(/^\/api\/projects\/([^/]+)\/assets\/([^/]+)$/);
       if (rmAssetMatch && rmAssetMatch[1] && rmAssetMatch[2] && m === 'DELETE') {
+        const existing = await ctx.orchestrator.load(rmAssetMatch[1]);
+        await softDeleteAssetInPostgres(
+          ctx,
+          rmAssetMatch[1],
+          rmAssetMatch[2],
+          existing.assets.some((asset) => asset.id === rmAssetMatch[2]),
+        );
         const project = await ctx.orchestrator.removeAsset(rmAssetMatch[1], rmAssetMatch[2]);
-        await softDeleteAssetInPostgres(ctx, rmAssetMatch[2]);
         return json(res, 200, { project });
       }
 
@@ -789,11 +808,10 @@ export async function startStudioServer(ctx: CliContext, port: number): Promise<
       // Set agent (runtime selection)
       const agentMatch = url.pathname.match(/^\/api\/projects\/([^/]+)\/agent$/);
       if (agentMatch && agentMatch[1] && m === 'PUT') {
-        const body = await readBody(req);
         const project = await ctx.orchestrator.setAgent(
           agentMatch[1],
-          (body.agent_id as string) || null,
-          body.agent_model === undefined ? undefined : ((body.agent_model as string) || null),
+          REQUIRED_AGENT_ID,
+          null,
         );
         return json(res, 200, { project });
       }
@@ -1227,14 +1245,13 @@ export async function startStudioServer(ctx: CliContext, port: number): Promise<
         try {
           // body.frameId set → draft ONLY that frame (single-frame regenerate).
           // unset → draft every frame (global). Either way returns a per-frame map.
-          const body = (await readBody(req)) as { agentId?: string; frameId?: string };
+          const body = (await readBody(req)) as { frameId?: string };
           const graph = await ctx.orchestrator.readContentGraph(projectId);
           if (!graph || !Array.isArray(graph.nodes) || graph.nodes.length === 0) {
             return json(res, 400, { error: 'No frames yet — generate the video first.' });
           }
-          if (!body.agentId) return json(res, 400, { error: 'No agent selected.' });
-          const agentDef = findAgent(body.agentId);
-          if (!agentDef) return json(res, 400, { error: `agent "${body.agentId}" not registered` });
+          const agentDef = findAgent(REQUIRED_AGENT_ID);
+          if (!agentDef) return json(res, 500, { error: 'Pi Agent is not registered' });
           const projectDir = await ctx.projects.ensureDir(projectId);
           // Only TextNode carries copy; fall back to label/id for entity/data.
           const nodeText = (n: typeof graph.nodes[number]): string =>
@@ -1357,26 +1374,18 @@ export async function startStudioServer(ctx: CliContext, port: number): Promise<
       if (url.pathname === '/api/agents' && m === 'GET') {
         const force = url.searchParams.get('force') === '1';
         const agents = await detectAll(force ? { force: true } : undefined);
-        return json(res, 200, { agents });
+        return json(res, 200, {
+          agents: agents.filter((agent) => agent.id === REQUIRED_AGENT_ID),
+        });
       }
 
-      // Agent models — currently AMR only. Lists the live `vela model list`
-      // catalog so the UI can offer a model picker (deepseek/claude/gpt/…).
+      // Model selection is intentionally disabled. Pi uses its global default.
       const modelsMatch = url.pathname.match(/^\/api\/agents\/([^/]+)\/models$/);
       if (modelsMatch && modelsMatch[1] && m === 'GET') {
-        const agentId = modelsMatch[1];
-        if (agentId !== 'amr') return json(res, 200, { models: [] });
-        const def = findAgent(agentId);
-        if (!def) return json(res, 404, { error: `agent "${agentId}" not registered` });
-        const { resolveBin, listAmrModels } = await import('@html-video/runtime');
-        const bin = await resolveBin(def);
-        if (!bin) return json(res, 400, { error: 'vela binary not found' });
-        try {
-          const models = await listAmrModels(bin);
-          return json(res, 200, { models, default: def.defaultModel ?? null });
-        } catch (err) {
-          return json(res, 200, { models: [], error: err instanceof Error ? err.message : String(err) });
+        if (modelsMatch[1] !== REQUIRED_AGENT_ID) {
+          return json(res, 404, { error: 'Agent not found' });
         }
+        return json(res, 200, { models: [], default: null });
       }
 
       // Agent login — currently AMR/vela only. Spawns `vela login`, which opens
@@ -1384,31 +1393,7 @@ export async function startStudioServer(ctx: CliContext, port: number): Promise<
       // cancelled). The user signs in with their OWN Open Design account.
       const loginMatch = url.pathname.match(/^\/api\/agents\/([^/]+)\/login$/);
       if (loginMatch && loginMatch[1] && m === 'POST') {
-        const agentId = loginMatch[1];
-        if (agentId !== 'amr') return json(res, 400, { error: `agent "${agentId}" has no login flow` });
-        const def = findAgent(agentId);
-        if (!def) return json(res, 404, { error: `agent "${agentId}" not registered` });
-        const { resolveBin } = await import('@html-video/runtime');
-        const bin = await resolveBin(def);
-        if (!bin) return json(res, 400, { error: 'vela binary not found' });
-        try {
-          const { spawn } = await import('node:child_process');
-          const code = await new Promise<number>((resolveCode, rejectCode) => {
-            const child = spawn(bin, ['login'], { stdio: 'ignore' });
-            // vela login opens the browser itself; it exits once auth completes
-            // or is cancelled. Cap the wait so a never-finished login can't hang.
-            const timer = setTimeout(() => { try { child.kill('SIGTERM'); } catch { /* */ } rejectCode(new Error('login timed out (5 min)')); }, 5 * 60_000);
-            child.on('error', (e: Error) => { clearTimeout(timer); rejectCode(e); });
-            child.on('exit', (c: number | null) => { clearTimeout(timer); resolveCode(c ?? -1); });
-          });
-          if (code !== 0) return json(res, 400, { ok: false, error: `vela login exited with code ${code}` });
-          // Re-detect (force) so the agent flips to available immediately.
-          const agents = await detectAll({ force: true });
-          const amr = agents.find((a) => a.id === 'amr');
-          return json(res, 200, { ok: !!amr?.available, available: !!amr?.available, ...(amr?.hint && { hint: amr.hint }) });
-        } catch (err) {
-          return json(res, 500, { ok: false, error: err instanceof Error ? err.message : String(err) });
-        }
+        return json(res, 404, { error: 'Agent login is not available' });
       }
 
       // Agent smoke test — fires a tiny prompt at the requested agent and
@@ -1417,6 +1402,9 @@ export async function startStudioServer(ctx: CliContext, port: number): Promise<
       const testMatch = url.pathname.match(/^\/api\/agents\/([^/]+)\/test$/);
       if (testMatch && testMatch[1] && m === 'POST') {
         const agentId = testMatch[1];
+        if (agentId !== REQUIRED_AGENT_ID) {
+          return json(res, 404, { error: 'Agent not found' });
+        }
         const def = findAgent(agentId);
         if (!def) return json(res, 404, { error: `agent "${agentId}" not registered` });
         const prompt = 'Reply with one word: hello.';
@@ -1542,56 +1530,35 @@ export async function startStudioServer(ctx: CliContext, port: number): Promise<
         const tmpl = project.templateId ? ctx.templates.get(project.templateId) : null;
         // No template required — agent can synthesize from scratch when none picked.
 
-        // Resolve the agent. Pinned project agent wins. Otherwise pick the first
-        // available agent that needs no extra setup (skip AMR — it's available
-        // but billed/needs balance, so it must be an explicit choice, not a
-        // silent default). anthropic-api is the final HTTP fallback. This keeps
-        // "what the toolbar shows" === "what actually runs".
-        let agentId = project.agentId;
-        if (!agentId) {
-          const detected = await detectAll();
-          // Prefer a real, ready-to-run CLI agent (claude/codex/…). Only fall
-          // back to anthropic-api if it's actually configured (has a key) —
-          // otherwise picking it would fail mid-flow with "No ANTHROPIC_API_KEY"
-          // on a later turn (e.g. after the detect cache expires and a transient
-          // probe miss drops the CLI agent). Persist the choice so every
-          // subsequent turn in this project uses the same agent, not whatever
-          // a fresh probe happens to return.
-          const ready = detected.filter((a) => a.available && a.id !== 'amr');
-          const apiReady = ready.find((a) => a.id === 'anthropic-api');
-          agentId =
-            ready.find((a) => a.id !== 'anthropic-api')?.id ??
-            apiReady?.id ??
-            'anthropic-api';
-          if (project.agentId !== agentId) {
-            try {
-              await ctx.orchestrator.setAgent(id, agentId, undefined);
-            } catch {
-              /* persist is best-effort; resolution above still holds for this turn */
-            }
+        const agentId = REQUIRED_AGENT_ID;
+        if (project.agentId !== REQUIRED_AGENT_ID || project.agentModel !== null) {
+          try {
+            await ctx.orchestrator.setAgent(id, REQUIRED_AGENT_ID, null);
+          } catch {
+            /* persistence is best-effort; this request still uses Pi */
           }
         }
         const agentDef = findAgent(agentId);
         if (!agentDef) {
           return json(res, 400, { error: `agent "${agentId}" not registered` });
         }
-        // Model the user picked for this agent (AMR); undefined → agent default.
-        const agentModel = project.agentModel ?? undefined;
+        // Pi resolves the model from its global ~/.pi/agent/settings.json.
+        const agentModel = undefined;
 
         // Append user message to history (with attachment summary)
         const attachmentSummary = attachments.length > 0
           ? `\n\n📎 ${attachments.length} attachment(s): ${attachments.map((a) => a.filename).join(', ')}`
           : '';
         const history = await loadMessages(ctx, id);
-        history.push({
+        const userMessage: ChatMessage = {
           role: 'user',
           content: userText + attachmentSummary,
           ts: Date.now(),
-        });
-        MESSAGES.set(id, history);
+        };
+        const selection = chatSelectionForMessage(history, userText, focusFrameId);
         // Persist immediately so the user message survives even if the
         // streaming agent call below crashes mid-flight.
-        await saveMessages(ctx, id, history);
+        await appendMessage(ctx, id, history, userMessage, selection);
 
         // Compose prompt — template-aware OR template-free
         const projectDir = await ctx.projects.ensureDir(id);
@@ -1676,7 +1643,8 @@ export async function startStudioServer(ctx: CliContext, port: number): Promise<
 
         // Mark this project as generating so a returning client knows the task
         // is still alive. Cleared in the finally below (covers all exit paths).
-        GENERATING.add(id);
+        const generationKey = runtimeProjectKey(ctx, id);
+        GENERATING.add(generationKey);
         try {
 
         // SSE response
@@ -2001,20 +1969,18 @@ export async function startStudioServer(ctx: CliContext, port: number): Promise<
           sseWrite({ type: 'text', chunk: fallback });
           persistText = fallback;
         }
-        history.push({
+        await appendMessage(ctx, id, history, {
           role: 'assistant',
           agent: agentDef.id,
           content: persistText,
           ts: Date.now(),
         });
-        MESSAGES.set(id, history);
-        await saveMessages(ctx, id, history);
         // discard project0 reference to keep TS happy
         void project0;
         res.end();
         return;
         } finally {
-          GENERATING.delete(id);
+          GENERATING.delete(generationKey);
         }
       }
 
@@ -2023,7 +1989,10 @@ export async function startStudioServer(ctx: CliContext, port: number): Promise<
       // progress lines used to be.
       const genStatusMatch = url.pathname.match(/^\/api\/projects\/([^/]+)\/generating$/);
       if (genStatusMatch && genStatusMatch[1] && m === 'GET') {
-        return json(res, 200, { generating: GENERATING.has(genStatusMatch[1]) });
+        await ctx.orchestrator.load(genStatusMatch[1]);
+        return json(res, 200, {
+          generating: GENERATING.has(runtimeProjectKey(ctx, genStatusMatch[1])),
+        });
       }
 
       // ============== v0.8: content-graph + frames API ==============
@@ -2166,9 +2135,19 @@ export async function startStudioServer(ctx: CliContext, port: number): Promise<
           return res.end('missing ?path');
         }
         const safe = resolve(p);
-        const projectRoot = resolve(ctx.projectRoot);
-        const insideProjectRoot = safe === projectRoot || safe.startsWith(projectRoot + '\\') || safe.startsWith(projectRoot + '/');
-        if (!insideProjectRoot) {
+        const projectsRoot = resolve(ctx.projectRoot, '.html-video', 'projects');
+        const user = ctx.requestContexts.getRequiredUser();
+        const allowedRoot = ctx.database?.mode === 'postgres'
+          ? resolve(projectsRoot, safeWorkDirectorySegment(user.userId, 'user'))
+          : projectsRoot;
+        let allowed = isPathInside(allowedRoot, safe);
+        if (!allowed && ctx.database?.mode === 'postgres') {
+          const projects = await ctx.orchestrator.list();
+          allowed = projects.some((project) => project.assets.some(
+            (asset) => asset.path !== undefined && resolve(asset.path) === safe,
+          ));
+        }
+        if (!allowed) {
           res.writeHead(403);
           return res.end('forbidden');
         }
@@ -2221,8 +2200,57 @@ export async function startStudioServer(ctx: CliContext, port: number): Promise<
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       const code = (e as { code?: string }).code ?? 'unknown';
-      json(res, 500, { error: msg, code });
+      json(res, httpStatusForErrorCode(code), { error: msg, code });
     }
+  };
+
+  const server = createServer(async (req, res) => {
+    if (!req.url) {
+      await handleRequest(req, res);
+      return;
+    }
+
+    let url: URL;
+    try {
+      url = new URL(req.url, 'http://x');
+    } catch {
+      res.writeHead(400);
+      res.end();
+      return;
+    }
+
+    const apiRoute = url.pathname === '/api' || url.pathname.startsWith('/api/');
+    const protectedFileRoute = url.pathname === '/asset' || url.pathname.startsWith('/preview/');
+    const authenticatedRoute = apiRoute || protectedFileRoute;
+    if (!authenticatedRoute) {
+      await handleRequest(req, res);
+      return;
+    }
+
+    const requestUser = getRequestUser(req, loadAuthConfig(ctx.projectRoot));
+    const publicAuthRoute = url.pathname === '/api/auth' || url.pathname.startsWith('/api/auth/');
+    if (!publicAuthRoute && !requestUser.authenticated) {
+      json(res, 401, {
+        error: 'Authentication required',
+        code: 'unauthenticated',
+      });
+      return;
+    }
+
+    if (!requestUser.authenticated) {
+      await handleRequest(req, res);
+      return;
+    }
+
+    const source = requestUser.source === 'header' ? 'header' : 'cookie';
+    await ctx.requestContexts.run({
+      requestId: randomUUID(),
+      source,
+      user: {
+        userId: requestUser.user_id,
+        actorId: requestUser.actor_id,
+      },
+    }, () => handleRequest(req, res));
   });
 
   return new Promise((resolveFn) => {
@@ -2244,6 +2272,14 @@ export async function startStudioServer(ctx: CliContext, port: number): Promise<
 // ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------
+
+function httpStatusForErrorCode(code: string): number {
+  if (code === 'project-not-found' || code === 'asset-not-found' || code === 'template-not-found') {
+    return 404;
+  }
+  if (code === 'invalid-input') return 400;
+  return 500;
+}
 
 function json(res: ServerResponse, code: number, body: unknown, headers: Record<string, string | string[]> = {}): void {
   res.writeHead(code, { 'content-type': MIME['.json']!, ...headers });
@@ -2293,7 +2329,12 @@ function getRequestUser(req: IncomingMessage, authConfig: AuthConfig | null): {
   source: 'header' | 'cookie' | 'default';
   authenticated: boolean;
 } {
-  const headerUserId = headerValue(req.headers['x-user-id']);
+  // Header identity is a local-only escape hatch for development and tests.
+  // Remote requests must authenticate through the signed cookie (or a future
+  // external identity adapter).
+  const headerUserId = isLoopbackAddress(req.socket.remoteAddress)
+    ? headerValue(req.headers['x-user-id'])
+    : '';
   const normalizedHeaderUserId = normalizeDevUserId(headerUserId);
   if (normalizedHeaderUserId) {
     return {
@@ -2328,6 +2369,17 @@ function getRequestUser(req: IncomingMessage, authConfig: AuthConfig | null): {
     source: 'default',
     authenticated: false,
   };
+}
+
+function isLoopbackAddress(address: string | undefined): boolean {
+  return address === '127.0.0.1'
+    || address === '::1'
+    || address === '::ffff:127.0.0.1';
+}
+
+function isPathInside(root: string, candidate: string): boolean {
+  const rel = relative(root, candidate);
+  return rel === '' || (rel !== '..' && !rel.startsWith(`..${sep}`) && !isAbsolute(rel));
 }
 
 function headerValue(value: string | string[] | undefined): string {
@@ -2635,14 +2687,9 @@ async function addFileAssetToOss(
     contentType: mime,
   });
 
-  const albums = new AlbumRepository(ctx.database.handle.db);
-  const album = await findProjectAlbum(albums, projectId);
   const checksumSha256 = createHash('sha256').update(bytes).digest('hex');
-  const assets = new AssetRepository(ctx.database.handle.db);
-  const created = await assets.create({
+  const created = await projectAssetPersistence(ctx).createForProject(projectId, {
     id: objectId,
-    user_id: 'local-dev',
-    album_id: album?.id ?? null,
     asset_type: assetTypeFromMime(mime),
     usage_type: 'source',
     source: 'upload',
@@ -2661,8 +2708,6 @@ async function addFileAssetToOss(
       oss_etag: uploaded.etag,
       original_local_path: filePath,
     },
-    created_by: 'local-dev',
-    updated_by: 'local-dev',
   });
 
   const asset: Asset = {
@@ -2684,10 +2729,27 @@ async function addFileAssetToOss(
   return ctx.orchestrator.load(projectId);
 }
 
-async function softDeleteAssetInPostgres(ctx: CliContext, assetId: string): Promise<void> {
+async function softDeleteAssetInPostgres(
+  ctx: CliContext,
+  projectId: string,
+  assetId: string,
+  allowMissingDatabaseRow: boolean,
+): Promise<void> {
   if (ctx.database?.mode !== 'postgres' || !ctx.database.handle) return;
-  const assets = new AssetRepository(ctx.database.handle.db);
-  await assets.softDelete('local-dev', assetId, 'local-dev');
+  await projectAssetPersistence(ctx).softDeleteForProject(projectId, assetId, {
+    allowMissingDatabaseRow,
+  });
+}
+
+function projectAssetPersistence(ctx: CliContext): PostgresAssetPersistence {
+  if (!ctx.database?.handle) {
+    throw new Error('PostgreSQL database handle is not available');
+  }
+  return new PostgresAssetPersistence({
+    getUserContext: () => ctx.requestContexts.getRequiredUser(),
+    albums: new AlbumRepository(ctx.database.handle.db),
+    assets: new AssetRepository(ctx.database.handle.db),
+  });
 }
 
 async function findProjectAlbum(repo: AlbumRepository, projectId: string) {
@@ -2864,11 +2926,8 @@ void copyFile;
 void AssetStore;
 
 // ---------------------------------------------------------------------------
-// Message history — in-memory cache, JSON file as source of truth.
-//
-// v0.8.2: previously memory-only, so chat history evaporated on every studio
-// restart. Now persisted to <projectDir>/messages.json. Cache is lazy-loaded
-// on first GET / POST per project; writes go through saveMessages().
+// Message history. PostgreSQL mode uses normalized session/message/selection
+// tables; file mode keeps the legacy in-memory cache + messages.json behavior.
 // ---------------------------------------------------------------------------
 
 interface ChatMessage {
@@ -2887,7 +2946,16 @@ const MESSAGES = new Map<string, ChatMessage[]>();
  *  ("⏳ still generating…") instead of seeing the progress lines vanish. */
 const GENERATING = new Set<string>();
 
+function runtimeProjectKey(ctx: CliContext, projectId: string): string {
+  if (ctx.database?.mode !== 'postgres') return projectId;
+  return `${ctx.requestContexts.getRequiredUser().userId}\0${projectId}`;
+}
+
 async function loadMessages(ctx: CliContext, projectId: string): Promise<ChatMessage[]> {
+  if (ctx.database?.mode === 'postgres' && ctx.database.handle) {
+    const rows = await projectChatPersistence(ctx).listForProject(projectId);
+    return rows.map(chatRowToMessage);
+  }
   const cached = MESSAGES.get(projectId);
   if (cached) return cached;
   const projectDir = await ctx.projects.ensureDir(projectId);
@@ -2910,15 +2978,141 @@ async function loadMessages(ctx: CliContext, projectId: string): Promise<ChatMes
   }
 }
 
-async function saveMessages(
+async function appendMessage(
   ctx: CliContext,
   projectId: string,
   messages: ChatMessage[],
+  message: ChatMessage,
+  selection?: ChatSelectionData,
 ): Promise<void> {
+  if (ctx.database?.mode === 'postgres' && ctx.database.handle) {
+    await projectChatPersistence(ctx).appendForProject(projectId, {
+      role: message.role,
+      content: message.content,
+      messageType: selection
+        ? selection.selectionType === 'form'
+          ? 'form_submission'
+          : selection.selectionType === 'confirmation'
+            ? 'confirmation'
+            : selection.selectionType === 'option'
+              ? 'option_selection'
+              : 'text'
+        : undefined,
+      ...(message.agent && { agent: message.agent }),
+      ...(message.tool && { tool: message.tool }),
+      payload: jsonObject({
+        ...(message.output !== undefined && { output: message.output }),
+        ...(selection && {
+          selection_type: selection.selectionType,
+          phase: selection.phase ?? null,
+          selection_key: selection.selectionKey ?? null,
+          value: selection.value,
+        }),
+      }),
+      occurredAt: new Date(message.ts),
+    });
+    messages.push(message);
+    return;
+  }
+  messages.push(message);
+  MESSAGES.set(projectId, messages);
   const projectDir = await ctx.projects.ensureDir(projectId);
   const filePath = join(projectDir, 'messages.json');
   const fs = await import('node:fs/promises');
   await fs.writeFile(filePath, JSON.stringify(messages, null, 2), 'utf8');
+}
+
+function projectChatPersistence(ctx: CliContext): PostgresChatPersistence {
+  if (!ctx.database?.handle) {
+    throw new Error('PostgreSQL database handle is not available');
+  }
+  const db = ctx.database.handle.db;
+  return new PostgresChatPersistence({
+    getUserContext: () => ctx.requestContexts.getRequiredUser(),
+    getRequestId: () => ctx.requestContexts.get()?.requestId,
+    albums: new AlbumRepository(db),
+    sessions: new ChatSessionRepository(db),
+    messages: new ChatMessageRepository(db),
+  });
+}
+
+function chatRowToMessage(row: ChatMessageRow): ChatMessage {
+  const output = row.payload.output;
+  return {
+    role: row.role,
+    content: row.content,
+    ...(row.agent && { agent: row.agent }),
+    ...(row.tool && { tool: row.tool }),
+    ...(output !== undefined && { output }),
+    ts: row.occurred_time instanceof Date
+      ? row.occurred_time.getTime()
+      : new Date(row.occurred_time).getTime(),
+  };
+}
+
+interface ChatSelectionData {
+  selectionType: 'option' | 'form' | 'confirmation' | 'frame_focus';
+  phase?: string;
+  selectionKey?: string;
+  value: JsonObject;
+}
+
+function chatSelectionForMessage(
+  history: ChatMessage[],
+  content: string,
+  focusFrameId: string,
+): ChatSelectionData | undefined {
+  const trimmed = content.trim();
+  const previousCard = lastAssistantCardWithMeta(history);
+  const form = /^\[hv-form:submit\]\s*\n([\s\S]+)$/.exec(trimmed);
+  if (form?.[1]) {
+    try {
+      return {
+        selectionType: 'form',
+        phase: previousCard?.metaPhase ?? 'format',
+        value: jsonObject(JSON.parse(form[1]) as Record<string, unknown>),
+      };
+    } catch {
+      return {
+        selectionType: 'form',
+        phase: previousCard?.metaPhase ?? 'format',
+        value: { raw: form[1] },
+      };
+    }
+  }
+  if (trimmed === '[hv-confirm:generate]' || trimmed === '[hv-confirm:edit]') {
+    return {
+      selectionType: 'confirmation',
+      phase: previousCard?.metaPhase ?? 'confirm',
+      selectionKey: 'action',
+      value: { action: trimmed === '[hv-confirm:generate]' ? 'generate' : 'edit' },
+    };
+  }
+  if (previousCard?.kind === 'hv-options') {
+    return {
+      selectionType: 'option',
+      ...(previousCard.metaPhase && { phase: previousCard.metaPhase }),
+      selectionKey: 'label',
+      value: { label: trimmed },
+    };
+  }
+  if (focusFrameId) {
+    return {
+      selectionType: 'frame_focus',
+      phase: 'iterate',
+      selectionKey: 'frame_id',
+      value: { frame_id: focusFrameId },
+    };
+  }
+  return undefined;
+}
+
+function jsonObject(value: Record<string, unknown>): JsonObject {
+  return JSON.parse(JSON.stringify(value, (_key, item) => (
+    item === undefined || typeof item === 'bigint' || typeof item === 'function'
+      ? undefined
+      : item
+  ))) as JsonObject;
 }
 
 // `Attachment` is declared above (at the buildHtmlGenerationPrompt section)

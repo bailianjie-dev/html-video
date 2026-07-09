@@ -1198,7 +1198,7 @@ function renderAgentPill() {
   const pill = document.getElementById('btn-agent');
   if (!pill) return;
   const p = state.selected;
-  pill.disabled = !p;
+  pill.disabled = true;
   const dot = document.getElementById('agent-dot');
   const logo = document.getElementById('agent-pill-logo');
   const label = document.getElementById('agent-pill-label');
@@ -1208,7 +1208,7 @@ function renderAgentPill() {
     dot.className = 'agent-dot';
     return;
   }
-  const currentId = p.agentId ?? (state.agents.find((a) => a.available && a.id !== 'amr')?.id ?? 'anthropic-api');
+  const currentId = 'pi-agent';
   const a = state.agents.find((x) => x.id === currentId);
   const available = a?.available ?? false;
   label.textContent = a?.name ?? currentId;
@@ -1225,35 +1225,17 @@ async function renderModelSwitch(currentAgentId) {
   const wrap = document.getElementById('model-switch');
   const sel = document.getElementById('model-select');
   if (!wrap || !sel) return;
-  if (!state.selected || currentAgentId !== 'amr') { wrap.hidden = true; return; }
-  wrap.hidden = false;
-  // Fetch once per session; cache on state.
-  if (!state._amrModels) {
-    try {
-      const data = await fetch('/api/agents/amr/models').then((r) => r.json());
-      state._amrModels = data.models ?? [];
-      state._amrDefaultModel = data.default ?? null;
-    } catch { state._amrModels = []; }
-  }
-  const models = state._amrModels;
-  if (!models.length) { wrap.hidden = true; return; }
-  const chosen = state.selected.agentModel ?? state._amrDefaultModel ?? models[0].id;
-  sel.innerHTML = models.map((m) => `<option value="${esc(m.id)}"${m.id === chosen ? ' selected' : ''}>${esc(m.label)}</option>`).join('');
-  sel.onchange = async () => {
-    if (!state.selected) return;
-    try {
-      await API.setAgent(state.selected.id, 'amr', sel.value);
-      state.selected = (await API.getProject(state.selected.id)).project;
-      toast(`✓ ${sel.value}`, 'success');
-    } catch (e) { toast(`${e?.message ?? e}`, 'error'); }
-  };
+  void currentAgentId;
+  wrap.hidden = true;
+  sel.innerHTML = '';
+  sel.onchange = null;
 }
 
 /** Open/refresh the top-bar agent dropdown. */
 function renderAgentMenu() {
   const menu = document.getElementById('agent-menu');
   if (!menu || !state.selected) return;
-  const currentId = state.selected.agentId ?? (state.agents.find((a) => a.available && a.id !== 'amr')?.id ?? 'anthropic-api');
+  const currentId = 'pi-agent';
   menu.innerHTML = state.agents.map((a) => {
     const cur = a.id === currentId ? ' current' : '';
     const logo = AGENT_LOGOS[a.id] ? `<img src="${esc(AGENT_LOGOS[a.id])}" alt="" />` : '';
@@ -1706,7 +1688,6 @@ function wireSoundtrackPanel() {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({
-          agentId: state.selected.agentId ?? (state.agents.find((a) => a.available && a.id !== 'amr')?.id ?? 'anthropic-api'),
           ...(frameId && { frameId }),
         }),
       });
@@ -3815,33 +3796,13 @@ async function renderSettingsAudio(panel) {
 }
 
 function renderSettingsAgent(panel) {
-  // Default to local CLI mode; BYOK = anthropic-api which is itself an HTTP agent
-  const mode = panel.dataset.mode || 'local';
   const agents = state.agents ?? [];
-  const localAgents = agents.filter((a) => a.id !== 'anthropic-api');
-  const httpAgents = agents.filter((a) => a.id === 'anthropic-api');
-  const list = mode === 'byok' ? httpAgents : localAgents;
-  const currentId = state.selected?.agentId
-    || (agents.find((a) => a.available)?.id ?? 'anthropic-api');
+  const list = agents.filter((a) => a.id === 'pi-agent');
+  const currentId = 'pi-agent';
 
   panel.innerHTML = `
     <h3>${esc(t('settings.agent.title'))}</h3>
     <div class="panel-sub">${esc(t('settings.agent.subtitle'))}</div>
-
-    <div class="settings-mode-tabs">
-      <button data-mode="local" class="${mode === 'local' ? 'active' : ''}">${esc(t('settings.agent.mode.local'))}</button>
-      <button data-mode="byok" class="${mode === 'byok' ? 'active' : ''}">${esc(t('settings.agent.mode.byok'))}</button>
-    </div>
-
-    ${mode === 'byok' ? `
-      <div class="panel-sub" style="margin-bottom:14px">
-        ${esc(t('settings.agent.byok.intro'))}
-        <ul style="margin:6px 0 0 18px;padding:0;font-family:var(--font-mono);font-size:11.5px">
-          <li>${esc(t('settings.agent.byok.env_key'))}</li>
-          <li>${esc(t('settings.agent.byok.env_base'))}</li>
-        </ul>
-      </div>
-    ` : ''}
 
     <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px">
       <div style="font-size:11px;color:var(--text-muted);font-family:var(--font-mono);letter-spacing:.08em;text-transform:uppercase">
@@ -3870,9 +3831,7 @@ function renderSettingsAgent(panel) {
           <div class="agent-actions">
             ${a.available ? `<button data-act="test">${esc(t('settings.agent.test'))}</button>` : ''}
             ${a.available
-              ? (isCurrent
-                  ? `<span style="font-size:11px;color:var(--accent);font-family:var(--font-mono)">${esc(t('settings.agent.in_use'))}</span>`
-                  : `<button data-act="use" class="primary-action" style="background:var(--accent);border-color:var(--accent);color:var(--accent-fg)">${esc(t('settings.agent.use'))}</button>`)
+              ? `<span style="font-size:11px;color:var(--accent);font-family:var(--font-mono)">${esc(t('settings.agent.in_use'))}</span>`
               : (a.installUrl ? `<a href="${a.installUrl}" target="_blank" rel="noopener" style="font-size:11px;color:var(--text-faint)">install ↗</a>` : '')}
           </div>
           <div class="agent-test-result" data-test-result="${esc(a.id)}" style="display:none;grid-column:1 / -1"></div>
@@ -3881,12 +3840,6 @@ function renderSettingsAgent(panel) {
     </div>
   `;
 
-  panel.querySelectorAll('.settings-mode-tabs button').forEach((btn) => {
-    btn.onclick = () => {
-      panel.dataset.mode = btn.dataset.mode;
-      renderSettingsAgent(panel);
-    };
-  });
   panel.querySelectorAll('.btn-rescan').forEach((btn) => {
     btn.onclick = async () => {
       btn.disabled = true;
@@ -3906,16 +3859,7 @@ function renderSettingsAgent(panel) {
       const card = btn.closest('.agent-card');
       const aid = card.dataset.agentId;
       const act = btn.dataset.act;
-      if (act === 'use') {
-        if (!state.selected) {
-          toast(t('composer.placeholder.no_project'), 'error');
-          return;
-        }
-        await API.setAgent(state.selected.id, aid);
-        state.selected = (await API.getProject(state.selected.id)).project;
-        renderSettingsAgent(panel);
-        toast(`✓ ${aid}`, 'success');
-      } else if (act === 'test') {
+      if (act === 'test') {
         const result = panel.querySelector(`[data-test-result="${aid}"]`);
         result.style.display = 'block';
         result.className = 'agent-test-result';

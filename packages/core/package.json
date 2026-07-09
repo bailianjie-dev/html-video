@@ -20,7 +20,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "node -e \"require('node:fs').existsSync('test') ? require('node:child_process').execFileSync(process.execPath, ['--test', 'test/'], { stdio: 'inherit' }) : console.log('no tests')\""
+    "test": "node --test \"test/**/*.test.mjs\""
   },
   "dependencies": {
     "@html-video/content-graph": "workspace:*",

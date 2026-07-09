@@ -200,7 +200,9 @@ cli
       url: handle.url,
       port: handle.port,
       pid: process.pid,
-      project_count: (await ctx.orchestrator.list()).length,
+      project_count: ctx.database?.mode === 'postgres'
+        ? null
+        : (await ctx.orchestrator.list()).length,
       template_count: ctx.templates.list().length,
       note: 'Studio running. Press Ctrl+C to stop.',
     });

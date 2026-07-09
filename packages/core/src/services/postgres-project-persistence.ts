@@ -19,12 +19,13 @@ import {
   projectToAlbumSettings,
 } from './project-mapper.js';
 import type { ProjectPersistence } from './project-persistence.js';
-import { LOCAL_DEV_USER_CONTEXT, type UserContext } from './user-context.js';
+import type { UserContext } from './user-context.js';
+import { safeWorkDirectorySegment } from './work-directory.js';
 
 export interface PostgresProjectPersistenceOptions {
   db: DbClient;
   projectRoot: string;
-  userContext?: UserContext;
+  getUserContext: () => Readonly<UserContext>;
   albums?: AlbumRepository;
   pages?: AlbumPageRepository;
 }
@@ -32,25 +33,35 @@ export interface PostgresProjectPersistenceOptions {
 export class PostgresProjectPersistence implements ProjectPersistence {
   private readonly albums: AlbumRepository;
   private readonly pages: AlbumPageRepository;
-  private readonly userContext: UserContext;
 
   constructor(private readonly opts: PostgresProjectPersistenceOptions) {
     this.albums = opts.albums ?? new AlbumRepository(opts.db);
     this.pages = opts.pages ?? new AlbumPageRepository(opts.db);
-    this.userContext = opts.userContext ?? LOCAL_DEV_USER_CONTEXT;
   }
 
   async ensureDir(id: string): Promise<string> {
-    const dir = join(this.opts.projectRoot, '.html-video', 'projects', id);
+    const user = this.opts.getUserContext();
+    const dir = join(
+      this.opts.projectRoot,
+      '.html-video',
+      'projects',
+      safeWorkDirectorySegment(user.userId, 'user'),
+      safeWorkDirectorySegment(id, 'project'),
+    );
     await mkdir(join(dir, 'assets'), { recursive: true });
     return dir;
   }
 
   async save(project: Project): Promise<void> {
-    const existing = await this.findAlbumForProjectId(project.id);
+    const user = this.opts.getUserContext();
+    await this.saveForUser(project, user);
+  }
+
+  private async saveForUser(project: Project, user: Readonly<UserContext>): Promise<void> {
+    const existing = await this.findAlbumForProjectId(project.id, user);
     const settings = projectToAlbumSettings(project, existing?.settings ?? {});
     if (existing) {
-      await this.albums.update(this.userContext.userId, existing.id, {
+      await this.albums.update(user.userId, existing.id, {
         title: project.name,
         description: project.intent ?? null,
         status: projectStatusToAlbumStatus(project.status),
@@ -60,13 +71,13 @@ export class PostgresProjectPersistence implements ProjectPersistence {
         duration_ms: projectDurationMs(project),
         page_count: project.frames?.length ?? 0,
         settings,
-      }, this.userContext.actorId);
+      }, user.actorId);
       return;
     }
 
     await this.albums.create({
       id: randomUUID(),
-      user_id: this.userContext.userId,
+      user_id: user.userId,
       source_project_id: project.id,
       title: project.name,
       description: project.intent ?? null,
@@ -77,13 +88,18 @@ export class PostgresProjectPersistence implements ProjectPersistence {
       duration_ms: projectDurationMs(project),
       page_count: project.frames?.length ?? 0,
       settings,
-      created_by: this.userContext.actorId,
-      updated_by: this.userContext.actorId,
+      created_by: user.actorId,
+      updated_by: user.actorId,
     });
   }
 
   async load(id: string): Promise<Project> {
-    const album = await this.findAlbumForProjectId(id);
+    const user = this.opts.getUserContext();
+    return this.loadForUser(id, user);
+  }
+
+  private async loadForUser(id: string, user: Readonly<UserContext>): Promise<Project> {
+    const album = await this.findAlbumForProjectId(id, user);
     if (!album || album.status === 'deleted') {
       throw new HtmlVideoError('project-not-found', `Project ${id} not found`);
     }
@@ -91,27 +107,29 @@ export class PostgresProjectPersistence implements ProjectPersistence {
   }
 
   async list(): Promise<Project[]> {
-    const albums = await this.albums.listByUser(this.userContext.userId);
+    const user = this.opts.getUserContext();
+    const albums = await this.albums.listByUser(user.userId);
     return albums.filter(isFormalProjectAlbum).map((album) => albumRowToProject(album));
   }
 
   async remove(id: string): Promise<void> {
-    const album = await this.findAlbumForProjectId(id);
-    if (!album || album.status === 'deleted') return;
-    await this.albums.softDelete(this.userContext.userId, album.id, this.userContext.actorId);
+    const user = this.opts.getUserContext();
+    const album = await this.requireAlbum(id, user);
+    await this.albums.softDelete(user.userId, album.id, user.actorId);
   }
 
   async readRawHtml(projectId: string): Promise<string | null> {
-    const album = await this.findAlbumForProjectId(projectId);
-    if (!album || album.status === 'deleted') return null;
-    const page = await this.pages.findByNodeId(this.userContext.userId, album.id, 'preview')
-      ?? await this.pages.findByPageNo(this.userContext.userId, album.id, 1);
+    const user = this.opts.getUserContext();
+    const album = await this.requireAlbum(projectId, user);
+    const page = await this.pages.findByNodeId(user.userId, album.id, 'preview')
+      ?? await this.pages.findByPageNo(user.userId, album.id, 1);
     if (page?.raw_html) return page.raw_html;
     return readLocalFile(asString(album.settings.local_last_preview_html_path));
   }
 
   async writeRawHtml(projectId: string, html: string): Promise<{ project: Project; htmlPath: string }> {
-    const album = await this.requireAlbum(projectId);
+    const user = this.opts.getUserContext();
+    const album = await this.requireAlbum(projectId, user);
     const project = albumRowToProject(album);
     const projectDir = await this.ensureDir(project.id);
     const htmlPath = join(projectDir, 'preview.html');
@@ -124,14 +142,14 @@ export class PostgresProjectPersistence implements ProjectPersistence {
     }
     if (project.status === 'draft') project.status = 'previewed';
 
-    const existingPreview = await this.pages.findByNodeId(this.userContext.userId, album.id, 'preview');
-    const existingPages = existingPreview ? [] : await this.pages.listByAlbum(this.userContext.userId, album.id);
+    const existingPreview = await this.pages.findByNodeId(user.userId, album.id, 'preview');
+    const existingPages = existingPreview ? [] : await this.pages.listByAlbum(user.userId, album.id);
     const previewPageNo = existingPreview?.page_no
       ?? Math.max(0, ...existingPages.map((page) => page.page_no)) + 1;
 
     await this.pages.upsertByAlbumAndNodeId({
       id: randomUUID(),
-      user_id: this.userContext.userId,
+      user_id: user.userId,
       album_id: album.id,
       node_id: 'preview',
       page_no: previewPageNo,
@@ -140,17 +158,17 @@ export class PostgresProjectPersistence implements ProjectPersistence {
       duration_ms: projectDurationMs(project) || 3000,
       raw_html: html,
       content: { kind: 'single_preview', local_html_path: htmlPath },
-      created_by: this.userContext.actorId,
-      updated_by: this.userContext.actorId,
+      created_by: user.actorId,
+      updated_by: user.actorId,
     });
-    await this.save(project);
-    return { project: await this.load(project.id), htmlPath };
+    await this.saveForUser(project, user);
+    return { project: await this.loadForUser(project.id, user), htmlPath };
   }
 
   async readFrameHtml(projectId: string, nodeId: string): Promise<string | null> {
-    const album = await this.findAlbumForProjectId(projectId);
-    if (!album || album.status === 'deleted') return null;
-    const page = await this.pages.findByNodeId(this.userContext.userId, album.id, nodeId);
+    const user = this.opts.getUserContext();
+    const album = await this.requireAlbum(projectId, user);
+    const page = await this.pages.findByNodeId(user.userId, album.id, nodeId);
     if (page?.raw_html) return page.raw_html;
     const project = albumRowToProject(album);
     const frame = (project.frames ?? []).find((item) => item.graphNodeId === nodeId);
@@ -163,7 +181,8 @@ export class PostgresProjectPersistence implements ProjectPersistence {
     html: string,
     frame: FrameRecord,
   ): Promise<{ project: Project; frame: FrameRecord }> {
-    const album = await this.requireAlbum(projectId);
+    const user = this.opts.getUserContext();
+    const album = await this.requireAlbum(projectId, user);
     const project = albumRowToProject(album);
     const projectDir = await this.ensureDir(project.id);
     const framesDir = join(projectDir, 'frames');
@@ -185,10 +204,12 @@ export class PostgresProjectPersistence implements ProjectPersistence {
     }
     if (project.status === 'draft') project.status = 'previewed';
 
-    const pageNo = await this.pageNoForGraphNode(album.id, nodeId, frame.order);
+    const existingPage = await this.pages.findByNodeId(user.userId, album.id, nodeId);
+    const pageNo = existingPage?.page_no
+      ?? await this.pageNoForGraphNode(album.id, nodeId, frame.order, user);
     await this.pages.upsertByAlbumAndPageNo({
-      id: randomUUID(),
-      user_id: this.userContext.userId,
+      id: existingPage?.id ?? randomUUID(),
+      user_id: user.userId,
       album_id: album.id,
       node_id: nodeId,
       page_no: pageNo,
@@ -197,29 +218,32 @@ export class PostgresProjectPersistence implements ProjectPersistence {
       template_key: frame.nativeTemplateId ?? null,
       duration_ms: Math.max(1, Math.round(frame.durationSec * 1000)),
       raw_html: html,
-      content: stripUndefined({
-        graph_node_id: nodeId,
-        data: frame.data,
-        local_html_path: htmlPath,
-        local_preview_mp4_path: frame.previewMp4Path,
-      }),
+      content: {
+        ...(existingPage?.content ?? {}),
+        ...stripUndefined({
+          graph_node_id: nodeId,
+          data: frame.data,
+          local_html_path: htmlPath,
+          local_preview_mp4_path: frame.previewMp4Path,
+        }),
+      },
       style: stripUndefined({
         engine: frame.engine,
         native_template_id: frame.nativeTemplateId,
       }),
-      created_by: this.userContext.actorId,
-      updated_by: this.userContext.actorId,
+      created_by: user.actorId,
+      updated_by: user.actorId,
     });
-    await this.save(project);
-    return { project: await this.load(project.id), frame: nextFrame };
+    await this.saveForUser(project, user);
+    return { project: await this.loadForUser(project.id, user), frame: nextFrame };
   }
 
   async readContentGraph(projectId: string): Promise<ContentGraph | null> {
-    const album = await this.findAlbumForProjectId(projectId);
-    if (!album || album.status === 'deleted') return null;
+    const user = this.opts.getUserContext();
+    const album = await this.requireAlbum(projectId, user);
     const graphMeta = asObject(album.settings.content_graph);
     if (graphMeta) {
-      const pages = await this.pages.listByAlbum(this.userContext.userId, album.id);
+      const pages = await this.pages.listByAlbum(user.userId, album.id);
       const nodes = pages
         .map((page) => asObject(page.content.graph_node))
         .filter((node): node is JsonObject => node !== null);
@@ -241,7 +265,8 @@ export class PostgresProjectPersistence implements ProjectPersistence {
     graph: ContentGraph,
     opts: { preserveFrames?: boolean } = {},
   ): Promise<{ project: Project; graphPath: string }> {
-    const album = await this.requireAlbum(projectId);
+    const user = this.opts.getUserContext();
+    const album = await this.requireAlbum(projectId, user);
     const project = albumRowToProject(album);
     const projectDir = await this.ensureDir(project.id);
     const graphPath = join(projectDir, 'content-graph.json');
@@ -262,11 +287,11 @@ export class PostgresProjectPersistence implements ProjectPersistence {
 
     for (let i = 0; i < graph.nodes.length; i++) {
       const node = graph.nodes[i]!;
-      const existing = await this.pages.findByNodeId(this.userContext.userId, album.id, node.id);
-      const pageNo = existing?.page_no ?? await this.pageNoForGraphNode(album.id, node.id, i);
+      const existing = await this.pages.findByNodeId(user.userId, album.id, node.id);
+      const pageNo = existing?.page_no ?? await this.pageNoForGraphNode(album.id, node.id, i, user);
       await this.pages.upsertByAlbumAndPageNo({
         id: existing?.id ?? randomUUID(),
-        user_id: this.userContext.userId,
+        user_id: user.userId,
         album_id: album.id,
         node_id: node.id,
         page_no: pageNo,
@@ -280,8 +305,8 @@ export class PostgresProjectPersistence implements ProjectPersistence {
         },
         style: existing?.style ?? {},
         transition: existing?.transition ?? {},
-        created_by: this.userContext.actorId,
-        updated_by: this.userContext.actorId,
+        created_by: user.actorId,
+        updated_by: user.actorId,
       });
     }
 
@@ -294,32 +319,37 @@ export class PostgresProjectPersistence implements ProjectPersistence {
         edges: graph.edges,
       }),
     };
-    await this.albums.update(this.userContext.userId, album.id, {
+    await this.albums.update(user.userId, album.id, {
       page_count: graph.nodes.length,
       settings,
-    }, this.userContext.actorId);
-    return { project: await this.load(project.id), graphPath };
+    }, user.actorId);
+    return { project: await this.loadForUser(project.id, user), graphPath };
   }
 
-  private async findAlbumForProjectId(id: string): Promise<AlbumRow | null> {
-    const bySourceProjectId = await this.albums.findBySourceProjectId(this.userContext.userId, id);
+  private async findAlbumForProjectId(id: string, user: Readonly<UserContext>): Promise<AlbumRow | null> {
+    const bySourceProjectId = await this.albums.findBySourceProjectId(user.userId, id);
     if (bySourceProjectId) return bySourceProjectId;
     if (!isUuid(id)) return null;
-    return this.albums.findById(this.userContext.userId, id);
+    return this.albums.findById(user.userId, id);
   }
 
-  private async requireAlbum(id: string): Promise<AlbumRow> {
-    const album = await this.findAlbumForProjectId(id);
+  private async requireAlbum(id: string, user: Readonly<UserContext>): Promise<AlbumRow> {
+    const album = await this.findAlbumForProjectId(id, user);
     if (!album || album.status === 'deleted') {
       throw new HtmlVideoError('project-not-found', `Project ${id} not found`);
     }
     return album;
   }
 
-  private async pageNoForGraphNode(albumId: string, nodeId: string, order: number): Promise<number> {
-    const existing = await this.pages.findByNodeId(this.userContext.userId, albumId, nodeId);
+  private async pageNoForGraphNode(
+    albumId: string,
+    nodeId: string,
+    order: number,
+    user: Readonly<UserContext>,
+  ): Promise<number> {
+    const existing = await this.pages.findByNodeId(user.userId, albumId, nodeId);
     if (existing) return existing.page_no;
-    const preview = await this.pages.findByNodeId(this.userContext.userId, albumId, 'preview');
+    const preview = await this.pages.findByNodeId(user.userId, albumId, 'preview');
     return order + 1 + (preview ? 1 : 0);
   }
 }
