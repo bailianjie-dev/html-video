@@ -3330,6 +3330,57 @@ interface PhaseInputs {
  * storyboard rather than starting fresh. */
 type PhaseResult = { phase: ConvPhase; inputs: PhaseInputs; postGen?: boolean };
 
+function parseConfiguredCreateRequest(text: string): PhaseInputs | undefined {
+  const hasCreatePageShape =
+    /生成要求\s*[:：]/.test(text) &&
+    /(?:内容类型|类型)\s*[:：]/.test(text) &&
+    /(?:主题和素材说明|相册标题|图片顺序)\s*[:：]/.test(text);
+  if (!hasCreatePageShape) return undefined;
+
+  const pickLine = (label: string): string => {
+    const re = new RegExp(`${label}\\s*[:：]\\s*([^\\n。]+)`);
+    return re.exec(text)?.[1]?.trim() ?? '';
+  };
+  const pickedType = pickLine('(?:内容类型|类型)') || '电子相册';
+  const pickedStyle = pickLine('风格');
+  const aspect = pickLine('(?:比例|画面尺寸|尺寸)');
+  const pageCount = /(?:页数\/帧数|页数|帧数)\s*[:：]\s*(\d{1,2})/.exec(text)?.[1];
+  const topic =
+    /主题和素材说明\s*[:：]\s*([\s\S]*?)\n\s*生成要求\s*[:：]/.exec(text)?.[1]?.trim()
+    ?? /相册标题\s*[:：]\s*([\s\S]*?)\n\s*补充说明\s*[:：]/.exec(text)?.[1]?.trim()
+    ?? '';
+  const audience = pickLine('受众');
+  const scene = pickLine('场景');
+  const tone = pickLine('语气');
+
+  const collected: Record<string, string> = {};
+  if (aspect) collected.aspect = aspect;
+
+  if (/单帧|单画面|标题卡|封面|logo|title.?card|single.?frame|cover|still/i.test(pickedType)) {
+    collected.frame_count = '1';
+    collected.duration = '5';
+  } else if (pageCount) {
+    collected.frame_count = pageCount;
+    collected.per_frame = '4';
+  }
+
+  const details = [
+    topic ? `主题和素材说明：${topic}` : '',
+    audience ? `受众：${audience}` : '',
+    scene ? `场景：${scene}` : '',
+    tone ? `语气：${tone}` : '',
+    pageCount ? `页数/帧数：${pageCount}` : '',
+  ].filter(Boolean).join('；');
+
+  const inputs: PhaseInputs = {
+    collected,
+    pickedType,
+    contentTurns: [details || text],
+  };
+  if (pickedStyle) inputs.pickedStyle = pickedStyle;
+  return inputs;
+}
+
 function detectPhase(
   history: ChatMessage[],
   userText: string,
@@ -3450,6 +3501,9 @@ function detectPhase(
   const prev = lastAssistantCardWithMeta(history);
 
   if (!prev) {
+    const configured = parseConfiguredCreateRequest(trimmed);
+    if (configured) return { phase: 'generate', inputs: configured };
+
     // No prior card → opener.
     return { phase: 'opener', inputs };
   }

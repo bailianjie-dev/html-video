@@ -9,12 +9,12 @@
  * Locale resolution order:
  *   1. localStorage hv.studio.locale
  *   2. navigator.language prefix ("zh-CN" → "zh")
- *   3. DEFAULT_LOCALE = "en"
+ *   3. DEFAULT_LOCALE = "zh"
  *
  * Strings missing in the active locale fall back to en, then the key.
  */
 
-export const DEFAULT_LOCALE = 'en';
+export const DEFAULT_LOCALE = 'zh';
 export const AVAILABLE_LOCALES = ['en', 'zh'];
 
 const DICT = {
@@ -40,14 +40,14 @@ const DICT = {
     'toolbar.agent_none': '— none —',
     'toolbar.agent_ready': '● ready',
     'toolbar.agent_install': '○ install',
-    'toolbar.export_mp4': 'Export MP4',
-    'toolbar.export_html': 'Export HTML',
-    'toolbar.export_html_title_ready': 'Download the current preview as standalone HTML',
-    'toolbar.export_html_title_disabled': 'Generate or pick a template first',
+    'toolbar.export_mp4': '导出 MP4',
+    'toolbar.export_html': '导出 HTML',
+    'toolbar.export_html_title_ready': '下载当前预览为独立 HTML 相册',
+    'toolbar.export_html_title_disabled': '请先生成相册',
 
     'composer.placeholder.no_project': 'Pick a project first…',
     'composer.placeholder.detecting_agents': 'Describe the video while we check for agents…',
-    'composer.placeholder.no_agent': 'Install Claude Code (claude CLI) to enable chat…',
+    'composer.placeholder.no_agent': 'Configure AI Assistant to enable chat…',
     'composer.placeholder.focus':
       'Edit only this frame (click ✕ on the chip above to release)…',
     'composer.placeholder.no_template':
@@ -276,7 +276,7 @@ const DICT = {
   zh: {
     'app.empty_pick_create': '挑一个项目或新建',
     'app.empty_subtitle':
-      '每个项目 = 一个 HTML 视频。挑一个模板看视觉基线、跟 agent 聊驱动内容、在中间栏改逐帧文字、右边看效果。',
+      '每个项目都是一本电子相册。你可以继续调整文案、风格、页数，并导出 HTML 或 MP4。',
     'app.no_project': '未选项目',
 
     'sidebar.projects': '项目',
@@ -290,23 +290,23 @@ const DICT = {
 
     'toolbar.template': '模板',
     'toolbar.template_pick': '可选 · 挑模板',
-    'toolbar.agent': 'Agent',
+    'toolbar.agent': 'AI助手',
     'toolbar.model': '模型',
     'toolbar.agent_none': '— 无 —',
     'toolbar.agent_ready': '● 就绪',
     'toolbar.agent_install': '○ 待装',
     'toolbar.export_mp4': '导出 MP4',
-    'toolbar.export_html': '导出相册',
+    'toolbar.export_html': '导出 HTML',
     'toolbar.export_html_title_ready': '下载当前预览为独立 HTML 相册',
-    'toolbar.export_html_title_disabled': '请先生成相册或选择模板',
+    'toolbar.export_html_title_disabled': '请先生成相册',
 
     'composer.placeholder.no_project': '先选一个项目…',
-    'composer.placeholder.detecting_agents': '描述视频（正在探测 agent）…',
-    'composer.placeholder.no_agent': '装 claude CLI 后即可聊天…',
+    'composer.placeholder.detecting_agents': '描述想调整的内容（正在准备 AI助手）…',
+    'composer.placeholder.no_agent': '配置 AI助手 后即可聊天…',
     'composer.placeholder.focus': '只修改这一帧的内容（点掉上方芯片可恢复整片）…',
-    'composer.placeholder.no_template': '描述视频，或粘一个文章链接 / GitHub repo 据此生成。',
-    'composer.placeholder.with_template': '描述视频 — 内容、名字、数据…或粘文章链接 / GitHub repo。',
-    'composer.hint': 'Cmd / Ctrl + Enter · 拖拽 / 粘贴文件 · 拖入 design.md / frame.md 锁定品牌+动效',
+    'composer.placeholder.no_template': '描述电子相册主题、公司信息、产品亮点或调整要求。',
+    'composer.placeholder.with_template': '描述想调整的内容，例如文案、页数、风格、图片使用方式。',
+    'composer.hint': 'Ctrl + Enter 发送 · 可拖拽或粘贴图片素材',
     'composer.send': '发送',
     'composer.attach': '附加文件',
     'composer.focus_chip': '仅修改第 {order} 帧 {fid}',
@@ -314,25 +314,25 @@ const DICT = {
 
     'chat.empty.title': '发条消息开始',
     'chat.empty.body':
-      '告诉 agent 想做什么 — 单帧标题卡、多帧预告片、数据大字报 — 它会搭出 HTML。',
+      '告诉 AI助手你想调整什么，例如文案更简洁、增加客户案例、换成科技风格。',
     'chat.summary.form_submitted': '📋 提交了表单',
     'chat.summary.confirm_generate': '✓ 确认生成',
     'chat.summary.confirm_edit': '✏️ 改一下',
-    'chat.thinking': 'agent 思考中',
-    'chat.still_generating': '⏳ 这个项目仍在后台生成中 —— 完成后结果会出现在这里（点重载预览可刷新）。',
+    'chat.thinking': 'AI助手思考中',
+    'chat.still_generating': '⏳ 这个相册仍在生成中，完成后会自动显示结果，也可以点刷新预览查看。',
     'chat.placeholder.gen_html': '📄 *正在生成 HTML…*',
     'chat.placeholder.plan_graph': '🧭 *规划故事板…*',
     'chat.empty_reply':
-      '⚠️ Agent 返回为空。试着重新表述 — 比如告诉它品牌 / 主题 / 1-2 个具体点，或者你想要什么类型的帧。',
+      '⚠️ AI助手没有返回内容。可以补充公司名称、产品亮点、目标客户或想调整的页面。',
 
     'preview.placeholder.pick_project': '先选一个项目。',
     'preview.placeholder.pick_template':
-      '发一条消息让 agent 生成第一版 HTML。<br>或上方挑一个模板快开。',
+      '先输入主题生成第一版电子相册。<br>生成后可在这里预览和调整。',
     'preview.edit_text_on': '✓ 完成编辑',
     'preview.edit_text_off': '✎ 编辑文字',
     'preview.edit_text_title': '点画面里的文字直接修改',
     'preview.edit_text_done_title': '完成编辑',
-    'preview.reload': '↻ 重载预览',
+    'preview.reload': '↻ 刷新预览',
     'preview.no_hv_text': '当前帧没有可编辑的文字（HTML 缺 data-hv-text 标签）。',
 
     'frames.label': '分镜',
@@ -536,7 +536,7 @@ function resolveInitialLocale() {
   } catch {
     /* localStorage unavailable */
   }
-  // Default is English regardless of nav.language. Joey explicitly asked.
+  // This product is currently enterprise-facing in Chinese by default.
   return DEFAULT_LOCALE;
 }
 

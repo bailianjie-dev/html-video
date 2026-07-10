@@ -88,6 +88,9 @@ const state = {
   exporting: false,        // export run in progress
   exportProgress: null,    // { pct, stage } during a streamed export
   lastGraph: null,         // last fetched ContentGraph (for download)
+  generationMeta: null,    // create-page selections shown on the generation page
+  generationComposerOpen: false,
+  previewMode: 'desktop',
   // Phase C: per-frame native Remotion enhancement
   frameKinds: {},          // { [graphNodeId]: 'entity'|'data'|'text' } for the selected project
   enhancing: null,         // { nodeId, pct, stage } while a single-frame enhance render is in flight
@@ -124,6 +127,9 @@ function clearSessionState() {
   state.exporting = false;
   state.exportProgress = null;
   state.lastGraph = null;
+  state.generationMeta = null;
+  state.generationComposerOpen = false;
+  state.previewMode = 'desktop';
   state.activeFrameId = null;
   state.iterateFocusFrameId = null;
   state.editTextMode = false;
@@ -268,6 +274,7 @@ async function startExportStream() {
   state.exporting = true;
   state.exportProgress = { pct: 0, stage: 'starting' };
   renderToolbar();
+  updateGenerationControls();
   state.messages.push({ role: 'preview-event', content: t('export.starting'), ts: Date.now() });
   renderChatLog();
 
@@ -283,6 +290,7 @@ async function startExportStream() {
     state.exportProgress = null;
     toast(t('export.failed_short', { message: (e?.message ?? e) }), 'error');
     renderToolbar();
+    updateGenerationControls();
     return;
   }
   if (!res.ok || !res.body) {
@@ -291,6 +299,7 @@ async function startExportStream() {
     const err = await res.text().catch(() => '');
     toast(t('export.failed_short', { message: err.slice(0, 200) }), 'error');
     renderToolbar();
+    updateGenerationControls();
     return;
   }
 
@@ -311,6 +320,7 @@ async function startExportStream() {
         if (ev.type === 'export_progress') {
           state.exportProgress = { pct: ev.pct, stage: ev.stage };
           renderToolbar();
+          updateGenerationControls();
         } else if (ev.type === 'export_done') {
           state.exporting = false;
           state.exportProgress = null;
@@ -328,6 +338,7 @@ async function startExportStream() {
           });
           renderChatLog();
           renderToolbar();
+          updateGenerationControls();
           refreshProjects();
         } else if (ev.type === 'export_failed') {
           state.exporting = false;
@@ -339,6 +350,7 @@ async function startExportStream() {
           });
           renderChatLog();
           renderToolbar();
+          updateGenerationControls();
         }
       }
     }
@@ -347,6 +359,7 @@ async function startExportStream() {
     state.exportProgress = null;
     toast(t('export.stream_interrupted', { message: (e?.message ?? e) }), 'error');
     renderToolbar();
+    updateGenerationControls();
   }
 }
 
@@ -473,8 +486,8 @@ async function refreshProjects() {
   if (state.activePage === 'history') renderProjectHistory();
 }
 
-async function selectProject(id) {
-  state.activePage = 'workspace';
+async function selectProject(id, options = {}) {
+  state.activePage = options.page || 'workspace';
   state.selectedId = id;
   state.selected = (await API.getProject(id)).project;
   state.projectAssets = [];
@@ -528,8 +541,6 @@ const NAV_ITEMS = [
   { id: 'album', label: '图片转相册', desc: '素材生成 HTML', icon: 'image' },
   { id: 'workspace', label: '项目编辑', desc: '预览与导出', icon: 'edit' },
   { id: 'history', label: '历史项目', desc: '管理已生成项目', icon: 'history' },
-  { id: 'templates', label: '样例库', desc: '浏览视觉模板', icon: 'templates' },
-  { id: 'settings', label: '系统设置', desc: 'Agent 与音频配置', icon: 'settings' },
 ];
 
 function navIcon(name) {
@@ -618,13 +629,223 @@ async function createAlbumProject() {
 const CREATE_TOPIC_EXAMPLES = [
   '公司介绍电子相册：封面、公司简介、核心业务、团队优势、联系方式',
   '产品发布相册：痛点、方案、亮点、使用场景、购买方式',
+  '案例展示相册：客户背景、挑战、解决方案、成果数据、客户评价',
   '活动回顾相册：开场、现场瞬间、嘉宾观点、精彩数据、结束致谢',
-  '个人作品集：简介、代表作品、项目故事、能力标签、联系方式',
 ];
+
+const ALBUM_AUDIENCE_GROUPS = [
+  {
+    label: '常用受众',
+    options: [
+      { label: '潜在客户', value: '潜在客户：重点讲清企业实力、产品/服务价值、可信背书和合作入口，适合获客型宣传相册。' },
+      { label: '企业客户', value: '企业客户：语气专业可信，突出解决方案、交付能力、案例成果和长期服务能力。' },
+      { label: '合作伙伴', value: '合作伙伴：突出资源互补、合作模式、市场机会和共同成长价值。' },
+      { label: '招商加盟商', value: '招商加盟商：突出品牌势能、盈利模型、扶持政策、样板案例和加盟流程。' },
+      { label: '展会观众', value: '展会观众：开头抓眼球，快速说明公司是谁、亮点是什么、为什么值得进一步交流。' },
+    ],
+  },
+  {
+    label: '更多受众',
+    options: [
+      { label: '销售线索', value: '销售线索：围绕痛点、方案、优势、案例和行动引导组织内容，利于后续转化。' },
+      { label: '投资人', value: '投资人：突出商业模式、增长数据、团队能力、行业空间和里程碑。' },
+      { label: '渠道代理', value: '渠道代理：突出市场空间、产品卖点、合作政策、渠道支持和收益预期。' },
+      { label: '招投标评审', value: '招投标评审：表达严谨，突出资质、项目经验、交付流程、团队配置和风险控制。' },
+      { label: '政府/园区/协会', value: '政府、园区或行业协会：表达稳健正式，突出企业资质、产业价值、社会贡献和合规经营。' },
+      { label: '招聘候选人', value: '招聘候选人：突出企业愿景、团队氛围、成长机会和岗位吸引力。' },
+    ],
+  },
+];
+
+const ALBUM_SCENE_GROUPS = [
+  {
+    label: '常用场景',
+    options: [
+      { label: '公司介绍', value: '公司介绍：用于企业对外宣传，建议包含封面、公司简介、核心业务、优势背书、案例/成果、联系方式。' },
+      { label: '品牌宣传', value: '品牌宣传：突出品牌定位、理念、差异化价值、视觉记忆点和行动引导。' },
+      { label: '产品介绍', value: '产品介绍：围绕痛点、产品能力、核心卖点、使用场景、案例成果和购买/咨询方式组织。' },
+      { label: '解决方案', value: '解决方案：面向行业或客户问题，呈现需求洞察、方案架构、实施流程和预期价值。' },
+      { label: '案例展示', value: '案例展示：按客户背景、挑战、方案、执行过程、结果数据和客户评价展开。' },
+      { label: '活动回顾', value: '活动回顾：按开场、现场亮点、嘉宾观点、互动瞬间、数据成果和感谢收束组织。' },
+    ],
+  },
+  {
+    label: '更多场景',
+    options: [
+      { label: '展会招商', value: '展会招商：适合展台屏幕或扫码浏览，开头吸引注意，快速呈现品牌、产品、政策和联系方式。' },
+      { label: '客户拜访', value: '客户拜访：适合销售随身展示，内容简洁有说服力，突出客户关心的价值、案例和合作方式。' },
+      { label: '服务流程', value: '服务流程：讲清咨询、定制、交付、验收、售后等环节，增强信任和转化。' },
+      { label: '发布会预告', value: '发布会预告：制造期待感，突出主题、时间、亮点、嘉宾或新品信息，并引导报名/预约。' },
+      { label: '荣誉资质', value: '荣誉资质：集中展示证书、奖项、专利、认证、媒体报道和客户认可。' },
+      { label: '团队风采', value: '团队风采：展示核心团队、专业背景、协作方式、办公环境和服务精神。' },
+      { label: '年度总结', value: '年度总结：呈现年度数据、关键项目、团队成果、重要客户、荣誉和下一年规划。' },
+    ],
+  },
+];
+
+const ALBUM_STYLE_GROUPS = [
+  {
+    label: '通用与商务',
+    options: [
+      { label: '清爽留白', value: '清爽留白：浅色背景、充足留白、细线分隔、轻量卡片，适合正式介绍和可读性优先的电子相册。' },
+      { label: '浅中性渐变', value: '浅中性渐变：浅灰蓝或淡紫渐变背景，层次柔和，适合通用展示、课程、活动和公司介绍。' },
+      { label: '商务灰', value: '商务灰：冷静灰白底、规整网格、深色正文和克制强调色，适合报告、方案、项目汇报类相册。' },
+      { label: '暖色商务', value: '暖色商务：米白、暖金、浅咖色调，稳重亲和，适合品牌故事、团队介绍和客户展示。' },
+      { label: '杂志感', value: '杂志感：大标题、图文错落、留白与封面式排版，适合作品集、人物、品牌和活动回顾。' },
+    ],
+  },
+  {
+    label: '科技与产品',
+    options: [
+      { label: '科技深蓝', value: '科技深蓝：深蓝或蓝黑背景、蓝紫光效、玻璃拟态卡片、高对比标题，适合科技公司、产品发布和数据展示。' },
+      { label: '深色渐变', value: '深色渐变：深色背景叠加蓝紫/青绿渐变光，视觉冲击更强，适合发布会、预告片和高端产品相册。' },
+      { label: '数据大屏', value: '数据大屏：深色仪表盘、数字高亮、模块化信息卡，适合业绩、业务数据、年度总结和运营展示。' },
+      { label: '极简黑白', value: '极简黑白：黑白灰主调、强字体层级、少量强调色，适合高级感品牌、建筑、设计和作品展示。' },
+    ],
+  },
+  {
+    label: '自然与纪念',
+    options: [
+      { label: '自然绿', value: '自然绿：深绿、薄荷绿或森林绿配色，柔和渐变与自然纹理，适合户外、健康、环保和生活方式相册。' },
+      { label: '温暖纪实', value: '温暖纪实：暖光、胶片颗粒、真实照片优先，适合年会、毕业、家庭、旅行和纪念类电子相册。' },
+      { label: '胶片复古', value: '胶片复古：复古色调、轻颗粒、拍立得/相纸边框，适合个人回忆、旅行记录和老照片整理。' },
+      { label: '旅行明信片', value: '旅行明信片：明亮色彩、地图/票据/邮戳元素、轻松排版，适合旅行、城市漫游和活动路线相册。' },
+      { label: '婚礼浪漫', value: '婚礼浪漫：柔粉、奶白、香槟金、花艺与细腻衬线标题，适合婚礼、情侣和重要仪式相册。' },
+    ],
+  },
+  {
+    label: '个人与创意',
+    options: [
+      { label: '个人作品集', value: '个人作品集：干净背景、作品大图、标签化信息和强个人署名，适合设计师、摄影师、学生和求职展示。' },
+      { label: '插画手账', value: '插画手账：手绘贴纸、纸张纹理、轻松排版，适合亲子、校园、课程和生活记录。' },
+      { label: '国潮雅致', value: '国潮雅致：宣纸质感、墨色、朱砂或青绿点缀，现代留白结合东方元素，适合文化、非遗和中式品牌相册。' },
+      { label: '自定义风格', value: '自定义风格：优先采用用户在主题和素材说明里写出的个人偏好、参考图片或品牌要求；如果没有额外说明，再选择最适合内容的视觉方向。' },
+    ],
+  },
+];
+
+const GENERATION_STYLE_PRESETS = [
+  {
+    label: '科技深蓝',
+    desc: '深蓝背景、蓝紫光效、高对比标题，适合科技公司、产品发布、数据展示。',
+    swatch: 'linear-gradient(135deg, #08111f, #174ea6 58%, #23b7ff)',
+    prompt: '请把当前电子相册重套为“科技深蓝”风格：深蓝或蓝黑背景，蓝紫光效，高对比标题，适合科技公司、产品发布和数据展示；保留现有内容重点、页数和行动引导。',
+  },
+  {
+    label: '清爽商务',
+    desc: '浅色背景、留白充足、信息清楚，适合公司介绍、解决方案和客户拜访。',
+    swatch: 'linear-gradient(135deg, #ffffff, #e9f2ff 52%, #9db9e8)',
+    prompt: '请把当前电子相册重套为“清爽商务”风格：浅色背景，充足留白，规整图文层级，整体专业可信；保留现有内容重点、页数和行动引导。',
+  },
+  {
+    label: '暖色品牌',
+    desc: '暖白、浅金、柔和卡片，适合品牌故事、团队风采和客户案例。',
+    swatch: 'linear-gradient(135deg, #fff8ec, #ffd69d 58%, #c9893f)',
+    prompt: '请把当前电子相册重套为“暖色品牌”风格：暖白、浅金、柔和卡片和亲和视觉，适合品牌故事、团队风采和客户案例；保留现有内容重点、页数和行动引导。',
+  },
+  {
+    label: '杂志感',
+    desc: '大标题、封面式排版、图文错落，适合品牌宣传、活动回顾和作品展示。',
+    swatch: 'linear-gradient(135deg, #f7f3ea, #111827 54%, #d6b36a)',
+    prompt: '请把当前电子相册重套为“杂志感”风格：大标题、封面式排版、图文错落、留白明确，适合品牌宣传和活动回顾；保留现有内容重点、页数和行动引导。',
+  },
+  {
+    label: '数据大屏',
+    desc: '深色模块、数字突出、指标卡片，适合业绩成果、年度总结和运营数据。',
+    swatch: 'linear-gradient(135deg, #06141f, #0f766e 48%, #67e8f9)',
+    prompt: '请把当前电子相册重套为“数据大屏”风格：深色模块化界面，数字和指标突出，适合业绩成果、年度总结和运营数据展示；保留现有内容重点、页数和行动引导。',
+  },
+  {
+    label: '极简黑白',
+    desc: '黑白灰主调、强字体层级、少量强调色，适合高端品牌和设计感展示。',
+    swatch: 'linear-gradient(135deg, #f8fafc, #111827 62%, #64748b)',
+    prompt: '请把当前电子相册重套为“极简黑白”风格：黑白灰主调，强字体层级，少量强调色，整体高级克制；保留现有内容重点、页数和行动引导。',
+  },
+];
+
+const GENERATION_PAGE_PRESETS = [
+  { label: '3 页', desc: '精简版，适合快速介绍和移动端轻量传播。' },
+  { label: '5 页', desc: '标准版，适合公司介绍、产品宣传和客户拜访。' },
+  { label: '8 页', desc: '完整版，适合信息较多的企业宣传和案例展示。' },
+  { label: '10 页', desc: '详细版，适合招商、解决方案、年度成果等长内容。' },
+];
+
+function renderGroupedOptions(groups, defaultLabel = '') {
+  return groups.map((group) => `
+    <optgroup label="${esc(group.label)}">
+      ${group.options.map((option) => `<option value="${esc(option.value)}"${option.label === defaultLabel ? ' selected' : ''}>${esc(option.label)}</option>`).join('')}
+    </optgroup>
+  `).join('');
+}
+
+function renderAlbumAudienceOptions(defaultLabel = '潜在客户') {
+  return renderGroupedOptions(ALBUM_AUDIENCE_GROUPS, defaultLabel);
+}
+
+function renderAlbumSceneOptions(defaultLabel = '公司介绍') {
+  return renderGroupedOptions(ALBUM_SCENE_GROUPS, defaultLabel);
+}
+
+function renderAlbumStyleOptions(defaultLabel = '科技深蓝') {
+  return renderGroupedOptions(ALBUM_STYLE_GROUPS, defaultLabel);
+}
 
 function makeAlbumProjectName(raw) {
   const first = String(raw || '').split(/\r?\n/).find((line) => line.trim())?.trim() || '电子相册';
   return first.replace(/[<>:"/\\|?*\x00-\x1f]/g, '').slice(0, 18) || '电子相册';
+}
+
+function projectUserStatus(project) {
+  if (!project) return '';
+  if (state.selectedId === project.id && state.exporting) return '正在导出';
+  if (state.selectedId === project.id && state.composing) return '正在生成';
+  const hasPreview = !!(
+    project.lastPreviewHtmlPath
+    || project.last_preview_html_path
+    || (project.frames?.length ?? 0) > 0
+  );
+  if (hasPreview || project.status === 'rendered' || project.status === 'previewed') return '已生成，可预览和调整';
+  if (project.status === 'draft') return '准备生成';
+  return '可继续编辑';
+}
+
+function selectedOptionText(id) {
+  const el = document.getElementById(id);
+  return el?.selectedOptions?.[0]?.textContent?.trim() || el?.value || '';
+}
+
+function buildCreateGenerationMeta(raw) {
+  const title = makeAlbumProjectName(raw);
+  return {
+    title,
+    status: 'draft',
+    kind: '电子相册',
+    pages: selectedOptionText('create-pages') || '5 页',
+    audience: selectedOptionText('create-audience') || '潜在客户',
+    scene: selectedOptionText('create-scene') || '公司介绍',
+    tone: selectedOptionText('create-tone') || '温柔',
+    ratio: selectedOptionText('create-ratio') || '16:9 横屏',
+    style: selectedOptionText('create-style') || '科技深蓝',
+    materialUse: selectedOptionText('create-material-use') || '优先使用上传素材',
+    cta: selectedOptionText('create-cta') || '联系咨询',
+  };
+}
+
+function buildImageAlbumGenerationMeta() {
+  const title = document.getElementById('image-album-title')?.value.trim() || '图片电子相册';
+  return {
+    title: makeAlbumProjectName(title),
+    status: 'draft',
+    kind: '电子相册',
+    pages: `${state.pendingAttachments.length || 0} 页`,
+    audience: '潜在客户',
+    scene: '图片宣传相册',
+    tone: '温柔',
+    ratio: selectedOptionText('image-album-ratio') || '16:9 横屏',
+    style: selectedOptionText('image-album-style') || '温暖纪实',
+    materialUse: '图片为主文字为辅',
+    cta: '联系咨询',
+  };
 }
 
 function buildAlbumPromptFromCreatePage() {
@@ -632,7 +853,7 @@ function buildAlbumPromptFromCreatePage() {
   const raw = document.getElementById('create-topic-input')?.value.trim() || '';
   const wantsThinking = document.getElementById('btn-create-thinking')?.classList.contains('active');
   const attachmentNote = state.pendingAttachments.length
-    ? `\n已上传 ${state.pendingAttachments.length} 个素材，请优先使用这些素材安排画面。`
+    ? `\n已上传 ${state.pendingAttachments.length} 个素材，请按照“素材使用方式”处理这些素材。`
     : '';
   return `帮我生成一个电子相册。
 
@@ -640,15 +861,19 @@ function buildAlbumPromptFromCreatePage() {
 ${raw}
 
 生成要求：
-1. 页数：${pick('create-pages')}。
-2. 受众：${pick('create-audience')}。
-3. 场景：${pick('create-scene')}。
-4. 语气：${pick('create-tone')}。
-5. 比例：${pick('create-ratio')}。
-6. 风格：${pick('create-style')}。
-7. 必须是手机端下滑翻页、PC 端点击下一页查看下一页的交互式 HTML 电子相册。
-8. 页面文案要适合直接对外展示，整体简洁、科技感、适合宣传。
-9. ${wantsThinking ? '请先梳理内容结构，再生成最终 HTML。' : '直接生成最终 HTML。'}${attachmentNote}`;
+1. 内容类型：电子相册。
+2. 页数：${pick('create-pages')}。
+3. 受众：${pick('create-audience')}。
+4. 场景：${pick('create-scene')}。
+5. 语气：${pick('create-tone')}。
+6. 比例：${pick('create-ratio')}。
+7. 风格：${pick('create-style')}。
+8. 素材使用方式：${pick('create-material-use')}。
+9. 行动引导：${pick('create-cta')}。
+10. 这些页数、受众、场景、语气、比例、风格、素材使用方式、行动引导都已由用户在输入前确认，不要再追问“想做哪种内容”或重复确认配置。
+11. 必须是手机端下滑翻页、PC 端点击下一页查看下一页的交互式 HTML 电子相册。
+12. 页面文案要服务于企业宣传相册，适合直接对外展示：表达可信、重点清晰、避免夸张空话；最后一页必须按“行动引导”生成明确 CTA。
+13. ${wantsThinking ? '请先梳理内容结构，再生成最终 HTML。' : '直接生成最终 HTML。'}${attachmentNote}`;
 }
 
 function renderLandingAttachments() {
@@ -711,13 +936,15 @@ function buildImageAlbumPrompt() {
 ${names}
 
 生成要求：
-1. 必须严格按照上传图片顺序生成页面，第 1 张图片对应第 1 页，第 2 张图片对应第 2 页，以此类推。
-2. 每一页以对应图片为主体，搭配一句简短标题和一段不超过 40 字的说明。
-3. 风格：${style}。
-4. 比例：${ratio}。
-5. 生成可独立运行的交互式 HTML 电子相册。
-6. 手机端下滑翻页，PC 端点击下一页或使用键盘翻页。
-7. 不要编造图片中看不出的具体事实；不确定的内容用中性表达。`;
+1. 内容类型：电子相册。
+2. 已确认这是图片转电子相册，不要再追问“想做哪种内容”或重复确认配置。
+3. 必须严格按照上传图片顺序生成页面，第 1 张图片对应第 1 页，第 2 张图片对应第 2 页，以此类推。
+4. 每一页以对应图片为主体，搭配一句简短标题和一段不超过 40 字的说明。
+5. 风格：${style}。
+6. 比例：${ratio}。
+7. 生成可独立运行的交互式 HTML 电子相册。
+8. 手机端下滑翻页，PC 端点击下一页或使用键盘翻页。
+9. 不要编造图片中看不出的具体事实；不确定的内容用中性表达。`;
 }
 
 async function startImageAlbumFromUploadPage() {
@@ -733,6 +960,7 @@ async function startImageAlbumFromUploadPage() {
   const btn = document.getElementById('btn-image-album-send');
   if (btn) btn.disabled = true;
   try {
+    state.generationMeta = buildImageAlbumGenerationMeta();
     const title = document.getElementById('image-album-title')?.value.trim() || '图片电子相册';
     const r = await API.createProject({ name: makeAlbumProjectName(title) });
     if (!r?.project) throw new Error('project create failed');
@@ -743,7 +971,7 @@ async function startImageAlbumFromUploadPage() {
       toast(`电子相册模板应用失败：${e?.message ?? e}`, 'error');
     }
     const prompt = buildImageAlbumPrompt();
-    await selectProject(r.project.id);
+    await selectProject(r.project.id, { page: 'generating' });
     const input = document.getElementById('composer-input');
     if (input) {
       input.value = prompt;
@@ -765,6 +993,7 @@ async function startAlbumFromCreatePage() {
   const btn = document.getElementById('btn-create-send');
   if (btn) btn.disabled = true;
   try {
+    state.generationMeta = buildCreateGenerationMeta(raw);
     const r = await API.createProject({ name: makeAlbumProjectName(raw) });
     if (!r?.project) throw new Error('project create failed');
     await refreshProjects();
@@ -774,7 +1003,7 @@ async function startAlbumFromCreatePage() {
       toast(`电子相册模板应用失败：${e?.message ?? e}`, 'error');
     }
     const prompt = buildAlbumPromptFromCreatePage();
-    await selectProject(r.project.id);
+    await selectProject(r.project.id, { page: 'generating' });
     const input = document.getElementById('composer-input');
     if (input) {
       input.value = prompt;
@@ -791,8 +1020,8 @@ function renderCreatePage() {
   return `
     <main class="create-page">
       <section class="create-hero">
-        <h2>基于 Agent 的<span>电子相册工具</span></h2>
-        <p>输入主题、上传素材，生成可下滑浏览的 HTML 电子相册</p>
+        <h2>企业宣传<span>电子相册工具</span></h2>
+        <p>输入主题、上传素材，生成可下滑浏览、可导出的 HTML 电子相册</p>
       </section>
 
       <section class="generator-panel">
@@ -802,13 +1031,29 @@ function renderCreatePage() {
 
         <div class="generator-controls">
           <label><span>页数</span><select id="create-pages"><option>5 页</option><option>3 页</option><option>8 页</option><option>10 页</option></select></label>
-          <label><span>受众</span><select id="create-audience"><option>大众</option><option>客户</option><option>投资人</option><option>内部团队</option></select></label>
-          <label><span>场景</span><select id="create-scene"><option>企业宣传</option><option>产品介绍</option><option>活动回顾</option><option>作品展示</option></select></label>
+          <label><span>受众</span><select id="create-audience">${renderAlbumAudienceOptions('潜在客户')}</select></label>
+          <label><span>场景</span><select id="create-scene">${renderAlbumSceneOptions('公司介绍')}</select></label>
           <label><span>语气</span><select id="create-tone"><option>温柔</option><option>专业</option><option>活泼</option><option>克制</option></select></label>
           <label><span>比例</span><select id="create-ratio"><option>16:9 横屏</option><option>9:16 竖屏</option><option>1:1 方形</option></select></label>
-          <label><span>风格</span><select id="create-style"><option>科技深蓝</option><option>清爽留白</option><option>杂志感</option><option>暖色商务</option></select></label>
+          <label><span>风格</span><select id="create-style">${renderAlbumStyleOptions('科技深蓝')}</select></label>
+          <label><span>素材使用方式</span><select id="create-material-use">
+            <option value="优先使用上传素材：如果用户上传了图片、Logo、截图或资料，应优先围绕这些素材组织页面；不足的部分再用文字、图形或合理占位补足。">优先使用上传素材</option>
+            <option value="图片为主文字为辅：页面以图片、产品图、场景图或上传素材为主要视觉，文字保持短句说明和标题，不要堆叠长段落。">图片为主文字为辅</option>
+            <option value="文字为主图片点缀：页面以清晰文案、数据、卖点和结构化信息为主，图片只作为品牌氛围、图标或局部点缀。">文字为主图片点缀</option>
+            <option value="没有素材也可生成：即使用户没有上传素材，也要基于主题生成完整电子相册，可使用排版、色块、图标、数据卡片和合理占位，不要要求用户补充素材。">没有素材也可生成</option>
+          </select></label>
+          <label><span>行动引导</span><select id="create-cta">
+            <option value="联系咨询：最后一页突出联系方式、咨询按钮或电话/微信入口，引导客户直接联系。">联系咨询</option>
+            <option value="扫码添加：最后一页预留二维码区域，文案引导扫码添加客服、企业微信或公众号。">扫码添加</option>
+            <option value="预约演示：最后一页突出预约演示、体验产品或安排顾问讲解的行动按钮。">预约演示</option>
+            <option value="了解产品：最后一页引导查看产品详情、核心功能、解决方案或产品手册。">了解产品</option>
+            <option value="报名活动：最后一页突出活动报名、席位预约、参会时间和报名入口。">报名活动</option>
+            <option value="下载资料：最后一页引导下载白皮书、产品资料、报价单、案例集或宣传册。">下载资料</option>
+          </select></label>
         </div>
+        <p class="generator-help">默认生成企业宣传电子相册；这些选项只调整页数、受众、场景、语气、比例、视觉风格、素材使用和最后一页 CTA。</p>
 
+        <p class="prompt-guide">可以写公司介绍、产品亮点、客户案例、联系方式；也可以直接粘贴公司简介。</p>
         <div class="prompt-field">
           <textarea id="create-topic-input" rows="8" placeholder="请输入电子相册主题，例如：大米科技有限公司公司介绍，包含封面、公司简介、核心业务、团队优势、联系方式。"></textarea>
           <div class="prompt-bottom">
@@ -818,14 +1063,14 @@ function renderCreatePage() {
               <span class="attachment-state" id="create-attachment-state">未选择素材</span>
             </div>
             <div class="prompt-actions">
-              <button type="button" class="mini-action" id="btn-create-thinking">${navIcon('settings')}<span>深度思考</span></button>
-              <button type="button" class="send-orb" id="btn-create-send" title="生成电子相册">${navIcon('plus')}</button>
+              <button type="button" class="mini-action" id="btn-create-thinking" title="先梳理结构再生成，适合资料多、要求高的相册。">${navIcon('settings')}<span>深度思考</span></button>
+              <button type="button" class="send-orb" id="btn-create-send" title="生成电子相册">${navIcon('plus')}<span>生成相册</span></button>
             </div>
           </div>
         </div>
 
         <div class="topic-row">
-          <span>热门主题：</span>
+          <span>常用宣传主题：</span>
           ${CREATE_TOPIC_EXAMPLES.map((x) => `<button type="button" data-topic="${esc(x)}">${esc(x.split('：')[0])}</button>`).join('')}
         </div>
         <p class="create-note">创建后会自动进入项目编辑页，可继续修改文字、预览交互并导出 HTML 或 MP4。</p>
@@ -919,10 +1164,7 @@ function renderAlbumPage() {
                 <label class="stack-field">
                   <span>风格</span>
                   <select id="image-album-style">
-                    <option>清爽留白</option>
-                    <option>杂志感</option>
-                    <option>科技深蓝</option>
-                    <option>温暖纪实</option>
+                    ${renderAlbumStyleOptions('温暖纪实')}
                   </select>
                 </label>
               </div>
@@ -936,7 +1178,7 @@ function renderAlbumPage() {
             <div class="side-panel muted">
               <div>
                 <h3>生成规则</h3>
-                <p>每张图片生成一页，图片作为页面主体；Agent 会补充短标题和说明文案。生成完成后可在项目编辑页继续预览、改字和导出。</p>
+                <p>每张图片生成一页，图片作为页面主体；AI助手会补充短标题和说明文案。生成完成后可继续预览、改字和导出。</p>
               </div>
             </div>
         </section>
@@ -984,6 +1226,266 @@ function wireAlbumPage() {
   renderImageAlbumAttachments();
 }
 
+function renderGenerationPage() {
+  const meta = state.generationMeta || {
+    title: state.selected?.name || '电子相册',
+    status: 'draft',
+    kind: '电子相册',
+    pages: '5 页',
+    audience: '潜在客户',
+    scene: '公司介绍',
+    tone: '温柔',
+    ratio: '16:9 横屏',
+    style: '科技深蓝',
+    materialUse: '优先使用上传素材',
+    cta: '联系咨询',
+  };
+  const summaryRows = [
+    ['页数', meta.pages || '5 页'],
+    ['受众', meta.audience || '潜在客户'],
+    ['场景', meta.scene || '公司介绍'],
+    ['语气', meta.tone || '温柔'],
+    ['比例', meta.ratio || '16:9 横屏'],
+    ['风格', meta.style || '科技深蓝'],
+    ['素材', meta.materialUse || '优先使用上传素材'],
+    ['行动引导', meta.cta || '联系咨询'],
+  ];
+  const canExportHtml = !!state.selected?.lastPreviewHtmlPath;
+  const canExportMp4 = !!(state.selected && (state.selected.templateId || (state.selected.frames?.length ?? 0) > 0)) && !state.exporting;
+  return `
+    <main class="generation-page">
+      <header class="generation-topbar">
+        <div class="generation-title-block">
+          <h1>${esc(meta.title || '电子相册')}</h1>
+          <p>需求摘要</p>
+          <div class="generation-summary">
+            ${summaryRows.map(([label, value]) => `<span><b>${esc(label)}</b>${esc(value)}</span>`).join('')}
+          </div>
+        </div>
+        <div class="generation-actions">
+          <button type="button" class="generation-btn" id="btn-generation-copy">调整文案</button>
+          <button type="button" class="generation-btn" id="btn-generation-style">换风格</button>
+          <button type="button" class="generation-btn" id="btn-generation-pages">改页数</button>
+          <button type="button" class="generation-btn" id="btn-generation-image">替换图片</button>
+          <button type="button" class="generation-btn" id="btn-generation-cta">调整结尾 CTA</button>
+          <button type="button" class="generation-btn" id="btn-generation-regenerate">重新生成</button>
+          <button type="button" class="generation-btn" id="btn-generation-export-html"${canExportHtml ? '' : ' disabled'}>导出 HTML</button>
+          <button type="button" class="generation-btn primary" id="btn-generation-export-mp4"${canExportMp4 ? '' : ' disabled'}>${state.exporting ? '导出中...' : '预览满意，导出 MP4'}</button>
+        </div>
+      </header>
+
+      <section class="generation-workbench">
+        <div class="generation-main">
+          <div class="preview-mode-switch" aria-label="预览模式">
+            <button type="button" id="btn-preview-desktop" class="${state.previewMode === 'desktop' ? 'active' : ''}">电脑预览</button>
+            <button type="button" id="btn-preview-mobile" class="${state.previewMode === 'mobile' ? 'active' : ''}">手机预览</button>
+          </div>
+          <div class="generation-preview-shell" id="preview-stage">
+            <div class="generation-loading">
+              <div class="generation-spinner"></div>
+              <h2>正在为你生成「${esc(meta.title || '电子相册')}」</h2>
+              <p>${esc(meta.pages || '5 页')} · 完成后可调整内容并导出 HTML 或 MP4</p>
+              <span>实时进度请查看右侧 AI助手</span>
+              <div class="generation-skeletons" aria-hidden="true">
+                <div class="generation-skeleton-card"></div>
+                <div class="generation-skeleton-card active"></div>
+                <div class="generation-skeleton-card"></div>
+              </div>
+              <div class="generation-tip">
+                <b>宣传相册生成中</b>
+                <span>AI助手会根据你选择的受众、场景和风格自动组织页面结构。</span>
+              </div>
+            </div>
+          </div>
+          <div class="frames-strip" id="frames-strip"></div>
+          <div class="right-footer generation-footer">
+            <span class="status" id="footer-status">${esc(meta.title || '电子相册')} · 正在生成</span>
+            <span class="grow"></span>
+            <button class="reload-btn" id="btn-reload">刷新预览</button>
+          </div>
+          <div class="export-format-help">
+            <span><b>HTML</b> 适合网页分享 / 嵌入官网</span>
+            <span><b>MP4</b> 适合视频号、朋友圈、展会屏幕播放</span>
+          </div>
+        </div>
+
+        <aside class="generation-assistant">
+          <div class="generation-assistant-head">
+            <div>
+              <h2>AI助手</h2>
+              <p>正在生成相册...</p>
+            </div>
+          </div>
+          <div class="generation-progress">
+            <span>执行进度</span>
+            <b>${state.composing ? '整理内容 → 规划页面 → 生成文案 → 生成预览' : '已生成，可预览和调整'}</b>
+          </div>
+          <div class="chat-log generation-chat-log" id="chat-log"></div>
+          <div class="generation-side-composer ${state.generationComposerOpen ? 'open' : ''}">
+            <button type="button" class="composer-disclosure" id="btn-generation-composer-toggle">还有其它修改要求？</button>
+            <div class="generation-composer-shell composer-shell" id="composer-shell">
+              <div class="attachments" id="attachments"></div>
+              <textarea id="composer-input" rows="3" placeholder="点击上方按钮快速调整，也可以直接输入具体修改要求..."></textarea>
+              <div class="actions">
+                <button class="icon-btn" id="btn-attach" title="${t('composer.attach')}">📎</button>
+                <input type="file" id="file-input" multiple style="display:none" />
+                <span class="hint">生成后可继续调整</span>
+                <button class="send-btn" id="btn-send" disabled>${t('composer.send')}</button>
+              </div>
+            </div>
+          </div>
+        </aside>
+      </section>
+    </main>
+  `;
+}
+
+function wireGenerationPage() {
+  const copyBtn = document.getElementById('btn-generation-copy');
+  if (copyBtn) copyBtn.onclick = () => sendGenerationQuickAdjust('请优化这本电子相册的文案：标题更有吸引力，正文更简洁有说服力，CTA 更明确；保持当前页数、比例和整体结构。');
+  const styleBtn = document.getElementById('btn-generation-style');
+  if (styleBtn) styleBtn.onclick = () => state.selected ? openGenerationStyleModal() : null;
+  const pagesBtn = document.getElementById('btn-generation-pages');
+  if (pagesBtn) pagesBtn.onclick = () => state.selected ? openGenerationPagesModal() : null;
+  const imageBtn = document.getElementById('btn-generation-image');
+  if (imageBtn) {
+    imageBtn.onclick = () => {
+      openGenerationComposer('请替换或补充这本电子相册中的图片素材：优先使用我新上传的图片，保持当前内容结构和风格。');
+      document.getElementById('file-input')?.click();
+    };
+  }
+  const ctaBtn = document.getElementById('btn-generation-cta');
+  if (ctaBtn) ctaBtn.onclick = () => openGenerationComposer('请调整最后一页的行动引导 CTA：让联系方式、咨询入口或扫码添加更明确，文案更适合企业客户转化。');
+  const regenerateBtn = document.getElementById('btn-generation-regenerate');
+  if (regenerateBtn) regenerateBtn.onclick = () => sendGenerationQuickAdjust('请基于当前需求重新生成一版电子相册，保留用户已选择的受众、场景、语气、比例、风格、素材使用方式和行动引导，但重新组织页面结构与表达。');
+  const desktopBtn = document.getElementById('btn-preview-desktop');
+  if (desktopBtn) desktopBtn.onclick = () => setPreviewMode('desktop');
+  const mobileBtn = document.getElementById('btn-preview-mobile');
+  if (mobileBtn) mobileBtn.onclick = () => setPreviewMode('mobile');
+  const composerToggle = document.getElementById('btn-generation-composer-toggle');
+  if (composerToggle) composerToggle.onclick = () => toggleGenerationComposer();
+  const exportHtmlBtn = document.getElementById('btn-generation-export-html');
+  if (exportHtmlBtn) {
+    exportHtmlBtn.onclick = () => {
+      if (!state.selected || !state.selected.lastPreviewHtmlPath) return;
+      window.location.href = `/api/projects/${state.selected.id}/export-html`;
+    };
+  }
+  const exportMp4Btn = document.getElementById('btn-generation-export-mp4');
+  if (exportMp4Btn) {
+    exportMp4Btn.onclick = () => {
+      if (!state.selected || state.exporting) return;
+      startExportStream();
+    };
+  }
+  updateGenerationControls();
+}
+
+async function sendGenerationQuickAdjust(text) {
+  if (!state.selected || state.composing) return;
+  openGenerationComposer(text);
+  await sendMessage();
+}
+
+function openGenerationComposer(text = '') {
+  state.generationComposerOpen = true;
+  const panel = document.querySelector('.generation-side-composer');
+  if (panel) panel.classList.add('open');
+  const input = document.getElementById('composer-input');
+  if (input) {
+    if (text) input.value = text;
+    input.focus();
+  }
+}
+
+function toggleGenerationComposer() {
+  state.generationComposerOpen = !state.generationComposerOpen;
+  const panel = document.querySelector('.generation-side-composer');
+  if (panel) panel.classList.toggle('open', state.generationComposerOpen);
+  if (state.generationComposerOpen) document.getElementById('composer-input')?.focus();
+}
+
+function setPreviewMode(mode) {
+  state.previewMode = mode === 'mobile' ? 'mobile' : 'desktop';
+  renderPreview();
+  document.getElementById('btn-preview-desktop')?.classList.toggle('active', state.previewMode === 'desktop');
+  document.getElementById('btn-preview-mobile')?.classList.toggle('active', state.previewMode === 'mobile');
+}
+
+function openGenerationStyleModal() {
+  const modal = document.getElementById('generation-style-modal');
+  const grid = document.getElementById('generation-style-grid');
+  if (!modal || !grid) return;
+  grid.innerHTML = GENERATION_STYLE_PRESETS.map((preset, index) => `
+    <button type="button" class="generation-style-card" data-style-index="${index}">
+      <span class="generation-style-swatch" style="background:${esc(preset.swatch)}"></span>
+      <b>${esc(preset.label)}</b>
+      <em>${esc(preset.desc)}</em>
+    </button>
+  `).join('');
+  grid.querySelectorAll('[data-style-index]').forEach((btn) => {
+    btn.onclick = async () => {
+      const preset = GENERATION_STYLE_PRESETS[Number(btn.dataset.styleIndex)];
+      closeGenerationStyleModal();
+      if (preset) await sendGenerationQuickAdjust(preset.prompt);
+    };
+  });
+  modal.classList.add('show');
+}
+
+function closeGenerationStyleModal() {
+  document.getElementById('generation-style-modal')?.classList.remove('show');
+}
+
+function openGenerationPagesModal() {
+  const modal = document.getElementById('generation-pages-modal');
+  const grid = document.getElementById('generation-pages-grid');
+  const customInput = document.getElementById('generation-pages-custom');
+  if (!modal || !grid || !customInput) return;
+  grid.innerHTML = GENERATION_PAGE_PRESETS.map((preset) => `
+    <button type="button" class="generation-page-card" data-page-value="${esc(preset.label)}">
+      <b>${esc(preset.label)}</b>
+      <span>${esc(preset.desc)}</span>
+    </button>
+  `).join('');
+  grid.querySelectorAll('[data-page-value]').forEach((btn) => {
+    btn.onclick = async () => {
+      closeGenerationPagesModal();
+      await sendGenerationPageAdjust(btn.dataset.pageValue || '5 页');
+    };
+  });
+  customInput.value = '';
+  modal.classList.add('show');
+  customInput.focus();
+}
+
+function closeGenerationPagesModal() {
+  document.getElementById('generation-pages-modal')?.classList.remove('show');
+}
+
+async function sendGenerationPageAdjust(pageLabel) {
+  await sendGenerationQuickAdjust(`请把这本电子相册调整为 ${pageLabel}。请重新规划页面结构，让每一页信息清晰、节奏适合企业宣传，并保留当前受众、场景、语气、比例、风格、素材使用方式和行动引导。`);
+}
+
+function updateGenerationControls() {
+  ['btn-generation-copy', 'btn-generation-pages', 'btn-generation-image', 'btn-generation-cta', 'btn-generation-regenerate'].forEach((id) => {
+    const btn = document.getElementById(id);
+    if (btn) btn.disabled = !state.selected || !!state.composing;
+  });
+  const styleBtn = document.getElementById('btn-generation-style');
+  if (styleBtn) styleBtn.disabled = !state.selected || !!state.composing;
+  const htmlBtn = document.getElementById('btn-generation-export-html');
+  if (htmlBtn) htmlBtn.disabled = !state.selected?.lastPreviewHtmlPath;
+  const mp4Btn = document.getElementById('btn-generation-export-mp4');
+  if (mp4Btn) {
+    const canExport = !!(state.selected && (state.selected.templateId || (state.selected.frames?.length ?? 0) > 0));
+    mp4Btn.disabled = !canExport || !!state.exporting;
+    mp4Btn.textContent = state.exporting ? '导出中...' : '预览满意，导出 MP4';
+  }
+  const progress = document.querySelector('.generation-progress b');
+  if (progress) progress.textContent = state.composing ? '整理内容 → 规划页面 → 生成文案 → 生成预览' : '已生成，可预览和调整';
+}
+
 function renderProjectHistoryPage() {
   return `
     <main class="feature-page">
@@ -991,7 +1493,7 @@ function renderProjectHistoryPage() {
         <section class="feature-hero">
           <div class="kicker">Project History</div>
           <h2>项目历史</h2>
-          <p>集中查看和继续编辑已经创建的 HTML 视频与电子相册项目。</p>
+          <p>集中查看和继续编辑已经创建的电子相册项目。</p>
         </section>
         <section class="feature-panel">
           <div class="feature-panel-head">
@@ -1019,7 +1521,7 @@ function renderProjectHistory() {
     <div class="history-row">
       <div>
         <div class="name">${esc(p.name)}</div>
-        <div class="meta">${p.template_id ? esc(p.template_id) : 'no template'} · ${esc(p.status ?? '')}</div>
+        <div class="meta">电子相册 · ${esc(projectUserStatus(p))}</div>
       </div>
       <div class="actions">
         <button class="feature-btn" data-open-project="${esc(p.id)}">打开</button>
@@ -1160,7 +1662,7 @@ function renderSettingsPage() {
             </div>
           </div>
           <div class="quick-grid">
-            <div class="quick-card"><h4>Agent</h4><p>配置 Codex、Claude、AMR 等生成代理。</p></div>
+            <div class="quick-card"><h4>AI助手</h4><p>配置用于生成电子相册的 AI 助手后端。</p></div>
             <div class="quick-card"><h4>音频</h4><p>配置背景音乐和旁白所需的 MiniMax API 信息。</p></div>
             <div class="quick-card"><h4>语言</h4><p>切换 Studio 界面语言。</p></div>
           </div>
@@ -1187,7 +1689,7 @@ function renderSidebar() {
     div.className = 'project-row' + (p.id === state.selectedId ? ' active' : '');
     div.innerHTML = `
       <div class="name">${esc(p.name)}</div>
-      <div class="meta">${p.template_id ? esc(p.template_id) : 'no template'} · ${p.status}</div>
+      <div class="meta">电子相册 · ${esc(projectUserStatus(p))}</div>
       <button class="row-menu-btn" title="More" data-pid="${esc(p.id)}">⋯</button>
     `;
     div.onclick = (e) => {
@@ -1524,7 +2026,11 @@ function renderMain() {
   renderFeatureNav();
   const page = state.activePage || 'create';
   document.body.dataset.page = page;
-  body.className = page === 'workspace' ? 'body workspace-body' : 'body feature-body';
+  body.className = page === 'workspace'
+    ? 'body workspace-body'
+    : page === 'generating'
+      ? 'body generation-body'
+      : 'body feature-body';
   if (page === 'create') {
     body.innerHTML = renderCreatePage();
     wireCreatePage();
@@ -1533,6 +2039,37 @@ function renderMain() {
   if (page === 'album') {
     body.innerHTML = renderAlbumPage();
     wireAlbumPage();
+    return;
+  }
+  if (page === 'generating') {
+    body.innerHTML = renderGenerationPage();
+    wireGenerationPage();
+    if (state.selected) {
+      renderChatLog();
+      renderComposer();
+      renderFooter();
+      renderFramesStrip();
+      if (state.selected.lastPreviewHtmlPath || (state.selected.frames?.length ?? 0) > 0) {
+        renderPreview();
+      }
+      const sendBtn = document.getElementById('btn-send');
+      if (sendBtn) sendBtn.onclick = sendMessage;
+      const composerInput = document.getElementById('composer-input');
+      if (composerInput) {
+        composerInput.addEventListener('keydown', (e) => {
+          if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
+            e.preventDefault();
+            sendMessage();
+          }
+        });
+      }
+      const attachBtn = document.getElementById('btn-attach');
+      const fileInput = document.getElementById('file-input');
+      if (attachBtn && fileInput) attachBtn.onclick = () => fileInput.click();
+      if (fileInput) fileInput.onchange = (e) => addAttachments([...e.target.files]);
+      const reloadBtn = document.getElementById('btn-reload');
+      if (reloadBtn) reloadBtn.onclick = renderPreview;
+    }
     return;
   }
   if (page === 'history') {
@@ -1594,96 +2131,8 @@ function renderMain() {
             <span class="grow"></span>
             <button class="reload-btn" id="btn-reload">${t('preview.reload')}</button>
           </div>
-          <details class="project-assets-panel" id="project-assets-panel" open>
-            <summary>
-              <span class="project-assets-title">已上传素材</span>
-              <span class="project-assets-count" id="project-assets-count">0 个素材</span>
-            </summary>
-            <div class="project-assets-list" id="project-assets-list">
-              <div class="project-assets-empty">暂无已上传素材。</div>
-            </div>
-          </details>
-          <details class="soundtrack-panel" id="soundtrack-panel">
-            <summary>
-              <span class="st-summary-main">${t('soundtrack.title')}</span>
-              <span class="st-summary-sub">${t('soundtrack.summary_sub')}</span>
-              <span class="soundtrack-badge">${t('soundtrack.optional')}</span>
-            </summary>
-            <div class="soundtrack-body">
-              <!-- ===== Background music: its own input + generate ===== -->
-              <div class="st-section">
-                <div class="st-section-title">${t('soundtrack.music_label')}</div>
-                <div class="st-presets" id="st-music-presets">
-                  ${MUSIC_PRESETS.map((p) => `<button type="button" class="st-preset" data-prompt="${p.prompt}">${t('soundtrack.preset_' + p.key)}</button>`).join('')}
-                </div>
-                <textarea id="st-music-prompt" rows="2" placeholder="${t('soundtrack.music_placeholder')}"></textarea>
-                <div class="st-vol-row"><label>${t('soundtrack.music_volume')} <input type="range" id="st-music-vol" min="-40" max="0" value="-18" /><b id="st-music-vol-val">-18 dB</b></label></div>
-                <div class="st-section-actions">
-                  <button class="st-generate" id="btn-st-gen-music">${t('soundtrack.gen_music')}</button>
-                  <span class="st-status" id="st-music-status"></span>
-                </div>
-              </div>
-
-              <!-- ===== Narration / voiceover ===== -->
-              <!-- Two explicit steps so users don't confuse "write the text"
-                   (AI drafts words, no audio) with "synthesize the voice"
-                   (calls MiniMax, produces an mp3). See issues #4 / #5. -->
-              <div class="st-section st-narration">
-                <div class="st-section-title">${t('soundtrack.narration_label')}</div>
-
-                <!-- Step 1: write the script (text only) -->
-                <div class="st-substep">
-                  <div class="st-substep-head">
-                    <span class="st-step-badge">1</span>
-                    <span class="st-step-label">${t('soundtrack.step_write')}</span>
-                    <span class="st-narration-which" id="st-narration-which"></span>
-                  </div>
-                  <textarea id="st-narration-text" rows="2" placeholder="${t('soundtrack.narration_placeholder')}"></textarea>
-                  <div class="st-draft-group">
-                    <button type="button" class="st-draft" id="btn-st-draft-frame">${t('soundtrack.draft_frame')}</button>
-                    <button type="button" class="st-draft" id="btn-st-draft-all">${t('soundtrack.draft_all')}</button>
-                  </div>
-                </div>
-
-                <!-- Step 2: synthesize the voice (audio) -->
-                <div class="st-substep">
-                  <div class="st-substep-head">
-                    <span class="st-step-badge">2</span>
-                    <span class="st-step-label">${t('soundtrack.step_voice')}</span>
-                  </div>
-                  <div class="st-voice-row">
-                    <span class="st-voice-label">${t('soundtrack.voice_label')}</span>
-                    <select id="st-narration-voice" class="st-voice-select">
-                      ${NARRATION_VOICES.map((v) => `<option value="${v.voiceId}">${t('soundtrack.voice_' + v.key)}</option>`).join('')}
-                    </select>
-                    <button type="button" class="st-fit" id="btn-st-fit" title="${t('soundtrack.fit_hint')}">${t('soundtrack.fit_durations')}</button>
-                  </div>
-                  <div class="st-vol-row"><label>${t('soundtrack.narration_volume')} <input type="range" id="st-narration-vol" min="-20" max="6" value="0" /><b id="st-narration-vol-val">0 dB</b></label></div>
-                  <div class="st-section-actions">
-                    <button class="st-generate" id="btn-st-gen-narration">${t('soundtrack.gen_narration')}</button>
-                    <span class="st-status" id="st-narration-status"></span>
-                  </div>
-                </div>
-              </div>
-
-              <div class="soundtrack-actions">
-                <button class="st-clear" id="btn-st-clear">${t('soundtrack.clear')}</button>
-              </div>
-              <div class="soundtrack-preview" id="st-preview"></div>
-            </div>
-          </details>
         </section>
 
-        <section class="text-pane">
-          <div class="text-pane-head">
-            <h2>${t('text_pane.title')}</h2>
-            <span class="save-state" id="text-save-state">${t('text_pane.save_state.idle')}</span>
-            <button class="textfields-toggle" id="btn-textfields-toggle" title="${t('text_pane.collapse')}">›</button>
-          </div>
-          <div class="text-fields" id="text-fields">
-            <div class="text-empty">${t('text_pane.empty_no_frames')}</div>
-          </div>
-        </section>
         <div class="graph-modal" id="graph-modal">
           <div class="panel">
             <header>
@@ -1705,14 +2154,11 @@ function renderMain() {
   document.getElementById('btn-new').onclick = createDefaultProject;
   const togBtn = document.getElementById('btn-sidebar-toggle');
   if (togBtn) togBtn.onclick = () => document.body.classList.toggle('sidebar-collapsed');
-  const tfTog = document.getElementById('btn-textfields-toggle');
-  if (tfTog) tfTog.onclick = () => document.body.classList.toggle('textfields-collapsed');
   if (state.selected) {
     renderChatLog();
     renderComposer();
     renderPreview();
     renderFooter();
-    renderProjectAssetsPanel();
     document.getElementById('btn-send').onclick = sendMessage;
     document.getElementById('composer-input').addEventListener('keydown', (e) => {
       if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
@@ -1723,8 +2169,7 @@ function renderMain() {
     document.getElementById('btn-attach').onclick = () => document.getElementById('file-input').click();
     document.getElementById('file-input').onchange = (e) => addAttachments([...e.target.files]);
     wireDragAndPaste();
-    document.getElementById('btn-reload').onclick = () => { reloadPreview(); refreshTextFields(); };
-    wireSoundtrackPanel();
+    document.getElementById('btn-reload').onclick = reloadPreview;
   }
 }
 
@@ -2142,9 +2587,9 @@ function renderFooter() {
   const fs = document.getElementById('footer-status');
   if (!fs) return;
   if (p) {
-    fs.innerHTML = `<b>${esc(p.name)}</b> · ${p.templateId ? `template <b>${esc(p.templateId)}</b>` : '<i>no template</i>'} · ${p.status}`;
+    fs.innerHTML = `<b>${esc(p.name)}</b> · ${esc(projectUserStatus(p))}`;
   } else {
-    fs.textContent = 'no project';
+    fs.textContent = '未选择项目';
   }
 }
 
@@ -2337,6 +2782,31 @@ async function pickAndSend(label) {
   await sendMessage();
 }
 
+function parseCreatePromptSummary(content) {
+  const text = String(content || '');
+  if (!/生成要求\s*[:：]/.test(text)) return null;
+  if (!/(主题和素材说明|相册标题|图片顺序)\s*[:：]/.test(text)) return null;
+  const pickLine = (label) => {
+    const re = new RegExp(`${label}\\s*[:：]\\s*([^\\n。]+)`);
+    return re.exec(text)?.[1]?.trim() || '';
+  };
+  const title =
+    /主题和素材说明\s*[:：]\s*([\s\S]*?)\n\s*生成要求\s*[:：]/.exec(text)?.[1]?.trim()
+    || pickLine('相册标题')
+    || state.selected?.name
+    || '电子相册';
+  const rows = [
+    pickLine('(?:内容类型|类型)'),
+    pickLine('页数\\/帧数') || pickLine('页数') || pickLine('帧数'),
+    pickLine('受众'),
+    pickLine('场景'),
+    pickLine('风格'),
+    pickLine('素材使用方式'),
+    pickLine('行动引导'),
+  ].filter(Boolean);
+  return { title: title.replace(/\s+/g, ' ').slice(0, 140), rows };
+}
+
 function renderMessage(m, idx) {
   if (m.role === 'user') {
     // User-side form-submission marker carries hidden JSON the user can't read;
@@ -2351,6 +2821,14 @@ function renderMessage(m, idx) {
     if ((m.content ?? '').trim() === '[hv-confirm:edit]') {
       return `<div class="msg user">${t('chat.summary.confirm_edit')}</div>`;
     }
+    const promptSummary = parseCreatePromptSummary(m.content);
+    if (promptSummary) {
+      return `<div class="msg user prompt-summary">
+        <b>已提交生成需求</b>
+        <span>${esc(promptSummary.title)}</span>
+        <div class="prompt-summary-tags">${promptSummary.rows.map((row) => `<em>${esc(row)}</em>`).join('')}</div>
+      </div>`;
+    }
     return `<div class="msg user">${esc(m.content)}</div>`;
   }
   if (m.role === 'system') return `<div class="msg system">${esc(m.content)}</div>`;
@@ -2361,12 +2839,10 @@ function renderMessage(m, idx) {
     const fname = path.split('/').pop() || 'output.mp4';
     return `<div class="msg export-done">
       <div class="export-title">${t('export.title')}</div>
-      <div class="export-path"><code>${esc(path)}</code></div>
+      <div class="export-fname">${esc(fname)}</div>
       <div class="export-actions">
         <button class="btn-reveal" data-export-action="reveal">${t('export.reveal')}</button>
-        <button class="btn-copy-path" data-export-action="copy">${t('export.copy_path')}</button>
       </div>
-      <div class="export-fname">${esc(fname)}</div>
     </div>`;
   }
   // assistant: try each card protocol in turn
@@ -2387,7 +2863,7 @@ function renderMessage(m, idx) {
     }
     const formHtml = renderFormCard(formP.form, submitted, idx);
     return `<div class="msg assistant">
-      <div class="role">${esc(m.agent ?? 'agent')}</div>
+      <div class="role">AI助手</div>
       <div class="body">${md(sanitizeAssistantProse(formP.prose))}${formHtml}</div>
     </div>`;
   }
@@ -2429,7 +2905,7 @@ function renderMessage(m, idx) {
     }
     const confirmHtml = renderConfirmCard(confirmP.confirm, resolved, idx);
     return `<div class="msg assistant">
-      <div class="role">${esc(m.agent ?? 'agent')}</div>
+      <div class="role">AI助手</div>
       <div class="body">${md(sanitizeAssistantProse(confirmP.prose))}${confirmHtml}</div>
     </div>`;
   }
@@ -2444,7 +2920,7 @@ function renderMessage(m, idx) {
   }
   const optionsHtml = options ? renderOptionCard(options, picked, idx) : '';
   return `<div class="msg assistant">
-    <div class="role">${esc(m.agent ?? 'agent')}</div>
+    <div class="role">AI助手</div>
     <div class="body">${md(sanitizeAssistantProse(prose))}${optionsHtml}</div>
   </div>`;
 }
@@ -2698,6 +3174,8 @@ function renderOptionCard(opts, picked, msgIdx) {
 function renderPreview() {
   const stage = document.getElementById('preview-stage');
   if (!stage) return;
+  stage.classList.toggle('preview-mobile', state.previewMode === 'mobile');
+  stage.classList.toggle('preview-desktop', state.previewMode !== 'mobile');
   const p = state.selected;
   if (!p) {
     stage.innerHTML = `<div class="preview-placeholder"><div><div class="ico">🎞️</div>${t('preview.placeholder.pick_project')}</div></div>`;
@@ -3299,6 +3777,7 @@ async function sendMessage() {
   // a different project if the user switches away mid-generation.
   const genProjectId = state.selectedId;
   renderComposer();
+  updateGenerationControls();
 
   // Iterate scope: when the user has selected a specific frame in the
   // strip, the iterate-phase server route should only rewrite that frame.
@@ -3374,7 +3853,7 @@ async function sendMessage() {
           if (ev.type === 'text') {
             if (assistantIdx === -1) {
               // Replace thinking with assistant message
-              state.messages[thinkingIdx] = { role: 'assistant', agent: state.selected.agentId ?? 'claude', content: '', ts: Date.now() };
+              state.messages[thinkingIdx] = { role: 'assistant', agent: 'AI助手', content: '', ts: Date.now() };
               assistantIdx = thinkingIdx;
             }
             state.messages[assistantIdx].content += ev.chunk;
@@ -3383,17 +3862,17 @@ async function sendMessage() {
             const frameCount = ev.frames || 0;
             const focusedFrame = ev.focused_frame;
             const summary = focusedFrame
-              ? `✓ frame ${focusedFrame} updated`
+              ? '✓ 已更新选中页面'
               : frameCount > 0
-                ? `✓ ${frameCount}-frame storyboard generated`
-                : '✓ HTML preview updated';
+                ? `✓ 已生成 ${frameCount} 页预览`
+                : '✓ 预览已更新';
             const event = focusedFrame
-              ? `🎞 frame ${focusedFrame} reloaded`
+              ? '预览已刷新'
               : frameCount > 0
-                ? `🎞 storyboard reloaded (${frameCount} frames)`
-                : '🎞 preview reloaded';
+                ? `预览已刷新（${frameCount} 页）`
+                : '预览已刷新';
             if (assistantIdx === -1) {
-              state.messages[thinkingIdx] = { role: 'assistant', agent: state.selected.agentId ?? 'claude', content: summary, ts: Date.now() };
+              state.messages[thinkingIdx] = { role: 'assistant', agent: 'AI助手', content: summary, ts: Date.now() };
               assistantIdx = thinkingIdx;
             } else {
               state.messages[assistantIdx].content = summary;
@@ -3419,9 +3898,10 @@ async function sendMessage() {
             await refreshTextFields();
             renderToolbar();
             renderFooter();
+            updateGenerationControls();
           } else if (ev.type === 'warning') {
             if (assistantIdx === -1) {
-              state.messages[thinkingIdx] = { role: 'assistant', agent: state.selected.agentId ?? 'claude', content: '', ts: Date.now() };
+              state.messages[thinkingIdx] = { role: 'assistant', agent: 'AI助手', content: '', ts: Date.now() };
               assistantIdx = thinkingIdx;
             }
             state.messages[assistantIdx].content += '\n\n⚠️ ' + ev.message;
@@ -3450,6 +3930,8 @@ async function sendMessage() {
   if (state.selectedId === genProjectId) {
     state.composing = false;
     renderComposer();
+    renderFooter();
+    updateGenerationControls();
   }
 }
 
@@ -3767,6 +4249,29 @@ function wireModals() {
   document.getElementById('gallery-modal').addEventListener('click', e => {
     if (e.target.id === 'gallery-modal') closeGallery();
   });
+  const styleModal = document.getElementById('generation-style-modal');
+  if (styleModal) {
+    document.getElementById('generation-style-close').onclick = closeGenerationStyleModal;
+    styleModal.addEventListener('click', (e) => {
+      if (e.target.id === 'generation-style-modal') closeGenerationStyleModal();
+    });
+  }
+  const pagesModal = document.getElementById('generation-pages-modal');
+  if (pagesModal) {
+    document.getElementById('generation-pages-close').onclick = closeGenerationPagesModal;
+    document.getElementById('generation-pages-custom-ok').onclick = async () => {
+      const value = Number(document.getElementById('generation-pages-custom')?.value || 0);
+      if (!Number.isFinite(value) || value < 1) {
+        toast('请输入有效页数', 'error');
+        return;
+      }
+      closeGenerationPagesModal();
+      await sendGenerationPageAdjust(`${Math.round(value)} 页`);
+    };
+    pagesModal.addEventListener('click', (e) => {
+      if (e.target.id === 'generation-pages-modal') closeGenerationPagesModal();
+    });
+  }
   // Settings
   const settingsModal = document.getElementById('settings-modal');
   if (settingsModal) {
