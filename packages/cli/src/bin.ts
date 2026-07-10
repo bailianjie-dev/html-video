@@ -215,12 +215,14 @@ cli
 cli
   .command('studio', 'Launch the project studio in the browser')
   .option('--port <n>', 'Port (default 3071)', { default: 3071 })
+  .option('--host <host>', 'Host/IP to bind (default 127.0.0.1; use 0.0.0.0 for LAN access)', { default: '127.0.0.1' })
   .action(async (opts: any) => {
     setJsonMode(!!opts.json);
     const ctx = await bootstrap({ cwd: opts.cwd });
-    const handle = await startStudioServer(ctx, Number(opts.port));
+    const handle = await startStudioServer(ctx, Number(opts.port), String(opts.host || '127.0.0.1'));
     ok({
       url: handle.url,
+      host: handle.host,
       port: handle.port,
       pid: process.pid,
       project_count: ctx.database?.mode === 'postgres'

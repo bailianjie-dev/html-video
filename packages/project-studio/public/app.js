@@ -56,6 +56,7 @@ const API = {
   setAgent: (id, aid, model) => fetch(`/api/projects/${id}/agent`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ agent_id: aid, ...(model !== undefined && { agent_model: model }) }) }).then(r => r.json()),
   exportMp4: id => fetch(`/api/projects/${id}/export`, { method: 'POST' }).then(r => r.json()),
   getMessages: id => fetch(`/api/projects/${id}/messages`).then(r => r.json()),
+  getAssets: id => fetch(`/api/projects/${id}/assets`).then(r => r.ok ? r.json() : Promise.reject(new Error(`${r.status}`))),
   rawHtml: id => fetch(`/api/projects/${id}/raw-html`).then(r => r.ok ? r.text() : null),
   putRawHtml: (id, html) => fetch(`/api/projects/${id}/raw-html`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ html }) }).then(r => r.json()),
   contentGraph: id => fetch(`/api/projects/${id}/content-graph`).then(r => r.ok ? r.json() : null),
@@ -73,6 +74,9 @@ const state = {
   selectedId: null,
   selected: null,
   messages: [],
+  projectAssets: [],
+  projectAssetsLoading: false,
+  projectAssetsError: '',
   composing: false,
   textFields: [],          // [{key, original, current}]
   textSaveTimer: null,
@@ -106,11 +110,41 @@ async function init() {
 
 let studioInitialized = false;
 
+function clearSessionState() {
+  state.selectedId = null;
+  state.selected = null;
+  state.messages = [];
+  state.projectAssets = [];
+  state.projectAssetsLoading = false;
+  state.projectAssetsError = '';
+  state.projects = [];
+  state.activePage = 'create';
+  state.pendingAttachments = [];
+  state.composing = false;
+  state.exporting = false;
+  state.exportProgress = null;
+  state.lastGraph = null;
+  state.activeFrameId = null;
+  state.iterateFocusFrameId = null;
+  state.editTextMode = false;
+  state.frameKinds = {};
+  state.enhancing = null;
+  state.textFields = [];
+  if (state.textSaveTimer) {
+    clearTimeout(state.textSaveTimer);
+    state.textSaveTimer = null;
+  }
+}
+
 async function enterStudio(user) {
+  const previousUserId = state.currentUser?.user_id ?? null;
+  const userChanged = previousUserId !== null && previousUserId !== user.user_id;
   state.currentUser = user;
   document.getElementById('auth-screen').hidden = true;
   document.getElementById('studio-app').hidden = false;
   if (studioInitialized) {
+    if (userChanged) clearSessionState();
+    await refreshProjects();
     renderToolbar();
     renderMain();
     return;
@@ -177,9 +211,13 @@ function showLogin() {
   state.currentUser = null;
   document.getElementById('studio-app').hidden = true;
   document.getElementById('auth-screen').hidden = false;
+  const usernameInput = document.getElementById('auth-username');
   const passwordInput = document.getElementById('auth-password');
-  passwordInput.value = '';
-  passwordInput.focus();
+  if (usernameInput) usernameInput.value = '';
+  if (passwordInput) {
+    passwordInput.value = '';
+    passwordInput.focus();
+  }
 }
 
 async function logout() {
@@ -188,6 +226,8 @@ async function logout() {
   } catch (error) {
     console.warn('logout failed:', error);
   }
+  clearSessionState();
+  state.currentUser = null;
   showLogin();
 }
 
@@ -437,6 +477,9 @@ async function selectProject(id) {
   state.activePage = 'workspace';
   state.selectedId = id;
   state.selected = (await API.getProject(id)).project;
+  state.projectAssets = [];
+  state.projectAssetsError = '';
+  state.projectAssetsLoading = true;
   state.activeFrameId = null;  // reset frame selection on project switch
   state.iterateFocusFrameId = null;
   state.editTextMode = false;
@@ -476,6 +519,7 @@ async function selectProject(id) {
   renderToolbar();   // <-- bug fix: toolbar buttons (template / agent / export) must
                      //     be re-enabled after a project is selected
   renderMain();
+  await refreshProjectAssets(id);
   await refreshTextFields();
 }
 
@@ -987,6 +1031,94 @@ function renderProjectHistory() {
   });
 }
 
+async function refreshProjectAssets(projectId = state.selectedId) {
+  if (!projectId) return;
+  state.projectAssetsLoading = true;
+  state.projectAssetsError = '';
+  renderProjectAssetsPanel();
+  try {
+    const result = await API.getAssets(projectId);
+    if (state.selectedId !== projectId) return;
+    state.projectAssets = result.assets ?? [];
+  } catch (error) {
+    if (state.selectedId !== projectId) return;
+    state.projectAssets = [];
+    state.projectAssetsError = error?.message ?? String(error);
+  } finally {
+    if (state.selectedId === projectId) {
+      state.projectAssetsLoading = false;
+      renderProjectAssetsPanel();
+    }
+  }
+}
+
+function assetDisplayName(asset) {
+  return asset.file_name || asset.filename || asset.name || asset.id || '未命名素材';
+}
+
+function assetDisplayType(asset) {
+  return asset.asset_type || asset.kind || asset.mime_type || 'asset';
+}
+
+function assetPreviewUrl(asset) {
+  if (state.selectedId && asset.id) {
+    return `/api/projects/${encodeURIComponent(state.selectedId)}/assets/${encodeURIComponent(asset.id)}/content`;
+  }
+  const direct = asset.url || asset.path;
+  if (!direct) return '';
+  if (/^https?:\/\//i.test(direct)) return direct;
+  return `/asset?path=${encodeURIComponent(direct)}`;
+}
+
+function formatAssetSize(bytes) {
+  const n = Number(bytes);
+  if (!Number.isFinite(n) || n <= 0) return '';
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  return `${(n / 1024 / 1024).toFixed(1)} MB`;
+}
+
+function renderProjectAssetsPanel() {
+  const list = document.getElementById('project-assets-list');
+  const count = document.getElementById('project-assets-count');
+  if (!list) return;
+  const assets = (state.projectAssets ?? []).filter((asset) => asset.status !== 'deleted');
+  if (count) count.textContent = state.projectAssetsLoading ? '加载中' : `${assets.length} 个素材`;
+  if (state.projectAssetsLoading && !assets.length) {
+    list.innerHTML = `<div class="project-assets-empty">正在读取已上传素材…</div>`;
+    return;
+  }
+  if (state.projectAssetsError) {
+    list.innerHTML = `<div class="project-assets-empty error">素材读取失败：${esc(state.projectAssetsError)}</div>`;
+    return;
+  }
+  if (!assets.length) {
+    list.innerHTML = `<div class="project-assets-empty">暂无已上传素材。通过聊天框或“图片转相册”上传后会显示在这里。</div>`;
+    return;
+  }
+  list.innerHTML = assets.map((asset) => {
+    const name = assetDisplayName(asset);
+    const type = assetDisplayType(asset);
+    const size = formatAssetSize(asset.file_size_bytes ?? asset.size);
+    const url = assetPreviewUrl(asset);
+    const isImage = type === 'image' || String(asset.mime_type ?? '').startsWith('image/');
+    const key = asset.oss_key || asset.path || '';
+    const thumb = isImage && url
+      ? `<img src="${esc(url)}" alt="${esc(name)}" loading="lazy" referrerpolicy="no-referrer" onerror="this.replaceWith(Object.assign(document.createElement('span'), { textContent: '图片' }))" />`
+      : `<span>${esc(type)}</span>`;
+    return `
+      <div class="project-asset-card">
+        <div class="project-asset-thumb">${thumb}</div>
+        <div class="project-asset-info">
+          <b title="${esc(name)}">${esc(name)}</b>
+          <span>${esc(type)}${size ? ` · ${esc(size)}` : ''} · ${esc(asset.status ?? 'available')}</span>
+          ${key ? `<small title="${esc(key)}">${esc(key)}</small>` : ''}
+        </div>
+      </div>
+    `;
+  }).join('');
+}
+
 function renderTemplatesPage() {
   return `
     <main class="feature-page">
@@ -1182,10 +1314,10 @@ function renderToolbar() {
   }
   if (exportHtmlBtn) {
     exportHtmlBtn.disabled = !p || !p.lastPreviewHtmlPath;
-    exportHtmlBtn.textContent = 'Export HTML';
+    exportHtmlBtn.textContent = t('toolbar.export_html');
     exportHtmlBtn.title = p?.lastPreviewHtmlPath
-      ? 'Download the current preview as standalone HTML'
-      : 'Generate or pick a template first';
+      ? t('toolbar.export_html_title_ready')
+      : t('toolbar.export_html_title_disabled');
   }
   renderAgentPill();
 
@@ -1462,6 +1594,15 @@ function renderMain() {
             <span class="grow"></span>
             <button class="reload-btn" id="btn-reload">${t('preview.reload')}</button>
           </div>
+          <details class="project-assets-panel" id="project-assets-panel" open>
+            <summary>
+              <span class="project-assets-title">已上传素材</span>
+              <span class="project-assets-count" id="project-assets-count">0 个素材</span>
+            </summary>
+            <div class="project-assets-list" id="project-assets-list">
+              <div class="project-assets-empty">暂无已上传素材。</div>
+            </div>
+          </details>
           <details class="soundtrack-panel" id="soundtrack-panel">
             <summary>
               <span class="st-summary-main">${t('soundtrack.title')}</span>
@@ -1571,6 +1712,7 @@ function renderMain() {
     renderComposer();
     renderPreview();
     renderFooter();
+    renderProjectAssetsPanel();
     document.getElementById('btn-send').onclick = sendMessage;
     document.getElementById('composer-input').addEventListener('keydown', (e) => {
       if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
@@ -3209,6 +3351,9 @@ async function sendMessage() {
       state.messages[thinkingIdx] = { role: 'system', content: '⚠️ ' + (err.error ?? 'agent failed'), ts: Date.now() };
       renderChatLog();
     } else {
+      if (hasAttachments) {
+        refreshProjectAssets(genProjectId);
+      }
       const reader = res.body.getReader();
       const decoder = new TextDecoder();
       let buf = '';

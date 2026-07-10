@@ -41,6 +41,9 @@ const DICT = {
     'toolbar.agent_ready': '● ready',
     'toolbar.agent_install': '○ install',
     'toolbar.export_mp4': 'Export MP4',
+    'toolbar.export_html': 'Export HTML',
+    'toolbar.export_html_title_ready': 'Download the current preview as standalone HTML',
+    'toolbar.export_html_title_disabled': 'Generate or pick a template first',
 
     'composer.placeholder.no_project': 'Pick a project first…',
     'composer.placeholder.detecting_agents': 'Describe the video while we check for agents…',
@@ -293,6 +296,9 @@ const DICT = {
     'toolbar.agent_ready': '● 就绪',
     'toolbar.agent_install': '○ 待装',
     'toolbar.export_mp4': '导出 MP4',
+    'toolbar.export_html': '导出相册',
+    'toolbar.export_html_title_ready': '下载当前预览为独立 HTML 相册',
+    'toolbar.export_html_title_disabled': '请先生成相册或选择模板',
 
     'composer.placeholder.no_project': '先选一个项目…',
     'composer.placeholder.detecting_agents': '描述视频（正在探测 agent）…',

@@ -1,0 +1,24 @@
+# Copy to .html-video/auth.toml and set real passwords before demo.
+# Do not commit .html-video/auth.toml (it is gitignored).
+
+[auth]
+# Default password for users that omit their own password field.
+password = "REPLACE_WITH_DEMO_PASSWORD"
+
+[[auth.users]]
+user_id = "admin"
+display_name = "管理员"
+
+[[auth.users]]
+user_id = "alice"
+display_name = "Alice"
+
+[[auth.users]]
+user_id = "bob"
+display_name = "Bob"
+
+# Optional: give one user a different password.
+# [[auth.users]]
+# user_id = "bob"
+# display_name = "Bob"
+# password = "bob-only-password"

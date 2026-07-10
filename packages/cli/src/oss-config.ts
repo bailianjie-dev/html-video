@@ -43,6 +43,16 @@ export interface OssDeleteInput {
   key: string;
 }
 
+export interface OssDownloadInput {
+  key: string;
+}
+
+export interface OssDownloadResult {
+  body: Buffer;
+  contentType: string;
+  contentLength: number;
+}
+
 export function loadOssConfig(projectRoot: string): OssConfig | null {
   const candidates = [
     join(projectRoot, '.html-video', 'oss.toml'),
@@ -138,6 +148,58 @@ export async function deleteFromAliyunOss(
             responseBody || res.statusMessage || 'no response body'
           }`,
         ));
+      });
+    });
+    req.on('error', reject);
+    req.end();
+  });
+}
+
+export async function downloadFromAliyunOss(
+  config: OssConfig,
+  input: OssDownloadInput,
+): Promise<OssDownloadResult> {
+  const endpoint = normalizeEndpoint(config.endpoint);
+  const protocol = endpoint.protocol;
+  const host = `${config.bucket}.${endpoint.host}`;
+  const encodedKey = encodeOssKey(input.key);
+  const url = `${protocol}//${host}/${encodedKey}`;
+  const date = new Date().toUTCString();
+  const stringToSign = [
+    'GET',
+    '',
+    '',
+    date,
+    `/${config.bucket}/${input.key}`,
+  ].join('\n');
+  const signature = createHmac('sha1', config.accessKeySecret)
+    .update(stringToSign)
+    .digest('base64');
+
+  return new Promise<OssDownloadResult>((resolveFn, reject) => {
+    const req = (protocol === 'https:' ? httpsRequest : httpRequest)(url, {
+      method: 'GET',
+      headers: {
+        Authorization: `OSS ${config.accessKeyId}:${signature}`,
+        Date: date,
+        Host: host,
+      },
+    }, (res) => {
+      const chunks: Buffer[] = [];
+      res.on('data', (chunk) => chunks.push(chunk as Buffer));
+      res.on('end', () => {
+        const body = Buffer.concat(chunks);
+        if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300) {
+          resolveFn({
+            body,
+            contentType: typeof res.headers['content-type'] === 'string'
+              ? res.headers['content-type']
+              : 'application/octet-stream',
+            contentLength: body.byteLength,
+          });
+          return;
+        }
+        reject(new Error(`OSS download failed (${res.statusCode ?? 'unknown'}): ${body.toString('utf8') || res.statusMessage || 'no response body'}`));
       });
     });
     req.on('error', reject);

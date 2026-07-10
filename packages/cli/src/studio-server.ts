@@ -37,6 +37,7 @@ import { extractUrls, fetchSource } from './fetch-source.js';
 import { detectAll, findAgent, spawnAgent } from '@html-video/runtime';
 import { createPgClient, loadDatabaseConfig, maskedDatabaseConfig } from './database-config.js';
 import {
+  downloadFromAliyunOss,
   loadOssConfig,
   maskedOssConfig,
   uploadFileToAliyunOss,
@@ -44,7 +45,7 @@ import {
 } from './oss-config.js';
 import {
   createDevAuthToken,
-  DEV_AUTH_USERNAME,
+  findAuthUser,
   loadAuthConfig,
   verifyDevAuthToken,
   verifyDevCredentials,
@@ -64,6 +65,7 @@ import { createHtmlOssPublisher } from './html-oss-publisher.js';
 
 interface StudioHandle {
   url: string;
+  host: string;
   port: number;
   close: () => void;
 }
@@ -96,7 +98,11 @@ function resolveUiRoot(): string {
   return candidates[0]!;
 }
 
-export async function startStudioServer(ctx: CliContext, port: number): Promise<StudioHandle> {
+export async function startStudioServer(
+  ctx: CliContext,
+  port: number,
+  host = '127.0.0.1',
+): Promise<StudioHandle> {
   const uiRoot = resolveUiRoot();
 
   const handleRequest = async (req: IncomingMessage, res: ServerResponse): Promise<unknown> => {
@@ -122,7 +128,7 @@ export async function startStudioServer(ctx: CliContext, port: number): Promise<
         const authConfig = loadAuthConfig(ctx.projectRoot);
         if (!authConfig) {
           return json(res, 503, {
-            error: 'Temporary login is not configured. Create .html-video/auth.toml from auth.example.toml.',
+            error: 'Temporary login is not configured. Create .html-video/auth.toml from config/auth.example.toml.',
           });
         }
         const username = typeof body.username === 'string'
@@ -134,19 +140,23 @@ export async function startStudioServer(ctx: CliContext, port: number): Promise<
         if (!verifyDevCredentials(authConfig, username, password)) {
           return json(res, 401, { error: 'Invalid username or password' });
         }
+        const account = findAuthUser(authConfig, username);
+        if (!account) {
+          return json(res, 401, { error: 'Invalid username or password' });
+        }
         return json(res, 200, {
           user: {
-            user_id: DEV_AUTH_USERNAME,
-            actor_id: DEV_AUTH_USERNAME,
-            display_name: 'Administrator',
+            user_id: account.userId,
+            actor_id: account.userId,
+            display_name: account.displayName,
             source: 'dev-cookie',
             authenticated: true,
           },
         }, {
           'set-cookie': [
-            makeCookie('hv_user_id', DEV_AUTH_USERNAME),
-            makeCookie('hv_display_name', 'Administrator'),
-            makeCookie('hv_auth', createDevAuthToken(authConfig)),
+            makeCookie('hv_user_id', account.userId),
+            makeCookie('hv_display_name', account.displayName),
+            makeCookie('hv_auth', createDevAuthToken(authConfig, account.userId)),
           ],
         });
       }
@@ -794,6 +804,42 @@ export async function startStudioServer(ctx: CliContext, port: number): Promise<
           }
         }
         return json(res, 200, { project });
+      }
+
+      // Authenticated thumbnail/content proxy for project assets stored in OSS.
+      // This lets private buckets still render previews while preserving the
+      // request-scoped user/project checks from PostgresAssetPersistence.
+      const assetContentMatch = url.pathname.match(/^\/api\/projects\/([^/]+)\/assets\/([^/]+)\/content$/);
+      if (assetContentMatch && assetContentMatch[1] && assetContentMatch[2] && m === 'GET') {
+        const projectId = assetContentMatch[1];
+        const assetId = assetContentMatch[2];
+        if (ctx.database?.mode !== 'postgres' || !ctx.database.handle) {
+          const project = await ctx.orchestrator.load(projectId);
+          const asset = project.assets.find((item) => item.id === assetId);
+          if (!asset?.path) return json(res, 404, { error: 'Asset not found' });
+          const safe = resolve(asset.path);
+          const projectsRoot = resolve(ctx.projectRoot, '.html-video', 'projects');
+          if (!isPathInside(projectsRoot, safe)) return json(res, 403, { error: 'Forbidden' });
+          if (!existsSync(safe)) return json(res, 404, { error: 'Asset file not found' });
+          return serveFile(safe, res);
+        }
+        const assets = await projectAssetPersistence(ctx).listForProject(projectId);
+        const asset = assets.find((item) => item.id === assetId && item.status !== 'deleted');
+        if (!asset?.oss_key) return json(res, 404, { error: 'Asset not found' });
+        const ossConfig = loadOssConfig(ctx.projectRoot);
+        if (!ossConfig?.enabled) return json(res, 404, { error: 'OSS is not configured' });
+        try {
+          const downloaded = await downloadFromAliyunOss(ossConfig, { key: asset.oss_key });
+          res.writeHead(200, {
+            'Content-Type': asset.mime_type || downloaded.contentType,
+            'Content-Length': String(downloaded.contentLength),
+            'Cache-Control': 'private, max-age=300',
+          });
+          return res.end(downloaded.body);
+        } catch (error) {
+          console.warn('[studio] asset content proxy failed:', error);
+          return json(res, 502, { error: 'Asset content unavailable' });
+        }
       }
 
       // Remove asset
@@ -1471,9 +1517,9 @@ export async function startStudioServer(ctx: CliContext, port: number): Promise<
       }
 
       // Messages: POST = send + stream agent reply via SSE
-      // v0.5: accepts multipart (text + files) OR JSON. Files become real
-      // project assets via AssetStore; their paths are passed to the agent
-      // prompt as attachments.
+      // v0.5: accepts multipart (text + files) OR JSON. In PostgreSQL + OSS
+      // mode, files use the same durable asset pipeline as /assets; otherwise
+      // they retain the local AssetStore compatibility behavior.
       if (msgsMatch && msgsMatch[1] && m === 'POST') {
         const id = msgsMatch[1];
         const ct = req.headers['content-type'] ?? '';
@@ -1490,7 +1536,9 @@ export async function startStudioServer(ctx: CliContext, port: number): Promise<
             } else if (p.kind === 'field' && p.name === 'focus_frame_id') {
               focusFrameId = p.value;
             } else if (p.kind === 'file') {
-              const updatedProject = await ctx.orchestrator.addFileAsset(id, p.tmpPath);
+              const updatedProject = shouldPersistUploadedAssetsToOss(ctx)
+                ? await addFileAssetToOss(ctx, id, p.tmpPath, p.filename)
+                : await ctx.orchestrator.addFileAsset(id, p.tmpPath);
               const newAsset = updatedProject.assets[updatedProject.assets.length - 1];
               if (newAsset) {
                 const att: Attachment = {
@@ -1501,9 +1549,9 @@ export async function startStudioServer(ctx: CliContext, port: number): Promise<
                 };
                 // Inline small text/data uploads so the agent (incl. HTTP ones)
                 // actually sees the content, not just a local path.
-                if ((newAsset.type === 'text' || newAsset.type === 'data') && newAsset.path) {
+                if (newAsset.type === 'text' || newAsset.type === 'data') {
                   try {
-                    const txt = await readFile(newAsset.path, 'utf8');
+                    const txt = await readFile(p.tmpPath, 'utf8');
                     if (txt.length <= 20_000) att.inlineText = txt;
                   } catch { /* fall back to path-only */ }
                 }
@@ -2286,11 +2334,13 @@ export async function startStudioServer(ctx: CliContext, port: number): Promise<
   });
 
   return new Promise((resolveFn) => {
-    server.listen(port, '127.0.0.1', () => {
+    server.listen(port, host, () => {
       const addr = server.address();
       const actualPort = typeof addr === 'object' && addr ? addr.port : port;
+      const displayHost = host === '0.0.0.0' || host === '::' ? '127.0.0.1' : host;
       resolveFn({
-        url: `http://127.0.0.1:${actualPort}`,
+        url: `http://${displayHost}:${actualPort}`,
+        host,
         port: actualPort,
         close: () => {
           server.close();
@@ -2382,13 +2432,14 @@ function getRequestUser(req: IncomingMessage, authConfig: AuthConfig | null): {
   const cookieUserId = normalizeDevUserId(cookies.hv_user_id);
   if (
     authConfig
-    && cookieUserId === DEV_AUTH_USERNAME
-    && verifyDevAuthToken(authConfig, cookies.hv_auth)
+    && cookieUserId
+    && verifyDevAuthToken(authConfig, cookieUserId, cookies.hv_auth)
   ) {
+    const account = findAuthUser(authConfig, cookieUserId);
     return {
       user_id: cookieUserId,
       actor_id: cookieUserId,
-      display_name: cookies.hv_display_name || cookieUserId,
+      display_name: account?.displayName || cookies.hv_display_name || cookieUserId,
       source: 'cookie',
       authenticated: true,
     };
@@ -2701,14 +2752,17 @@ async function addFileAssetToOss(
   }
 
   const project = await ctx.orchestrator.load(projectId);
+  const user = ctx.requestContexts.getRequiredUser();
   const bytes = await readFile(filePath);
   const fileName = originalFileName || basename(filePath);
   const { mime, type } = AssetStore.guessMime(fileName);
   const objectId = randomUUID();
   const ossKey = [
     oss.prefix,
+    'users',
+    safeWorkDirectorySegment(user.userId, 'user'),
     'projects',
-    projectId,
+    safeWorkDirectorySegment(projectId, 'project'),
     'assets',
     objectId,
     safeOssFileName(fileName),
@@ -2770,11 +2824,14 @@ async function uploadExportMp4ToOss(
   if (ctx.database?.mode !== 'postgres' || !ctx.database.handle || !exportJob) return null;
   const oss = loadOssConfig(ctx.projectRoot);
   if (!oss?.enabled) return null;
+  const user = ctx.requestContexts.getRequiredUser();
 
   const ossKey = [
     oss.prefix,
+    'users',
+    safeWorkDirectorySegment(user.userId, 'user'),
     'projects',
-    projectId,
+    safeWorkDirectorySegment(projectId, 'project'),
     'exports',
     exportJob.id,
     'output.mp4',

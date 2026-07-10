@@ -144,6 +144,7 @@ PUT /api/projects/:id/frames/:nodeId/raw-html
 
 ```text
 POST /api/projects/:id/assets
+POST /api/projects/:id/messages  # multipart 聊天/图片转相册附件
 ```
 
 行为：
@@ -152,6 +153,8 @@ POST /api/projects/:id/assets
   - 文件上传到 OSS
   - 写入 `ai_album_assets`
   - `project.assets[]` 中的 `path` 使用 OSS URL
+  - Pi Agent 收到可直接用于 HTML `src/href` 的 OSS URL
+  - object key 使用 `<prefix>/users/<user>/projects/<project>/assets/<assetId>/<fileName>`
 - 其他情况
   - 继续使用原本本地文件行为
 
@@ -475,7 +478,7 @@ MP4 导出已接入 `ai_album_export_jobs`，记录 queued/running/succeeded/fai
 当 PostgreSQL 与 OSS 同时启用时，渲染完成的 MP4 会上传到：
 
 ```text
-<prefix>/projects/<projectId>/exports/<jobId>/output.mp4
+<prefix>/users/<user>/projects/<projectId>/exports/<jobId>/output.mp4
 ```
 
 任务成功后写入 `oss_bucket`、`oss_key` 和 `output_url`。OSS 未启用时保留本地导出；
