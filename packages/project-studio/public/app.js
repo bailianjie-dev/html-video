@@ -91,10 +91,214 @@ const state = {
   generationMeta: null,    // create-page selections shown on the generation page
   generationComposerOpen: false,
   previewMode: 'desktop',
+  albumPageCount: 0,
+  activeAlbumPage: 0,
   // Phase C: per-frame native Remotion enhancement
   frameKinds: {},          // { [graphNodeId]: 'entity'|'data'|'text' } for the selected project
   enhancing: null,         // { nodeId, pct, stage } while a single-frame enhance render is in flight
 };
+
+const ROUTES = {
+  create: '/',
+  album: '/image-album',
+  history: '/album-history',
+  studioPrefix: '/album-studio',
+};
+
+function routeWithCurrentSearch(path) {
+  const params = new URLSearchParams(window.location.search);
+  params.delete('studioProject');
+  params.delete('generationJob');
+  const search = params.toString();
+  return `${path}${search ? `?${search}` : ''}`;
+}
+
+function routeProjectIdFromPath(pathname = window.location.pathname) {
+  const match = pathname.match(/^\/album-studio\/([^/?#]+)\/?$/);
+  return match?.[1] ? decodeURIComponent(match[1]) : '';
+}
+
+function routeProjectIdFromSearch(search = window.location.search) {
+  return new URLSearchParams(search).get('studioProject') || '';
+}
+
+function routeGenerationJobIdFromSearch(search = window.location.search) {
+  return new URLSearchParams(search).get('generationJob') || '';
+}
+
+function routePageFromPath(pathname = window.location.pathname) {
+  if (pathname === ROUTES.history) return 'history';
+  if (pathname === ROUTES.album) return 'album';
+  if (pathname === '/' || pathname === '/index.html') return 'create';
+  return '';
+}
+
+function projectStudioPath(projectId) {
+  return `${ROUTES.studioPrefix}/${encodeURIComponent(projectId)}`;
+}
+
+function projectStudioBootstrapUrl(projectId, extraParams = {}) {
+  const params = new URLSearchParams(window.location.search);
+  params.set('studioProject', projectId);
+  for (const [key, value] of Object.entries(extraParams)) {
+    if (value !== undefined && value !== null && value !== '') params.set(key, value);
+  }
+  const search = params.toString();
+  return `/${search ? `?${search}` : ''}`;
+}
+
+function openProjectStudioPlaceholder() {
+  const opened = window.open('about:blank', '_blank');
+  if (!opened) {
+    toast('浏览器拦截了新页面，请允许弹窗后重试。', 'warn');
+    return null;
+  }
+  try {
+    opened.document.write('<!doctype html><title>正在打开项目</title><body style="font-family:system-ui,sans-serif;padding:24px;color:#0f172a">正在打开项目预览...</body>');
+    opened.document.close();
+  } catch {}
+  return opened;
+}
+
+function focusOpenedPage(opened) {
+  if (!opened) return;
+  try {
+    opened.opener = null;
+    opened.focus?.();
+  } catch {}
+}
+
+function navigateProjectStudioPage(projectId, extraParams = {}, opened = null) {
+  const url = projectStudioBootstrapUrl(projectId, extraParams);
+  if (opened && !opened.closed) {
+    opened.location.href = url;
+    focusOpenedPage(opened);
+    return true;
+  }
+  const newWindow = window.open(url, '_blank');
+  if (newWindow) {
+    focusOpenedPage(newWindow);
+    return true;
+  }
+  toast('浏览器拦截了新页面，请允许弹窗后重试。', 'warn');
+  return false;
+}
+
+function openProjectStudioPage(projectId) {
+  navigateProjectStudioPage(projectId);
+}
+
+function updateBrowserRoute(path, { replace = false } = {}) {
+  const nextUrl = routeWithCurrentSearch(path);
+  const currentUrl = `${window.location.pathname}${window.location.search}`;
+  if (currentUrl === nextUrl) return;
+  const method = replace ? 'replaceState' : 'pushState';
+  window.history[method]({}, '', nextUrl);
+}
+
+function updateProjectStudioRoute(projectId, options = {}) {
+  updateBrowserRoute(projectStudioPath(projectId), options);
+}
+
+function updatePageRoute(page, options = {}) {
+  const path = ROUTES[page] || ROUTES.create;
+  updateBrowserRoute(path, options);
+}
+
+const PENDING_GENERATION_DB = 'hv-studio-pending-generation';
+const PENDING_GENERATION_STORE = 'jobs';
+const LOCAL_GENERATION_META_KEY = 'hv.studio.projectGenerationMeta';
+
+function openPendingGenerationDb() {
+  return new Promise((resolve, reject) => {
+    const request = indexedDB.open(PENDING_GENERATION_DB, 1);
+    request.onupgradeneeded = () => {
+      request.result.createObjectStore(PENDING_GENERATION_STORE, { keyPath: 'id' });
+    };
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error || new Error('open indexedDB failed'));
+  });
+}
+
+async function savePendingGenerationJob(job) {
+  const db = await openPendingGenerationDb();
+  const id = `job_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+  const row = { ...job, id, createdAt: Date.now() };
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(PENDING_GENERATION_STORE, 'readwrite');
+    tx.objectStore(PENDING_GENERATION_STORE).put(row);
+    tx.oncomplete = () => {
+      db.close();
+      resolve(id);
+    };
+    tx.onerror = () => {
+      db.close();
+      reject(tx.error || new Error('save pending generation failed'));
+    };
+  });
+}
+
+async function takePendingGenerationJob(id) {
+  if (!id) return null;
+  const db = await openPendingGenerationDb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(PENDING_GENERATION_STORE, 'readwrite');
+    const store = tx.objectStore(PENDING_GENERATION_STORE);
+    const get = store.get(id);
+    let row = null;
+    get.onsuccess = () => {
+      row = get.result || null;
+      if (row) store.delete(id);
+    };
+    tx.oncomplete = () => {
+      db.close();
+      resolve(row);
+    };
+    tx.onerror = () => {
+      db.close();
+      reject(tx.error || new Error('read pending generation failed'));
+    };
+  });
+}
+
+function serializePendingAttachments() {
+  return state.pendingAttachments.map((a) => ({
+    file: a.file,
+    name: a.name,
+    kind: a.kind,
+    size: a.size,
+    dataUrl: a.dataUrl || '',
+  }));
+}
+
+function restorePendingAttachments(attachments = []) {
+  return attachments
+    .filter((a) => a?.file)
+    .map((a) => ({
+      file: a.file,
+      name: a.name || a.file.name,
+      kind: a.kind || attachmentKind(a.file),
+      size: a.size || a.file.size,
+      dataUrl: a.dataUrl || '',
+    }));
+}
+
+function readLocalGenerationMetaMap() {
+  try {
+    return JSON.parse(localStorage.getItem(LOCAL_GENERATION_META_KEY) || '{}') || {};
+  } catch {
+    return {};
+  }
+}
+
+function saveLocalGenerationMeta(projectId, meta) {
+  if (!projectId || !meta) return;
+  try {
+    const map = readLocalGenerationMetaMap();
+    map[projectId] = meta;
+    localStorage.setItem(LOCAL_GENERATION_META_KEY, JSON.stringify(map));
+  } catch {}
+}
 
 // ============== boot ==============
 async function init() {
@@ -130,6 +334,8 @@ function clearSessionState() {
   state.generationMeta = null;
   state.generationComposerOpen = false;
   state.previewMode = 'desktop';
+  state.albumPageCount = 0;
+  state.activeAlbumPage = 0;
   state.activeFrameId = null;
   state.iterateFocusFrameId = null;
   state.editTextMode = false;
@@ -174,8 +380,50 @@ async function initStudio() {
   // Don't block — but surface failures in the console.
   agentsPromise.catch((e) => console.warn('agent detection failed:', e));
 
-  renderMain();
+  if (!(await applyRouteFromLocation({ replace: true }))) {
+    renderMain();
+  }
 }
+
+async function applyRouteFromLocation(options = {}) {
+  const routedProjectId = routeProjectIdFromPath() || routeProjectIdFromSearch();
+  if (routedProjectId) {
+    const generationJobId = routeGenerationJobIdFromSearch();
+    let generationJob = null;
+    if (generationJobId) {
+      try {
+        generationJob = await takePendingGenerationJob(generationJobId);
+        if (generationJob?.generationMeta) state.generationMeta = generationJob.generationMeta;
+      } catch (error) {
+        console.warn('pending generation job load failed:', error);
+      }
+    }
+    await selectProject(routedProjectId, { page: 'workspace', updateUrl: false });
+    if (options.replace) updateProjectStudioRoute(routedProjectId, { replace: true });
+    if (generationJob) {
+      await runPendingGenerationJob(generationJob);
+    }
+    return true;
+  }
+  const routedPage = routePageFromPath();
+  if (routedPage) {
+    state.activePage = routedPage;
+    renderToolbar();
+    renderMain();
+    return true;
+  }
+  return false;
+}
+
+window.addEventListener('popstate', () => {
+  if (!state.currentUser?.authenticated) return;
+  applyRouteFromLocation().then((handled) => {
+    if (handled) return;
+    state.activePage = 'create';
+    renderToolbar();
+    renderMain();
+  });
+});
 
 function wireAuthForm() {
   const form = document.getElementById('auth-form');
@@ -489,12 +737,17 @@ async function refreshProjects() {
 async function selectProject(id, options = {}) {
   state.activePage = options.page || 'workspace';
   state.selectedId = id;
+  if (options.updateUrl !== false) {
+    updateProjectStudioRoute(id, { replace: !!options.replaceUrl });
+  }
   state.selected = (await API.getProject(id)).project;
   state.projectAssets = [];
   state.projectAssetsError = '';
   state.projectAssetsLoading = true;
   state.activeFrameId = null;  // reset frame selection on project switch
   state.iterateFocusFrameId = null;
+  state.albumPageCount = 0;
+  state.activeAlbumPage = 0;
   state.editTextMode = false;
   state.enhancing = null;
   // Phase C: map graph node id → kind so the strip can show the "⚡ Enhance"
@@ -537,9 +790,8 @@ async function selectProject(id, options = {}) {
 }
 
 const NAV_ITEMS = [
-  { id: 'create', label: '新建相册', desc: '输入主题生成', icon: 'plus' },
-  { id: 'album', label: '图片转相册', desc: '素材生成 HTML', icon: 'image' },
-  { id: 'workspace', label: '项目编辑', desc: '预览与导出', icon: 'edit' },
+  { id: 'create', label: '新建相册', desc: 'Agent 规划结构与文案', icon: 'plus' },
+  { id: 'album', label: '图片转相册', desc: '照片按顺序一键成片', icon: 'image' },
   { id: 'history', label: '历史项目', desc: '管理已生成项目', icon: 'history' },
 ];
 
@@ -604,6 +856,13 @@ function renderFeatureNav() {
 
 function setActivePage(page) {
   state.activePage = page || 'create';
+  if (state.activePage === 'workspace' && !state.selectedId && state.projects[0]?.id) {
+    selectProject(state.projects[0].id, { page: 'workspace' });
+    return;
+  }
+  if (state.activePage !== 'workspace' && state.activePage !== 'generating') {
+    updatePageRoute(state.activePage);
+  }
   renderMain();
   renderToolbar();
 }
@@ -799,14 +1058,18 @@ function projectUserStatus(project) {
   if (!project) return '';
   if (state.selectedId === project.id && state.exporting) return '正在导出';
   if (state.selectedId === project.id && state.composing) return '正在生成';
-  const hasPreview = !!(
-    project.lastPreviewHtmlPath
-    || project.last_preview_html_path
-    || (project.frames?.length ?? 0) > 0
-  );
-  if (hasPreview || project.status === 'rendered' || project.status === 'previewed') return '已生成，可预览和调整';
+  if (hasProjectPreview(project)) return '已生成，可预览和调整';
+  if (project.status === 'rendered' || project.status === 'previewed') return '生成中断，可重新生成';
   if (project.status === 'draft') return '准备生成';
-  return '可继续编辑';
+  return '需要重新生成';
+}
+
+function hasProjectPreview(project) {
+  return !!(
+    project?.lastPreviewHtmlPath
+    || project?.last_preview_html_path
+    || (project?.frames?.length ?? 0) > 0
+  );
 }
 
 function selectedOptionText(id) {
@@ -824,9 +1087,9 @@ function buildCreateGenerationMeta(raw) {
     audience: selectedOptionText('create-audience') || '潜在客户',
     scene: selectedOptionText('create-scene') || '公司介绍',
     tone: selectedOptionText('create-tone') || '温柔',
-    ratio: selectedOptionText('create-ratio') || '16:9 横屏',
+    ratio: selectedOptionText('create-ratio') || '9:16 竖屏',
     style: selectedOptionText('create-style') || '科技深蓝',
-    materialUse: selectedOptionText('create-material-use') || '优先使用上传素材',
+    materialUse: selectedOptionText('create-material-use') || '没有素材也可生成',
     cta: selectedOptionText('create-cta') || '联系咨询',
   };
 }
@@ -880,11 +1143,11 @@ function renderLandingAttachments() {
   const el = document.getElementById('create-attachment-state');
   if (!el) return;
   if (!state.pendingAttachments.length) {
-    el.textContent = '未选择素材';
+    el.textContent = '可选，未上传参考图';
     return;
   }
   const names = state.pendingAttachments.map((a) => a.name).slice(0, 2).join('、');
-  el.textContent = `${state.pendingAttachments.length} 个素材：${names}${state.pendingAttachments.length > 2 ? ' 等' : ''}`;
+  el.textContent = `${state.pendingAttachments.length} 张参考图：${names}${state.pendingAttachments.length > 2 ? ' 等' : ''}`;
 }
 
 function renderImageAlbumAttachments() {
@@ -896,7 +1159,7 @@ function renderImageAlbumAttachments() {
     list.innerHTML = `
       <div class="image-upload-empty">
         <strong>先上传图片</strong>
-        <span>可一次选择多张，系统会按选择顺序生成相册页。</span>
+        <span>可拖拽或选择多张，按上传顺序一图一页生成。</span>
       </div>
     `;
     return;
@@ -947,6 +1210,21 @@ ${names}
 9. 不要编造图片中看不出的具体事实；不确定的内容用中性表达。`;
 }
 
+async function runPendingGenerationJob(job) {
+  if (!job || job.projectId !== state.selectedId) return;
+  if (job.generationMeta) state.generationMeta = job.generationMeta;
+  state.pendingAttachments = restorePendingAttachments(job.attachments);
+  renderAttachments();
+  renderLandingAttachments();
+  renderImageAlbumAttachments();
+  const input = document.getElementById('composer-input');
+  if (!input) return;
+  input.value = job.prompt || '';
+  if (input.value.trim() || state.pendingAttachments.length) {
+    await sendMessage();
+  }
+}
+
 async function startImageAlbumFromUploadPage() {
   if (!state.pendingAttachments.length) {
     toast('请先上传至少一张图片。', 'error');
@@ -957,10 +1235,13 @@ async function startImageAlbumFromUploadPage() {
     toast('图片转相册只支持图片文件，请移除非图片素材。', 'error');
     return;
   }
+  const targetWindow = openProjectStudioPlaceholder();
+  if (!targetWindow) return;
   const btn = document.getElementById('btn-image-album-send');
   if (btn) btn.disabled = true;
   try {
-    state.generationMeta = buildImageAlbumGenerationMeta();
+    const generationMeta = buildImageAlbumGenerationMeta();
+    state.generationMeta = generationMeta;
     const title = document.getElementById('image-album-title')?.value.trim() || '图片电子相册';
     const r = await API.createProject({ name: makeAlbumProjectName(title) });
     if (!r?.project) throw new Error('project create failed');
@@ -970,14 +1251,23 @@ async function startImageAlbumFromUploadPage() {
     } catch (e) {
       toast(`电子相册模板应用失败：${e?.message ?? e}`, 'error');
     }
+    saveLocalGenerationMeta(r.project.id, generationMeta);
+    await API.patchProject(r.project.id, { preferences: { generationMeta } }).catch((e) => {
+      console.warn('save generation meta failed:', e);
+    });
     const prompt = buildImageAlbumPrompt();
-    await selectProject(r.project.id, { page: 'generating' });
-    const input = document.getElementById('composer-input');
-    if (input) {
-      input.value = prompt;
-      await sendMessage();
-    }
+    const generationJob = await savePendingGenerationJob({
+      projectId: r.project.id,
+      prompt,
+      generationMeta,
+      attachments: serializePendingAttachments(),
+    });
+    navigateProjectStudioPage(r.project.id, { generationJob }, targetWindow);
+    state.pendingAttachments = [];
+    renderImageAlbumAttachments();
+    toast('已在新页面开始生成相册。', 'success');
   } catch (e) {
+    try { targetWindow.close(); } catch {}
     toast(`图片转相册失败：${e?.message ?? e}`, 'error');
   } finally {
     if (btn) btn.disabled = false;
@@ -990,10 +1280,13 @@ async function startAlbumFromCreatePage() {
     toast('请输入相册主题，或先上传素材。', 'error');
     return;
   }
+  const targetWindow = openProjectStudioPlaceholder();
+  if (!targetWindow) return;
   const btn = document.getElementById('btn-create-send');
   if (btn) btn.disabled = true;
   try {
-    state.generationMeta = buildCreateGenerationMeta(raw);
+    const generationMeta = buildCreateGenerationMeta(raw);
+    state.generationMeta = generationMeta;
     const r = await API.createProject({ name: makeAlbumProjectName(raw) });
     if (!r?.project) throw new Error('project create failed');
     await refreshProjects();
@@ -1002,14 +1295,23 @@ async function startAlbumFromCreatePage() {
     } catch (e) {
       toast(`电子相册模板应用失败：${e?.message ?? e}`, 'error');
     }
+    saveLocalGenerationMeta(r.project.id, generationMeta);
+    await API.patchProject(r.project.id, { preferences: { generationMeta } }).catch((e) => {
+      console.warn('save generation meta failed:', e);
+    });
     const prompt = buildAlbumPromptFromCreatePage();
-    await selectProject(r.project.id, { page: 'generating' });
-    const input = document.getElementById('composer-input');
-    if (input) {
-      input.value = prompt;
-      await sendMessage();
-    }
+    const generationJob = await savePendingGenerationJob({
+      projectId: r.project.id,
+      prompt,
+      generationMeta,
+      attachments: serializePendingAttachments(),
+    });
+    navigateProjectStudioPage(r.project.id, { generationJob }, targetWindow);
+    state.pendingAttachments = [];
+    renderLandingAttachments();
+    toast('已在新页面开始生成相册。', 'success');
   } catch (e) {
+    try { targetWindow.close(); } catch {}
     toast(`创建电子相册失败：${e?.message ?? e}`, 'error');
   } finally {
     if (btn) btn.disabled = false;
@@ -1020,8 +1322,8 @@ function renderCreatePage() {
   return `
     <main class="create-page">
       <section class="create-hero">
-        <h2>企业宣传<span>电子相册工具</span></h2>
-        <p>输入主题、上传素材，生成可下滑浏览、可导出的 HTML 电子相册</p>
+        <h2>基于Agent<span>电子相册工具</span></h2>
+        <p>输入主题，Agent 帮你规划结构与文案；无需图片也能生成完整相册</p>
       </section>
 
       <section class="generator-panel">
@@ -1034,13 +1336,13 @@ function renderCreatePage() {
           <label><span>受众</span><select id="create-audience">${renderAlbumAudienceOptions('潜在客户')}</select></label>
           <label><span>场景</span><select id="create-scene">${renderAlbumSceneOptions('公司介绍')}</select></label>
           <label><span>语气</span><select id="create-tone"><option>温柔</option><option>专业</option><option>活泼</option><option>克制</option></select></label>
-          <label><span>比例</span><select id="create-ratio"><option>16:9 横屏</option><option>9:16 竖屏</option><option>1:1 方形</option></select></label>
+          <label><span>比例</span><select id="create-ratio"><option>9:16 竖屏</option><option>16:9 横屏</option><option>1:1 方形</option></select></label>
           <label><span>风格</span><select id="create-style">${renderAlbumStyleOptions('科技深蓝')}</select></label>
           <label><span>素材使用方式</span><select id="create-material-use">
+            <option value="没有素材也可生成：即使用户没有上传素材，也要基于主题生成完整电子相册，可使用排版、色块、图标、数据卡片和合理占位，不要要求用户补充素材。">没有素材也可生成</option>
             <option value="优先使用上传素材：如果用户上传了图片、Logo、截图或资料，应优先围绕这些素材组织页面；不足的部分再用文字、图形或合理占位补足。">优先使用上传素材</option>
             <option value="图片为主文字为辅：页面以图片、产品图、场景图或上传素材为主要视觉，文字保持短句说明和标题，不要堆叠长段落。">图片为主文字为辅</option>
             <option value="文字为主图片点缀：页面以清晰文案、数据、卖点和结构化信息为主，图片只作为品牌氛围、图标或局部点缀。">文字为主图片点缀</option>
-            <option value="没有素材也可生成：即使用户没有上传素材，也要基于主题生成完整电子相册，可使用排版、色块、图标、数据卡片和合理占位，不要要求用户补充素材。">没有素材也可生成</option>
           </select></label>
           <label><span>行动引导</span><select id="create-cta">
             <option value="联系咨询：最后一页突出联系方式、咨询按钮或电话/微信入口，引导客户直接联系。">联系咨询</option>
@@ -1051,16 +1353,16 @@ function renderCreatePage() {
             <option value="下载资料：最后一页引导下载白皮书、产品资料、报价单、案例集或宣传册。">下载资料</option>
           </select></label>
         </div>
-        <p class="generator-help">默认生成企业宣传电子相册；这些选项只调整页数、受众、场景、语气、比例、视觉风格、素材使用和最后一页 CTA。</p>
+        <p class="generator-help">以文字主题为主，Agent 自动规划页面结构；上传参考图可选。下方选项调整页数、受众、场景、语气、比例、视觉风格和最后一页 CTA。</p>
 
         <p class="prompt-guide">可以写公司介绍、产品亮点、客户案例、联系方式；也可以直接粘贴公司简介。</p>
         <div class="prompt-field">
           <textarea id="create-topic-input" rows="8" placeholder="请输入电子相册主题，例如：大米科技有限公司公司介绍，包含封面、公司简介、核心业务、团队优势、联系方式。"></textarea>
           <div class="prompt-bottom">
             <div class="prompt-tools">
-              <button type="button" class="tool-btn" id="btn-create-attach">${navIcon('image')}<span>参考素材</span></button>
+              <button type="button" class="tool-btn" id="btn-create-attach" title="可选，上传 Logo、产品图等作为参考">${navIcon('image')}<span>补充参考图（可选）</span></button>
               <input type="file" id="create-file-input" multiple hidden />
-              <span class="attachment-state" id="create-attachment-state">未选择素材</span>
+              <span class="attachment-state" id="create-attachment-state">可选，未上传参考图</span>
             </div>
             <div class="prompt-actions">
               <button type="button" class="mini-action" id="btn-create-thinking" title="先梳理结构再生成，适合资料多、要求高的相册。">${navIcon('settings')}<span>深度思考</span></button>
@@ -1115,9 +1417,9 @@ function renderAlbumPage() {
     <main class="feature-page">
       <div class="feature-page-inner">
         <section class="feature-hero">
-          <div class="kicker">Image To Album</div>
+          <div class="kicker">Photo To Album</div>
           <h2>图片转相册</h2>
-          <p>先上传多张图片，再补充一句说明，系统会按图片顺序生成可翻页的 HTML 电子相册。</p>
+          <p>已有照片？按顺序一键成片。每张图一页，适合年会、旅行、毕业等纪念相册。</p>
         </section>
 
         <section class="image-album-flow">
@@ -1125,8 +1427,8 @@ function renderAlbumPage() {
             <div class="upload-drop" id="image-album-drop">
               <input type="file" id="image-album-input" accept="image/*" multiple hidden />
               <div class="upload-icon">${navIcon('image')}</div>
-              <h3>上传相册图片</h3>
-              <p>支持一次选择多张图片，生成时会严格按这里展示的顺序安排页面。</p>
+              <h3>拖拽或选择相册图片</h3>
+              <p>支持拖拽或选择多张图片；生成时严格按上传顺序，一图一页。</p>
               <button type="button" class="feature-btn primary" id="btn-image-album-pick">选择图片</button>
             </div>
 
@@ -1178,7 +1480,7 @@ function renderAlbumPage() {
             <div class="side-panel muted">
               <div>
                 <h3>生成规则</h3>
-                <p>每张图片生成一页，图片作为页面主体；AI助手会补充短标题和说明文案。生成完成后可继续预览、改字和导出。</p>
+                <p>一图一页，图片为页面主体；Agent 补充短标题和说明。无需填写宣传主题，有照片即可开始。生成后可预览、改字和导出。</p>
               </div>
             </div>
         </section>
@@ -1235,9 +1537,9 @@ function renderGenerationPage() {
     audience: '潜在客户',
     scene: '公司介绍',
     tone: '温柔',
-    ratio: '16:9 横屏',
+    ratio: '9:16 竖屏',
     style: '科技深蓝',
-    materialUse: '优先使用上传素材',
+    materialUse: '没有素材也可生成',
     cta: '联系咨询',
   };
   const summaryRows = [
@@ -1245,13 +1547,51 @@ function renderGenerationPage() {
     ['受众', meta.audience || '潜在客户'],
     ['场景', meta.scene || '公司介绍'],
     ['语气', meta.tone || '温柔'],
-    ['比例', meta.ratio || '16:9 横屏'],
+    ['比例', meta.ratio || '9:16 竖屏'],
     ['风格', meta.style || '科技深蓝'],
-    ['素材', meta.materialUse || '优先使用上传素材'],
+    ['素材', meta.materialUse || '没有素材也可生成'],
     ['行动引导', meta.cta || '联系咨询'],
   ];
+  const hasPreview = hasProjectPreview(state.selected);
+  const needsRegenerate = !!state.selected && !hasPreview && !state.composing;
+  const progressText = state.composing
+    ? '整理内容 → 规划页面 → 生成文案 → 生成预览'
+    : hasPreview
+      ? '已生成，可预览和调整'
+      : '尚未生成预览，请重新生成';
+  const footerText = state.composing
+    ? `${meta.title || '电子相册'} · 正在生成`
+    : hasPreview
+      ? `${meta.title || '电子相册'} · 已生成，可预览和调整`
+      : `${meta.title || '电子相册'} · 需要重新生成`;
   const canExportHtml = !!state.selected?.lastPreviewHtmlPath;
-  const canExportMp4 = !!(state.selected && (state.selected.templateId || (state.selected.frames?.length ?? 0) > 0)) && !state.exporting;
+  const canExportMp4 = !!state.selected && hasPreview && !state.exporting;
+  const previewEmptyHtml = needsRegenerate ? `
+            <div class="generation-loading generation-recover">
+              <h2>这个项目还没有生成成功</h2>
+              <p>可能是在生成过程中刷新、关闭页面或重启服务，导致预览 HTML 没有写入。</p>
+              <span>可以点击“重新生成”，系统会沿用当前页数、受众、场景、比例和风格重新生成相册。</span>
+              <div class="generation-tip">
+                <b>建议操作</b>
+                <span>直接点右上角“重新生成”；如果想保留原需求，也可以在右侧输入补充要求后发送。</span>
+              </div>
+              <button type="button" class="generation-btn primary" id="btn-recover-regenerate">重新生成</button>
+            </div>` : `
+            <div class="generation-loading">
+              <div class="generation-spinner"></div>
+              <h2>正在为你生成「${esc(meta.title || '电子相册')}」</h2>
+              <p>${esc(meta.pages || '5 页')} · 完成后可调整内容并导出 HTML 或 MP4</p>
+              <span>实时进度请查看右侧 AI助手</span>
+              <div class="generation-skeletons" aria-hidden="true">
+                <div class="generation-skeleton-card"></div>
+                <div class="generation-skeleton-card active"></div>
+                <div class="generation-skeleton-card"></div>
+              </div>
+              <div class="generation-tip">
+                <b>宣传相册生成中</b>
+                <span>AI助手会根据你选择的受众、场景和风格自动组织页面结构。</span>
+              </div>
+            </div>`;
   return `
     <main class="generation-page">
       <header class="generation-topbar">
@@ -1275,31 +1615,20 @@ function renderGenerationPage() {
       </header>
 
       <section class="generation-workbench">
+        <aside class="generation-page-rail">
+          <div class="frames-strip" id="frames-strip"></div>
+        </aside>
+
         <div class="generation-main">
           <div class="preview-mode-switch" aria-label="预览模式">
             <button type="button" id="btn-preview-desktop" class="${state.previewMode === 'desktop' ? 'active' : ''}">电脑预览</button>
             <button type="button" id="btn-preview-mobile" class="${state.previewMode === 'mobile' ? 'active' : ''}">手机预览</button>
           </div>
           <div class="generation-preview-shell" id="preview-stage">
-            <div class="generation-loading">
-              <div class="generation-spinner"></div>
-              <h2>正在为你生成「${esc(meta.title || '电子相册')}」</h2>
-              <p>${esc(meta.pages || '5 页')} · 完成后可调整内容并导出 HTML 或 MP4</p>
-              <span>实时进度请查看右侧 AI助手</span>
-              <div class="generation-skeletons" aria-hidden="true">
-                <div class="generation-skeleton-card"></div>
-                <div class="generation-skeleton-card active"></div>
-                <div class="generation-skeleton-card"></div>
-              </div>
-              <div class="generation-tip">
-                <b>宣传相册生成中</b>
-                <span>AI助手会根据你选择的受众、场景和风格自动组织页面结构。</span>
-              </div>
-            </div>
+${previewEmptyHtml}
           </div>
-          <div class="frames-strip" id="frames-strip"></div>
           <div class="right-footer generation-footer">
-            <span class="status" id="footer-status">${esc(meta.title || '电子相册')} · 正在生成</span>
+            <span class="status" id="footer-status">${esc(footerText)}</span>
             <span class="grow"></span>
             <button class="reload-btn" id="btn-reload">刷新预览</button>
           </div>
@@ -1313,14 +1642,23 @@ function renderGenerationPage() {
           <div class="generation-assistant-head">
             <div>
               <h2>AI助手</h2>
-              <p>正在生成相册...</p>
+              <p>${state.composing ? '正在生成相册...' : '用户提示与生成过程'}</p>
             </div>
           </div>
           <div class="generation-progress">
             <span>执行进度</span>
-            <b>${state.composing ? '整理内容 → 规划页面 → 生成文案 → 生成预览' : '已生成，可预览和调整'}</b>
+            <b>${esc(progressText)}</b>
           </div>
           <div class="chat-log generation-chat-log" id="chat-log"></div>
+        </aside>
+
+        <aside class="text-pane generation-text-pane">
+          <div class="text-pane-head">
+            <h2>${t('text_pane.title')}</h2>
+            <span class="save-state" id="text-save-state">${t('text_pane.save_state.idle')}</span>
+            <button class="textfields-toggle" id="btn-textfields-toggle" title="${t('text_pane.collapse')}">&lsaquo;</button>
+          </div>
+          <div class="text-fields" id="text-fields"></div>
           <div class="generation-side-composer ${state.generationComposerOpen ? 'open' : ''}">
             <button type="button" class="composer-disclosure" id="btn-generation-composer-toggle">还有其它修改要求？</button>
             <div class="generation-composer-shell composer-shell" id="composer-shell">
@@ -1358,6 +1696,8 @@ function wireGenerationPage() {
   if (ctaBtn) ctaBtn.onclick = () => openGenerationComposer('请调整最后一页的行动引导 CTA：让联系方式、咨询入口或扫码添加更明确，文案更适合企业客户转化。');
   const regenerateBtn = document.getElementById('btn-generation-regenerate');
   if (regenerateBtn) regenerateBtn.onclick = () => sendGenerationQuickAdjust('请基于当前需求重新生成一版电子相册，保留用户已选择的受众、场景、语气、比例、风格、素材使用方式和行动引导，但重新组织页面结构与表达。');
+  const recoverRegenerateBtn = document.getElementById('btn-recover-regenerate');
+  if (recoverRegenerateBtn) recoverRegenerateBtn.onclick = () => sendGenerationQuickAdjust('请基于当前需求重新生成这本电子相册，保留用户已选择的页数、受众、场景、语气、比例、风格、素材使用方式和行动引导。');
   const desktopBtn = document.getElementById('btn-preview-desktop');
   if (desktopBtn) desktopBtn.onclick = () => setPreviewMode('desktop');
   const mobileBtn = document.getElementById('btn-preview-mobile');
@@ -1478,58 +1818,251 @@ function updateGenerationControls() {
   if (htmlBtn) htmlBtn.disabled = !state.selected?.lastPreviewHtmlPath;
   const mp4Btn = document.getElementById('btn-generation-export-mp4');
   if (mp4Btn) {
-    const canExport = !!(state.selected && (state.selected.templateId || (state.selected.frames?.length ?? 0) > 0));
+    const canExport = !!(state.selected && hasProjectPreview(state.selected));
     mp4Btn.disabled = !canExport || !!state.exporting;
     mp4Btn.textContent = state.exporting ? '导出中...' : '预览满意，导出 MP4';
   }
   const progress = document.querySelector('.generation-progress b');
-  if (progress) progress.textContent = state.composing ? '整理内容 → 规划页面 → 生成文案 → 生成预览' : '已生成，可预览和调整';
+  if (progress) {
+    progress.textContent = state.composing
+      ? '整理内容 → 规划页面 → 生成文案 → 生成预览'
+      : hasProjectPreview(state.selected)
+        ? '已生成，可预览和调整'
+        : '尚未生成预览，请重新生成';
+  }
 }
 
 function renderProjectHistoryPage() {
   return `
     <main class="feature-page">
       <div class="feature-page-inner">
-        <section class="feature-hero">
-          <div class="kicker">Project History</div>
-          <h2>项目历史</h2>
-          <p>集中查看和继续编辑已经创建的电子相册项目。</p>
-        </section>
-        <section class="feature-panel">
-          <div class="feature-panel-head">
-            <div>
-              <h3>全部项目</h3>
-              <p>${state.projects.length} 个项目</p>
+        <section class="feature-panel history-shell">
+          <div class="history-toolbar">
+            <div class="history-title">
+              <h3>历史项目</h3>
+              <p>浏览已创建的电子相册，点击卡片继续预览和编辑。</p>
             </div>
-            <button class="feature-btn primary" id="btn-history-new">新建项目</button>
+            <div class="history-toolbar-actions">
+              <div class="history-count">共 ${state.projects.length} 个项目</div>
+              <button class="feature-btn primary" id="btn-history-new">新建项目</button>
+            </div>
           </div>
-          <div class="history-list" id="history-list"></div>
+          <div class="history-recent" id="history-recent"></div>
+          <div class="history-grid" id="history-list"></div>
         </section>
       </div>
     </main>
   `;
 }
 
+function projectPageCount(project) {
+  const frames = Array.isArray(project?.frames) ? project.frames.length : 0;
+  if (frames > 0) return frames;
+  const pages = Number(project?.preferences?.pages ?? project?.pageCount ?? project?.page_count);
+  return Number.isFinite(pages) && pages > 0 ? pages : null;
+}
+
+function projectAspectLabel(project) {
+  const res = project?.preferences?.resolution;
+  const w = Number(res?.width);
+  const h = Number(res?.height);
+  if (w > 0 && h > 0) {
+    if (Math.abs(w / h - 16 / 9) < 0.03) return '16:9';
+    if (Math.abs(w / h - 9 / 16) < 0.03) return '9:16';
+    if (Math.abs(w / h - 1) < 0.03) return '1:1';
+    return `${w}:${h}`;
+  }
+  return '16:9';
+}
+
+function projectGenerationMeta(project) {
+  return project?.preferences?.generationMeta || readLocalGenerationMetaMap()[project?.id] || {};
+}
+
+function projectPageLabel(project) {
+  const meta = projectGenerationMeta(project);
+  const count = projectPageCount(project);
+  const raw = meta.pages || (count ? `${count} 页` : '');
+  const match = String(raw || '').match(/\d+/);
+  if (match && Number(match[0]) > 0) return `${Number(match[0])} 页`;
+  return '5 页';
+}
+
+function normalizeRatioLabel(value) {
+  const raw = String(value || '').trim();
+  const ratio = raw.match(/(\d+)\s*:\s*(\d+)/);
+  if (ratio) return `${ratio[1]}:${ratio[2]}`;
+  if (/方形|square/i.test(raw)) return '1:1';
+  if (/竖屏|portrait/i.test(raw)) return '9:16';
+  if (/横屏|landscape/i.test(raw)) return '16:9';
+  return '';
+}
+
+function projectRatioLabel(project) {
+  const meta = projectGenerationMeta(project);
+  return normalizeRatioLabel(meta.ratio) || projectAspectLabel(project);
+}
+
+function projectHistoryPreviewSrc(project) {
+  if (!project?.id) return '';
+  const updated = project.updatedAt ?? project.updated_at ?? Date.now();
+  const ver = updated ? new Date(updated).getTime() : Date.now();
+  const frames = Array.isArray(project.frames) ? [...project.frames].sort((a, b) => a.order - b.order) : [];
+  if (frames[0]?.graphNodeId) {
+    return `/preview/${project.id}/frame/${encodeURIComponent(frames[0].graphNodeId)}?thumb=1&v=${ver}`;
+  }
+  if (hasProjectPreview(project)) {
+    return `/preview/${project.id}?thumb=1&albumPage=1&v=${ver}`;
+  }
+  return '';
+}
+
+function renderProjectHistoryCover(project, className = 'history-cover') {
+  const status = projectUserStatus(project);
+  const pageLabel = projectPageLabel(project);
+  const src = projectHistoryPreviewSrc(project);
+  const res = project?.preferences?.resolution ?? { width: 1920, height: 1080 };
+  const nativeW = Number(res.width) || 1920;
+  const nativeH = Number(res.height) || 1080;
+  const baseW = className.includes('recent') ? 300 : 360;
+  const scale = Math.max(0.08, baseW / nativeW);
+  return `
+      <div class="${className} ${src ? 'has-preview' : ''}">
+        ${src ? `<div class="history-cover-preview">
+          <iframe sandbox="allow-scripts allow-same-origin"
+            src="${src}"
+            tabindex="-1"
+            loading="lazy"
+            style="--history-cover-w:${nativeW}px;--history-cover-h:${nativeH}px;--history-cover-scale:${scale}"></iframe>
+        </div>` : `
+        <div class="history-cover-lines" aria-hidden="true">
+          <span></span><span></span><span></span>
+        </div>`}
+        <span class="history-badge status">${esc(status.includes('已生成') ? '已生成' : '草稿')}</span>
+        <span class="history-badge pages">${esc(pageLabel)}</span>
+      </div>`;
+}
+
+function renderProjectHistoryInfo(project, { compact = false } = {}) {
+  const meta = projectGenerationMeta(project);
+  const audience = meta.audience || '潜在客户';
+  const scene = meta.scene || '企业宣传';
+  const style = meta.style || meta.tone || '可预览';
+  const tone = meta.tone || '';
+  const pageLabel = projectPageLabel(project);
+  const ratioLabel = projectRatioLabel(project);
+  const chips = compact
+    ? [audience, scene, style]
+    : [`受众 ${audience}`, `场景 ${scene}`, `风格 ${style}`];
+  return {
+    subtitle: style,
+    detail: tone ? `受众：${audience}  场景：${scene}  语气：${tone}` : `受众：${audience}  场景：${scene}`,
+    pageLabel,
+    ratioLabel,
+    chips,
+  };
+}
+
+function projectSortTime(project) {
+  const raw = project?.updatedAt ?? project?.updated_at ?? project?.createdAt ?? project?.created_at;
+  const time = raw ? new Date(raw).getTime() : 0;
+  return Number.isFinite(time) ? time : 0;
+}
+
+function formatProjectTime(project) {
+  const raw = project?.updatedAt ?? project?.updated_at ?? project?.createdAt ?? project?.created_at;
+  if (!raw) return '刚刚';
+  const d = new Date(raw);
+  if (Number.isNaN(d.getTime())) return '刚刚';
+  return new Intl.DateTimeFormat('zh-CN', {
+    year: 'numeric',
+    month: 'numeric',
+    day: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+  }).format(d);
+}
+
 function renderProjectHistory() {
   const list = document.getElementById('history-list');
+  const recent = document.getElementById('history-recent');
   if (!list) return;
   if (!state.projects.length) {
-    list.innerHTML = `<div class="empty-list">还没有项目，点击上方新建一个。</div>`;
+    if (recent) recent.innerHTML = '';
+    list.innerHTML = `<div class="empty-list">还没有项目，先从“新建相册”开始生成一个。</div>`;
     return;
   }
-  list.innerHTML = state.projects.map((p) => `
-    <div class="history-row">
-      <div>
-        <div class="name">${esc(p.name)}</div>
-        <div class="meta">电子相册 · ${esc(projectUserStatus(p))}</div>
+  const projects = [...state.projects].sort((a, b) => projectSortTime(b) - projectSortTime(a));
+  const latest = projects[0];
+  if (recent && latest) {
+    const status = projectUserStatus(latest);
+    const updated = formatProjectTime(latest);
+    const info = renderProjectHistoryInfo(latest, { compact: true });
+    recent.innerHTML = `
+      <div class="history-recent-label">最近编辑</div>
+      <article class="history-recent-card" data-open-project="${esc(latest.id)}" tabindex="0" role="button">
+        ${renderProjectHistoryCover(latest, 'history-recent-cover')}
+        <div class="history-recent-body">
+          <h4 title="${esc(latest.name)}">${esc(latest.name)}</h4>
+          <p>电子相册 · ${esc(status)}</p>
+          <div class="history-tags">
+            ${info.chips.map((chip) => `<span>${esc(chip)}</span>`).join('')}
+          </div>
+        </div>
+        <div class="history-recent-meta">
+          <span>${esc(info.ratioLabel)}</span>
+          <span>${esc(updated)}</span>
+        </div>
+      </article>
+    `;
+  }
+  list.innerHTML = projects.map((p) => {
+    const status = projectUserStatus(p);
+    const updated = formatProjectTime(p);
+    const info = renderProjectHistoryInfo(p);
+    return `
+    <article class="history-card" data-open-project="${esc(p.id)}" tabindex="0" role="button">
+      ${renderProjectHistoryCover(p)}
+      <div class="history-card-body">
+        <h4 title="${esc(p.name)}">${esc(p.name)}</h4>
+        <div class="kind">${esc(info.subtitle)}</div>
+        <div class="history-detail-line">${esc(info.detail)}</div>
+        <div class="history-tags">
+          ${info.chips.map((chip) => `<span>${esc(chip)}</span>`).join('')}
+        </div>
+        <div class="history-meta-row">
+          <span>${esc(info.ratioLabel)}</span>
+          <span>${esc(updated)}</span>
+        </div>
       </div>
-      <div class="actions">
-        <button class="feature-btn" data-open-project="${esc(p.id)}">打开</button>
+      <div class="history-card-actions">
+        <button class="history-delete-btn" data-delete-project="${esc(p.id)}">删除项目</button>
       </div>
-    </div>
-  `).join('');
-  list.querySelectorAll('[data-open-project]').forEach((btn) => {
-    btn.onclick = () => selectProject(btn.dataset.openProject);
+    </article>`;
+  }).join('');
+  document.querySelectorAll('.history-card[data-open-project], .history-recent-card[data-open-project]').forEach((card) => {
+    card.onclick = (event) => {
+      if (event.target.closest('[data-delete-project]')) return;
+      openProjectStudioPage(card.dataset.openProject);
+    };
+    card.onkeydown = (event) => {
+      if (event.key !== 'Enter' && event.key !== ' ') return;
+      if (event.target.closest('[data-delete-project]')) return;
+      event.preventDefault();
+      openProjectStudioPage(card.dataset.openProject);
+    };
+  });
+  list.querySelectorAll('[data-delete-project]').forEach((btn) => {
+    btn.onclick = async (event) => {
+      event.stopPropagation();
+      const project = state.projects.find((p) => p.id === btn.dataset.deleteProject);
+      if (!project) return;
+      if (!confirm(`删除“${project.name}”？此操作不可撤销。`)) return;
+      await API.deleteProject(project.id);
+      await refreshProjects();
+      renderProjectHistory();
+    };
   });
 }
 
@@ -1802,8 +2335,7 @@ function renderToolbar() {
   // Frames-mode projects don't need a template to export — they have
   // frames[] directly. Single-frame projects still need a template until
   // the v0.x stub is gone.
-  const hasFrames = !!(p && Array.isArray(p.frames) && p.frames.length > 0);
-  exportBtn.disabled = !p || (!p.templateId && !hasFrames) || !!state.exporting;
+  exportBtn.disabled = !p || !hasProjectPreview(p) || !!state.exporting;
   if (state.exporting) {
     exportBtn.textContent = state.exportProgress
       ? t('export.button_running', {
@@ -2024,11 +2556,10 @@ function wireToolbar() {
 function renderMain() {
   const body = document.getElementById('body');
   renderFeatureNav();
-  const page = state.activePage || 'create';
+  const navPage = state.activePage || 'create';
+  const page = navPage === 'workspace' ? 'generating' : navPage;
   document.body.dataset.page = page;
-  body.className = page === 'workspace'
-    ? 'body workspace-body'
-    : page === 'generating'
+  body.className = page === 'generating'
       ? 'body generation-body'
       : 'body feature-body';
   if (page === 'create') {
@@ -2049,9 +2580,13 @@ function renderMain() {
       renderComposer();
       renderFooter();
       renderFramesStrip();
+      renderTextFields();
+      refreshTextFields();
       if (state.selected.lastPreviewHtmlPath || (state.selected.frames?.length ?? 0) > 0) {
         renderPreview();
       }
+      const textToggle = document.getElementById('btn-textfields-toggle');
+      if (textToggle) textToggle.onclick = () => document.body.classList.toggle('textfields-collapsed');
       const sendBtn = document.getElementById('btn-send');
       if (sendBtn) sendBtn.onclick = sendMessage;
       const composerInput = document.getElementById('composer-input');
@@ -2133,6 +2668,15 @@ function renderMain() {
           </div>
         </section>
 
+        <aside class="text-pane">
+          <div class="text-pane-head">
+            <h2>${t('text_pane.title')}</h2>
+            <span class="save-state" id="text-save-state">${t('text_pane.save_state.idle')}</span>
+            <button class="textfields-toggle" id="btn-textfields-toggle" title="${t('text_pane.collapse')}">&lsaquo;</button>
+          </div>
+          <div class="text-fields" id="text-fields"></div>
+        </aside>
+
         <div class="graph-modal" id="graph-modal">
           <div class="panel">
             <header>
@@ -2154,11 +2698,15 @@ function renderMain() {
   document.getElementById('btn-new').onclick = createDefaultProject;
   const togBtn = document.getElementById('btn-sidebar-toggle');
   if (togBtn) togBtn.onclick = () => document.body.classList.toggle('sidebar-collapsed');
+  const textToggle = document.getElementById('btn-textfields-toggle');
+  if (textToggle) textToggle.onclick = () => document.body.classList.toggle('textfields-collapsed');
   if (state.selected) {
     renderChatLog();
     renderComposer();
     renderPreview();
     renderFooter();
+    renderTextFields();
+    refreshTextFields();
     document.getElementById('btn-send').onclick = sendMessage;
     document.getElementById('composer-input').addEventListener('keydown', (e) => {
       if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
@@ -2800,6 +3348,8 @@ function parseCreatePromptSummary(content) {
     pickLine('页数\\/帧数') || pickLine('页数') || pickLine('帧数'),
     pickLine('受众'),
     pickLine('场景'),
+    pickLine('语气'),
+    pickLine('(?:比例|画面尺寸|尺寸)'),
     pickLine('风格'),
     pickLine('素材使用方式'),
     pickLine('行动引导'),
@@ -3183,8 +3733,8 @@ function renderPreview() {
     return;
   }
   // No template + no prior preview → show "send a chat first" placeholder
-  if (!p.templateId && !p.lastPreviewHtmlPath) {
-    stage.innerHTML = `<div class="preview-placeholder"><div><div class="ico">🎞️</div>${t('preview.placeholder.pick_template')}</div></div>`;
+  if (!hasProjectPreview(p)) {
+    stage.innerHTML = `<div class="preview-placeholder"><div><div class="ico">🎞️</div>这个项目还没有生成成功，请点击“重新生成”。</div></div>`;
     renderFramesStrip();
     return;
   }
@@ -3250,6 +3800,9 @@ function renderPreview() {
   // iframe loads. If already in edit mode and we re-rendered, attach now
   // (iframe might already be loaded when reusing a cached preview).
   const iframe = document.getElementById('preview-iframe');
+  if (iframe) {
+    iframe.addEventListener('load', () => syncAlbumPagesFromPreview(iframe), { once: true });
+  }
   if (iframe && state.editTextMode) {
     if (iframe.contentDocument && iframe.contentDocument.readyState === 'complete') {
       attachTextEditOverlay(iframe);
@@ -3262,6 +3815,88 @@ function renderPreview() {
   // (draft / fit) and the per-frame narration line in sync, regardless of which
   // path triggered the change.
   if (typeof window.__hvSyncNarration === 'function') window.__hvSyncNarration();
+}
+
+function getAlbumPagesFromIframe(iframe) {
+  try {
+    const doc = iframe?.contentDocument;
+    if (!doc) return [];
+    return Array.from(doc.querySelectorAll('[data-page]'));
+  } catch {
+    return [];
+  }
+}
+
+function syncAlbumPagesFromPreview(iframe) {
+  const p = state.selected;
+  const hasFrames = Array.isArray(p?.frames) && p.frames.length > 0;
+  if (!p || hasFrames) return;
+  const pages = getAlbumPagesFromIframe(iframe);
+  const nextCount = pages.length;
+  if (nextCount !== state.albumPageCount) {
+    state.albumPageCount = nextCount;
+    state.activeAlbumPage = Math.min(state.activeAlbumPage, Math.max(0, nextCount - 1));
+    renderFramesStrip();
+  }
+  scrollPreviewToAlbumPage(state.activeAlbumPage, 'auto');
+  wireAlbumPageScrollSync(iframe);
+}
+
+function wireAlbumPageScrollSync(iframe) {
+  try {
+    const doc = iframe?.contentDocument;
+    const album = doc?.getElementById('album') || doc?.scrollingElement;
+    const pages = getAlbumPagesFromIframe(iframe);
+    if (!album || pages.length === 0 || album.dataset.hvStudioPageSync === '1') return;
+    album.dataset.hvStudioPageSync = '1';
+    let ticking = false;
+    const update = () => {
+      ticking = false;
+      const albumRect = album.getBoundingClientRect();
+      let bestIndex = 0;
+      let bestDistance = Infinity;
+      pages.forEach((page, index) => {
+        const distance = Math.abs(page.getBoundingClientRect().top - albumRect.top);
+        if (distance < bestDistance) {
+          bestDistance = distance;
+          bestIndex = index;
+        }
+      });
+      if (bestIndex !== state.activeAlbumPage) {
+        state.activeAlbumPage = bestIndex;
+        updateAlbumPageTabActive();
+      }
+    };
+    album.addEventListener('scroll', () => {
+      if (ticking) return;
+      ticking = true;
+      requestAnimationFrame(update);
+    }, { passive: true });
+  } catch {}
+}
+
+function scrollPreviewToAlbumPage(index, behavior = 'smooth') {
+  const iframe = document.getElementById('preview-iframe');
+  const pages = getAlbumPagesFromIframe(iframe);
+  if (!pages.length) return;
+  const safeIndex = Math.max(0, Math.min(pages.length - 1, Number(index) || 0));
+  state.activeAlbumPage = safeIndex;
+  updateAlbumPageTabActive();
+  pages[safeIndex].scrollIntoView({ behavior, block: 'start' });
+}
+
+function scrollAlbumThumbToPage(iframe, index) {
+  const pages = getAlbumPagesFromIframe(iframe);
+  if (!pages.length) return;
+  const safeIndex = Math.max(0, Math.min(pages.length - 1, Number(index) || 0));
+  pages[safeIndex].scrollIntoView({ behavior: 'auto', block: 'start' });
+}
+
+function updateAlbumPageTabActive() {
+  document.querySelectorAll('button.album-page-tab').forEach((btn) => {
+    const pageIndex = Number(btn.dataset.albumPage) || 0;
+    btn.classList.toggle('active', pageIndex === state.activeAlbumPage);
+  });
 }
 
 function togglePreviewEdit() {
@@ -3460,8 +4095,7 @@ function renderFramesStrip() {
   const p = state.selected;
   const frames = p && Array.isArray(p.frames) ? [...p.frames].sort((a, b) => a.order - b.order) : [];
   if (frames.length === 0) {
-    strip.classList.remove('has-frames');
-    strip.innerHTML = '';
+    renderAlbumPagesStrip(strip, p);
     return;
   }
   strip.classList.add('has-frames');
@@ -3547,6 +4181,55 @@ function renderFramesStrip() {
   });
   const gbtn = document.getElementById('btn-show-graph');
   if (gbtn) gbtn.addEventListener('click', openGraphModal);
+}
+
+function renderAlbumPagesStrip(strip, p) {
+  const count = Number(state.albumPageCount) || 0;
+  if (!p || count <= 0) {
+    strip.classList.remove('has-frames');
+    strip.innerHTML = '';
+    return;
+  }
+  strip.classList.add('has-frames');
+  const ver = p.updatedAt ? new Date(p.updatedAt).getTime() : Date.now();
+  const res = p.preferences?.resolution ?? { width: 1920, height: 1080 };
+  const nativeW = res.width || 1920;
+  const nativeH = res.height || 1080;
+  const thumbW = 210;
+  const thumbH = 132;
+  const thumbScale = thumbW / nativeW;
+  const overflowY = Math.max(0, nativeH * thumbScale - thumbH);
+  const thumbOffsetY = -Math.round(overflowY * 0.42);
+  const thumbStyle = `--thumb-native-w:${nativeW}px;--thumb-native-h:${nativeH}px;--thumb-scale:${thumbScale};--thumb-offset-y:${thumbOffsetY}px`;
+  const tabs = Array.from({ length: count }, (_, index) => {
+    const isActive = index === state.activeAlbumPage;
+    const cls = ['frame-tab', 'album-page-tab', isActive && 'active'].filter(Boolean).join(' ');
+    return `<button class="${cls}" data-album-page="${index}">
+      <div class="frame-thumb">
+        <iframe sandbox="allow-scripts allow-same-origin"
+          src="/preview/${p.id}?thumb=1&albumPage=${index + 1}&v=${ver}"
+          data-album-thumb="${index}" tabindex="-1" loading="lazy" style="${thumbStyle}"></iframe>
+      </div>
+      <div class="frame-tab-label">
+        <span class="order">${String(index + 1).padStart(2, '0')}</span>
+        <span class="fid">第 ${index + 1} 页</span>
+      </div>
+    </button>`;
+  }).join('');
+  strip.innerHTML = `<span class="label">相册页</span>${tabs}`;
+  strip.querySelectorAll('button.album-page-tab').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const pageIndex = Number(btn.dataset.albumPage) || 0;
+      state.activeAlbumPage = pageIndex;
+      updateAlbumPageTabActive();
+      scrollPreviewToAlbumPage(pageIndex);
+    });
+  });
+  strip.querySelectorAll('iframe[data-album-thumb]').forEach((iframe) => {
+    iframe.addEventListener('load', () => {
+      scrollAlbumThumbToPage(iframe, Number(iframe.dataset.albumThumb) || 0);
+    }, { once: true });
+  });
 }
 
 async function openGraphModal() {
@@ -3673,8 +4356,102 @@ function autoResize(el) {
   el.style.height = Math.min(el.scrollHeight + 2, 320) + 'px';
 }
 
+const TEXT_FIELD_LABELS_ZH = {
+  company_tagline: '公司标语',
+  brand_name: '品牌名称',
+  cover_eyebrow: '封面眉标题',
+  cover_title: '封面标题',
+  cover_subtitle: '封面副标题',
+  cover_caption: '封面说明',
+  cover_meta_left: '封面左侧提示',
+  cover_meta_right: '封面右侧提示',
+  about_eyebrow: '关于我们眉标题',
+  about_title: '关于我们标题',
+  about_desc: '关于我们介绍',
+  stat_year: '成立年份',
+  stat_year_label: '成立年份标签',
+  stat_clients: '客户数量',
+  stat_clients_label: '客户数量标签',
+  stat_projects: '项目数量',
+  stat_projects_label: '项目数量标签',
+  stat_users: '用户数量',
+  stat_users_label: '用户数量标签',
+  cta_title: '行动引导标题',
+  cta_desc: '行动引导说明',
+  cta_button: '行动按钮',
+  contact_title: '联系标题',
+  contact_desc: '联系说明',
+  contact_phone: '联系电话',
+  contact_email: '联系邮箱',
+  contact_wechat: '联系微信',
+  headline: '主标题',
+  subheadline: '副标题',
+  tagline: '标语',
+  title: '标题',
+  subtitle: '副标题',
+  caption: '说明文字',
+  description: '描述',
+  eyebrow: '眉标题',
+  body: '正文',
+};
+
+const TEXT_FIELD_TOKEN_LABELS_ZH = {
+  about: '关于我们',
+  audience: '受众',
+  body: '正文',
+  brand: '品牌',
+  button: '按钮',
+  caption: '说明',
+  clients: '客户',
+  closing: '结尾',
+  company: '公司',
+  contact: '联系',
+  cover: '封面',
+  cta: '行动引导',
+  desc: '介绍',
+  description: '描述',
+  email: '邮箱',
+  eyebrow: '眉标题',
+  feature: '亮点',
+  headline: '主标题',
+  intro: '介绍',
+  item: '条目',
+  label: '标签',
+  left: '左侧',
+  logo: 'Logo',
+  meta: '提示',
+  name: '名称',
+  page: '页面',
+  phone: '电话',
+  product: '产品',
+  projects: '项目',
+  right: '右侧',
+  stat: '数据',
+  subtitle: '副标题',
+  tagline: '标语',
+  title: '标题',
+  users: '用户',
+  wechat: '微信',
+  year: '年份',
+};
+
 function humanizeKey(key) {
-  return key.replace(/_/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase());
+  const raw = String(key || '').trim();
+  if (!raw) return '';
+  if (TEXT_FIELD_LABELS_ZH[raw]) return TEXT_FIELD_LABELS_ZH[raw];
+
+  const pageMatch = raw.match(/^page_(\d+)_(.+)$/);
+  if (pageMatch) {
+    const pageNo = String(Number(pageMatch[1]));
+    return `第 ${pageNo} 页${humanizeKey(pageMatch[2])}`;
+  }
+
+  const parts = raw.split(/[_\s-]+/).filter(Boolean);
+  const translated = parts.map((part) => {
+    if (/^\d+$/.test(part)) return Number(part).toString();
+    return TEXT_FIELD_TOKEN_LABELS_ZH[part] || part;
+  });
+  return translated.join('');
 }
 
 function scheduleTextSave() {
@@ -3762,7 +4539,7 @@ async function sendMessage() {
   // instead of routing through the agent. The agent has nothing useful
   // to add for a deterministic export action.
   const p = state.selected;
-  const canExport = !!(p && (p.templateId || (p.frames?.length ?? 0) > 0));
+  const canExport = !!(p && hasProjectPreview(p));
   if (canExport && !hasAttachments && isExportIntent(text)) {
     ta.value = '';
     state.messages.push({ role: 'user', content: text, ts: Date.now() });

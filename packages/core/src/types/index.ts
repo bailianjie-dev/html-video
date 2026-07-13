@@ -322,6 +322,7 @@ export interface UserPreferences {
   fontFamilies?: string[];
   language?: string;
   commercial?: boolean;
+  generationMeta?: Record<string, string>;
 }
 
 export type ProjectStatus = 'draft' | 'previewed' | 'rendered';

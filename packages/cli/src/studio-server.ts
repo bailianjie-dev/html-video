@@ -711,6 +711,12 @@ export async function startStudioServer(
           if (typeof body.intent === 'string') {
             project.intent = body.intent.slice(0, 280);
           }
+          if (body.preferences && typeof body.preferences === 'object' && !Array.isArray(body.preferences)) {
+            project.preferences = {
+              ...project.preferences,
+              ...(body.preferences as Record<string, unknown>),
+            };
+          }
           await ctx.projects.save(project);
           return json(res, 200, { project: await ctx.orchestrator.load(id) });
         }
@@ -1703,6 +1709,14 @@ export async function startStudioServer(
           attachments.some((a) => !!a.inlineText),
           focusFrameId,
         );
+        if (phaseInfo.phase === 'generate' || phaseInfo.phase === 'iterate-format') {
+          try {
+            await persistResolutionFromInputs(ctx, id, phaseInfo.inputs);
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            process.stderr.write(`[studio:msg] proj=${id} persist resolution failed: ${msg}\n`);
+          }
+        }
         const t0 = Date.now();
         const operationId = randomUUID();
         // Save the prompt next to the project so we can inspect what we sent.
@@ -2273,6 +2287,13 @@ export async function startStudioServer(
       const filePath = join(uiRoot, path);
       if (filePath.startsWith(uiRoot) && existsSync(filePath) && statSync(filePath).isFile()) {
         return serveFile(filePath, res);
+      }
+
+      const appRoute = url.pathname === '/album-history'
+        || url.pathname === '/image-album'
+        || /^\/album-studio\/[^/]+\/?$/.test(url.pathname);
+      if (appRoute) {
+        return serveFile(join(uiRoot, 'index.html'), res);
       }
 
       res.writeHead(404);
@@ -3325,6 +3346,53 @@ interface PhaseInputs {
   contentTurns?: string[];            // free-text user messages between type-pick and style/format
 }
 
+function normalizeAspectLabel(value?: string): string {
+  const raw = String(value || '').trim();
+  const ratio = /\b(16\s*[:：]\s*9|9\s*[:：]\s*16|1\s*[:：]\s*1|4\s*[:：]\s*5)\b/.exec(raw);
+  if (ratio?.[1]) return ratio[1].replace(/\s/g, '').replace('：', ':');
+  if (/横屏|landscape|wide/i.test(raw)) return '16:9';
+  if (/竖屏|手机|portrait|vertical/i.test(raw)) return '9:16';
+  if (/方形|square/i.test(raw)) return '1:1';
+  if (/小红书|xiaohongshu|rednote/i.test(raw)) return '4:5';
+  return '16:9';
+}
+
+function resolutionForAspect(value?: string): { aspect: string; resolution: string; width: number; height: number } {
+  const aspect = normalizeAspectLabel(value);
+  if (aspect === '9:16') return { aspect, resolution: '1080×1920', width: 1080, height: 1920 };
+  if (aspect === '1:1') return { aspect, resolution: '1080×1080', width: 1080, height: 1080 };
+  if (aspect === '4:5') return { aspect, resolution: '1080×1350', width: 1080, height: 1350 };
+  return { aspect: '16:9', resolution: '1920×1080', width: 1920, height: 1080 };
+}
+
+async function persistResolutionFromInputs(
+  ctx: CliContext,
+  projectId: string,
+  inputs: PhaseInputs,
+): Promise<void> {
+  const aspect = inputs.collected?.aspect;
+  if (!aspect) return;
+  const { width, height } = resolutionForAspect(aspect);
+  const proj = await ctx.projects.load(projectId);
+  const current = proj.preferences?.resolution;
+  if (current?.width === width && current?.height === height) return;
+  proj.preferences = { ...proj.preferences, resolution: { width, height } };
+  await ctx.projects.save(proj);
+}
+
+function configuredOptionLines(collected: Record<string, string>): string[] {
+  const rows: Array<[string, string | undefined]> = [
+    ['受众 / audience', collected.audience],
+    ['场景 / scene', collected.scene],
+    ['语气 / tone', collected.tone],
+    ['素材使用方式 / material use', collected.material_use],
+    ['行动引导 / CTA', collected.cta],
+  ];
+  return rows
+    .filter(([, value]) => !!String(value || '').trim())
+    .map(([label, value]) => `- ${label}: ${value}`);
+}
+
 /** A phase reached during post-generation iteration carries postGen=true so the
  * prompt builder re-uses a card but bases the final regeneration on the existing
  * storyboard rather than starting fresh. */
@@ -3352,9 +3420,16 @@ function parseConfiguredCreateRequest(text: string): PhaseInputs | undefined {
   const audience = pickLine('受众');
   const scene = pickLine('场景');
   const tone = pickLine('语气');
+  const materialUse = pickLine('素材使用方式');
+  const cta = pickLine('行动引导');
 
   const collected: Record<string, string> = {};
   if (aspect) collected.aspect = aspect;
+  if (audience) collected.audience = audience;
+  if (scene) collected.scene = scene;
+  if (tone) collected.tone = tone;
+  if (materialUse) collected.material_use = materialUse;
+  if (cta) collected.cta = cta;
 
   if (/单帧|单画面|标题卡|封面|logo|title.?card|single.?frame|cover|still/i.test(pickedType)) {
     collected.frame_count = '1';
@@ -3369,6 +3444,8 @@ function parseConfiguredCreateRequest(text: string): PhaseInputs | undefined {
     audience ? `受众：${audience}` : '',
     scene ? `场景：${scene}` : '',
     tone ? `语气：${tone}` : '',
+    materialUse ? `素材使用方式：${materialUse}` : '',
+    cta ? `行动引导：${cta}` : '',
     pageCount ? `页数/帧数：${pageCount}` : '',
   ].filter(Boolean).join('；');
 
@@ -4295,7 +4372,7 @@ function buildHtmlGenerationPrompt(args: BuildPromptArgs): string {
     const pickedType = inputs.pickedType ?? '';
     const pickedStyle = inputs.pickedStyle ?? '';
     const contentTurns = inputs.contentTurns ?? [];
-    const aspect = ((collected.aspect ?? '16:9').split(/\s+/)[0] ?? '16:9'); // strip "16:9 横屏" → "16:9"
+    const { aspect, resolution } = resolutionForAspect(collected.aspect);
     const [w, h] = aspect.includes(':') ? aspect.split(':').map(Number) : [16, 9];
     const wantsAlbum = isAlbumType(pickedType)
       || tmpl?.id === 'album-scroll-story'
@@ -4304,12 +4381,6 @@ function buildHtmlGenerationPrompt(args: BuildPromptArgs): string {
     const isMulti = !wantsAlbum && (isMultiFrameType(pickedType)
       || Number(collected.frame_count ?? '1') > 1
       || Number(collected.per_frame ?? '0') > 0);
-
-    // Pick a concrete pixel resolution that respects the aspect choice.
-    let resolution = '1920×1080';
-    if (aspect === '9:16') resolution = '1080×1920';
-    else if (aspect === '1:1') resolution = '1080×1080';
-    else if (aspect === '4:5') resolution = '1080×1350';
 
     const styleLabel = pickedStyle && /^从设计模板选|template/i.test(pickedStyle)
       ? (tmpl ? `(use the selected template "${tmpl.name}" — ${tmpl.description})` : '(let the model choose)')
@@ -4335,6 +4406,11 @@ function buildHtmlGenerationPrompt(args: BuildPromptArgs): string {
       p.push(`- 内容 / content: (the user did not specify; pick a sensible default that fits the type, but keep it generic — no fake brand names)`);
     }
     if (styleLabel) p.push(`- 风格 / style: ${styleLabel}`);
+    const optionLines = configuredOptionLines(collected);
+    if (optionLines.length > 0) {
+      p.push(`- 首页已选配置 / configured options:`);
+      p.push(...optionLines.map((line) => `  ${line}`));
+    }
     p.push(`- 画面尺寸: ${aspect} (${resolution})`);
     p.push(`- 时长: ${collected.duration ?? '?'} 秒`);
     p.push(`- 帧数: ${collected.frame_count ?? (isMulti ? '4' : '1')}`);
@@ -4722,7 +4798,7 @@ async function runSplitMultiFrameGenerate(
       if (existsSync(p)) templateHtml = readFileSync(p, 'utf8');
     } catch { /* fall back to description-only */ }
   }
-  const aspect = ((collected.aspect ?? '16:9').split(/\s+/)[0] ?? '16:9');
+  const { aspect, resolution, width, height } = resolutionForAspect(collected.aspect);
   const frameCountReq = Math.max(2, Math.min(10, Number(collected.frame_count ?? '4') || 4));
   // Opt-in (format card): render data frames natively with Remotion. When on,
   // the planner must give every data node structured items, and after each
@@ -4738,20 +4814,13 @@ async function runSplitMultiFrameGenerate(
   const totalDurationSec = perFrameInput > 0
     ? perFrameDurationSec * frameCountReq
     : (Number(collected.duration ?? '15') || 15);
-  let resolution = '1920×1080';
-  if (aspect === '9:16') resolution = '1080×1920';
-  else if (aspect === '1:1') resolution = '1080×1080';
-  else if (aspect === '4:5') resolution = '1080×1350';
   // Persist the chosen resolution on the project so EXPORT records at the right
   // aspect (it reads project.preferences.resolution; without this it defaulted
   // to 1920×1080 and squashed a 4:5 / 9:16 frame into a 16:9 canvas).
   {
-    const [w, h] = resolution.split('×').map(Number);
-    if (w && h) {
-      const proj = await ctx.projects.load(projectId);
-      proj.preferences = { ...proj.preferences, resolution: { width: w, height: h } };
-      await ctx.projects.save(proj);
-    }
+    const proj = await ctx.projects.load(projectId);
+    proj.preferences = { ...proj.preferences, resolution: { width, height } };
+    await ctx.projects.save(proj);
   }
 
   const styleLabel = pickedStyle && /^从设计模板选|template/i.test(pickedStyle)
@@ -4803,6 +4872,12 @@ async function runSplitMultiFrameGenerate(
     }
   }
   if (styleLabel) graphPromptParts.push(`- 风格 / style: ${styleLabel}`);
+  const optionLines = configuredOptionLines(collected);
+  if (optionLines.length > 0) {
+    graphPromptParts.push(`- 首页已选配置 / configured options:`);
+    graphPromptParts.push(...optionLines.map((line) => `  ${line}`));
+  }
+  graphPromptParts.push(`- 画面尺寸 / aspect: ${aspect} (${resolution})`);
   graphPromptParts.push(`- 总时长: ${totalDurationSec}s split across ${frameCountReq} frames (~${perFrameDurationSec}s each)`);
   graphPromptParts.push('');
   if (sourceTexts.length > 0) {
