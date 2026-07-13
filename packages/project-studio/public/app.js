@@ -84,13 +84,12 @@ const state = {
   // v0.8: multi-frame timeline state
   activeFrameId: null,     // graphNodeId currently shown in iframe
   iterateFocusFrameId: null, // graphNodeId iterations should target only (null = whole video)
-  editTextMode: false,     // when true, preview iframe accepts inline text edits
   exporting: false,        // export run in progress
   exportProgress: null,    // { pct, stage } during a streamed export
   lastGraph: null,         // last fetched ContentGraph (for download)
   generationMeta: null,    // create-page selections shown on the generation page
   generationComposerOpen: false,
-  previewMode: 'desktop',
+  previewZoom: 1.15,
   albumPageCount: 0,
   activeAlbumPage: 0,
   // Phase C: per-frame native Remotion enhancement
@@ -333,12 +332,10 @@ function clearSessionState() {
   state.lastGraph = null;
   state.generationMeta = null;
   state.generationComposerOpen = false;
-  state.previewMode = 'desktop';
   state.albumPageCount = 0;
   state.activeAlbumPage = 0;
   state.activeFrameId = null;
   state.iterateFocusFrameId = null;
-  state.editTextMode = false;
   state.frameKinds = {};
   state.enhancing = null;
   state.textFields = [];
@@ -748,7 +745,6 @@ async function selectProject(id, options = {}) {
   state.iterateFocusFrameId = null;
   state.albumPageCount = 0;
   state.activeAlbumPage = 0;
-  state.editTextMode = false;
   state.enhancing = null;
   // Phase C: map graph node id → kind so the strip can show the "⚡ Enhance"
   // toggle only on data frames. One fetch per project switch.
@@ -805,6 +801,7 @@ function navIcon(name) {
     history: '<path d="M3 12a9 9 0 1 0 3-6.7"/><path d="M3 4v5h5"/><path d="M12 7v6l4 2"/>',
     templates: '<rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/>',
     settings: '<circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 0 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 0 1-4 0v-.2a1.7 1.7 0 0 0-1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 0 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 0 1 0-4h.2a1.7 1.7 0 0 0 1.5-1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 0 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3h.1a1.7 1.7 0 0 0 1-1.5V3a2 2 0 0 1 4 0v.2a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 0 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8v.1a1.7 1.7 0 0 0 1.5 1H21a2 2 0 0 1 0 4h-.2a1.7 1.7 0 0 0-1.4 1Z"/>',
+    attach: '<path d="m21.4 11.6-8.5 8.5a5.2 5.2 0 0 1-7.4-7.4l9.1-9.1a3.5 3.5 0 0 1 5 5l-9.1 9.1a1.8 1.8 0 0 1-2.5-2.5l8.5-8.5"/>',
   };
   return `<svg ${common}>${paths[name] ?? paths.edit}</svg>`;
 }
@@ -1104,7 +1101,7 @@ function buildImageAlbumGenerationMeta() {
     audience: '潜在客户',
     scene: '图片宣传相册',
     tone: '温柔',
-    ratio: selectedOptionText('image-album-ratio') || '16:9 横屏',
+    ratio: selectedOptionText('image-album-ratio') || '9:16 竖屏',
     style: selectedOptionText('image-album-style') || '温暖纪实',
     materialUse: '图片为主文字为辅',
     cta: '联系咨询',
@@ -1188,7 +1185,7 @@ function buildImageAlbumPrompt() {
   const note = document.getElementById('image-album-note')?.value.trim() || '请根据图片内容组织简洁文案。';
   const title = document.getElementById('image-album-title')?.value.trim() || '图片电子相册';
   const style = document.getElementById('image-album-style')?.value || '清爽留白';
-  const ratio = document.getElementById('image-album-ratio')?.value || '16:9 横屏';
+  const ratio = document.getElementById('image-album-ratio')?.value || '9:16 竖屏';
   const names = state.pendingAttachments.map((a, i) => `${i + 1}. ${a.name}`).join('\n');
   return `请根据我上传的图片生成一个电子相册。
 
@@ -1458,9 +1455,9 @@ function renderAlbumPage() {
                 <label class="stack-field">
                   <span>比例</span>
                   <select id="image-album-ratio">
-                    <option>16:9 横屏</option>
-                    <option>9:16 竖屏</option>
-                    <option>1:1 方形</option>
+                  <option>9:16 竖屏</option>
+                  <option>16:9 横屏</option>
+                  <option>1:1 方形</option>
                   </select>
                 </label>
                 <label class="stack-field">
@@ -1609,8 +1606,10 @@ function renderGenerationPage() {
           <button type="button" class="generation-btn" id="btn-generation-image">替换图片</button>
           <button type="button" class="generation-btn" id="btn-generation-cta">调整结尾 CTA</button>
           <button type="button" class="generation-btn" id="btn-generation-regenerate">重新生成</button>
-          <button type="button" class="generation-btn" id="btn-generation-export-html"${canExportHtml ? '' : ' disabled'}>导出 HTML</button>
-          <button type="button" class="generation-btn primary" id="btn-generation-export-mp4"${canExportMp4 ? '' : ' disabled'}>${state.exporting ? '导出中...' : '预览满意，导出 MP4'}</button>
+          <div class="generation-export-actions">
+            <button type="button" class="generation-btn primary" id="btn-generation-export-html"${canExportHtml ? '' : ' disabled'}>导出电子相册</button>
+            <button type="button" class="generation-btn primary" id="btn-generation-export-mp4"${canExportMp4 ? '' : ' disabled'}>${state.exporting ? '导出中...' : '导出视频'}</button>
+          </div>
         </div>
       </header>
 
@@ -1620,9 +1619,14 @@ function renderGenerationPage() {
         </aside>
 
         <div class="generation-main">
-          <div class="preview-mode-switch" aria-label="预览模式">
-            <button type="button" id="btn-preview-desktop" class="${state.previewMode === 'desktop' ? 'active' : ''}">电脑预览</button>
-            <button type="button" id="btn-preview-mobile" class="${state.previewMode === 'mobile' ? 'active' : ''}">手机预览</button>
+          <div class="preview-toolbar" aria-label="预览工具">
+            <div class="preview-zoom-controls" aria-label="预览缩放">
+              <button type="button" id="btn-preview-zoom-out" title="缩小预览">−</button>
+              <input type="range" id="preview-zoom-range" min="70" max="180" step="5" value="${Math.round(getPreviewZoom() * 100)}" aria-label="预览缩放比例" />
+              <button type="button" id="btn-preview-zoom-in" title="放大预览">+</button>
+              <span id="preview-zoom-value">${Math.round(getPreviewZoom() * 100)}%</span>
+              <button type="button" class="fit" id="btn-preview-zoom-fit" title="恢复为适合屏幕">适合</button>
+            </div>
           </div>
           <div class="generation-preview-shell" id="preview-stage">
 ${previewEmptyHtml}
@@ -1665,10 +1669,10 @@ ${previewEmptyHtml}
               <div class="attachments" id="attachments"></div>
               <textarea id="composer-input" rows="3" placeholder="点击上方按钮快速调整，也可以直接输入具体修改要求..."></textarea>
               <div class="actions">
-                <button class="icon-btn" id="btn-attach" title="${t('composer.attach')}">📎</button>
+                <button class="icon-btn attach-btn" id="btn-attach" title="${t('composer.attach')}" aria-label="${t('composer.attach')}">${navIcon('attach')}</button>
                 <input type="file" id="file-input" multiple style="display:none" />
-                <span class="hint">生成后可继续调整</span>
-                <button class="send-btn" id="btn-send" disabled>${t('composer.send')}</button>
+                <span class="hint">可上传参考图或补充资料</span>
+                <button class="send-btn" id="btn-send" disabled>发送调整</button>
               </div>
             </div>
           </div>
@@ -1698,10 +1702,7 @@ function wireGenerationPage() {
   if (regenerateBtn) regenerateBtn.onclick = () => sendGenerationQuickAdjust('请基于当前需求重新生成一版电子相册，保留用户已选择的受众、场景、语气、比例、风格、素材使用方式和行动引导，但重新组织页面结构与表达。');
   const recoverRegenerateBtn = document.getElementById('btn-recover-regenerate');
   if (recoverRegenerateBtn) recoverRegenerateBtn.onclick = () => sendGenerationQuickAdjust('请基于当前需求重新生成这本电子相册，保留用户已选择的页数、受众、场景、语气、比例、风格、素材使用方式和行动引导。');
-  const desktopBtn = document.getElementById('btn-preview-desktop');
-  if (desktopBtn) desktopBtn.onclick = () => setPreviewMode('desktop');
-  const mobileBtn = document.getElementById('btn-preview-mobile');
-  if (mobileBtn) mobileBtn.onclick = () => setPreviewMode('mobile');
+  wirePreviewZoomControls();
   const composerToggle = document.getElementById('btn-generation-composer-toggle');
   if (composerToggle) composerToggle.onclick = () => toggleGenerationComposer();
   const exportHtmlBtn = document.getElementById('btn-generation-export-html');
@@ -1745,11 +1746,35 @@ function toggleGenerationComposer() {
   if (state.generationComposerOpen) document.getElementById('composer-input')?.focus();
 }
 
-function setPreviewMode(mode) {
-  state.previewMode = mode === 'mobile' ? 'mobile' : 'desktop';
-  renderPreview();
-  document.getElementById('btn-preview-desktop')?.classList.toggle('active', state.previewMode === 'desktop');
-  document.getElementById('btn-preview-mobile')?.classList.toggle('active', state.previewMode === 'mobile');
+function getPreviewZoom() {
+  const zoom = Number(state.previewZoom);
+  return Number.isFinite(zoom) ? Math.max(0.7, Math.min(1.8, zoom)) : 1.15;
+}
+
+function setPreviewZoom(zoom, { render = true } = {}) {
+  state.previewZoom = Math.round(Math.max(0.7, Math.min(1.8, Number(zoom) || 1)) * 100) / 100;
+  updatePreviewZoomControls();
+  if (render) renderPreview();
+}
+
+function updatePreviewZoomControls() {
+  const pct = Math.round(getPreviewZoom() * 100);
+  const range = document.getElementById('preview-zoom-range');
+  const value = document.getElementById('preview-zoom-value');
+  if (range) range.value = String(pct);
+  if (value) value.textContent = `${pct}%`;
+}
+
+function wirePreviewZoomControls() {
+  updatePreviewZoomControls();
+  const outBtn = document.getElementById('btn-preview-zoom-out');
+  const inBtn = document.getElementById('btn-preview-zoom-in');
+  const fitBtn = document.getElementById('btn-preview-zoom-fit');
+  const range = document.getElementById('preview-zoom-range');
+  if (outBtn) outBtn.onclick = () => setPreviewZoom(getPreviewZoom() - 0.1);
+  if (inBtn) inBtn.onclick = () => setPreviewZoom(getPreviewZoom() + 0.1);
+  if (fitBtn) fitBtn.onclick = () => setPreviewZoom(1);
+  if (range) range.oninput = (e) => setPreviewZoom(Number(e.target.value) / 100);
 }
 
 function openGenerationStyleModal() {
@@ -1820,7 +1845,7 @@ function updateGenerationControls() {
   if (mp4Btn) {
     const canExport = !!(state.selected && hasProjectPreview(state.selected));
     mp4Btn.disabled = !canExport || !!state.exporting;
-    mp4Btn.textContent = state.exporting ? '导出中...' : '预览满意，导出 MP4';
+    mp4Btn.textContent = state.exporting ? '导出中...' : '导出视频';
   }
   const progress = document.querySelector('.generation-progress b');
   if (progress) {
@@ -3357,8 +3382,56 @@ function parseCreatePromptSummary(content) {
   return { title: title.replace(/\s+/g, ' ').slice(0, 140), rows };
 }
 
+function normalizePersistedStatusMessage(m) {
+  const raw = String(m?.content || '').trim();
+  if (!raw) return null;
+
+  if (m?.messageType === 'system_event') {
+    if (/^⚠️/.test(raw)) return { role: 'system', content: raw };
+    return { role: 'preview-event', content: raw.replace(/^✓\s*/, '') };
+  }
+
+  // Backward compatibility for old messages that were persisted as assistant
+  // prose before status events had their own messageType.
+  if (/^✓\s*updated the HTML preview$/i.test(raw)) {
+    return { role: 'preview-event', content: '预览已刷新' };
+  }
+  if (/^✓\s*HTML preview updated$/i.test(raw)) {
+    return { role: 'preview-event', content: '预览已刷新' };
+  }
+  const frameMatch = /^✓\s*frame\s+(.+?)\s+updated$/i.exec(raw);
+  if (frameMatch) {
+    return { role: 'preview-event', content: `已更新选中页面 ${frameMatch[1]}` };
+  }
+  const storyboardMatch = /^✓\s*(\d+)-frame storyboard (?:generated|regenerated|restyled)\b/i.exec(raw);
+  if (storyboardMatch) {
+    return { role: 'preview-event', content: `已生成 ${storyboardMatch[1]} 页预览` };
+  }
+  if (/^⚠️\s*The agent returned an empty reply/i.test(raw)) {
+    return {
+      role: 'system',
+      content: '⚠️ AI 助手本轮没有返回有效内容。请补充品牌、主题或 1-2 个关键细节后重试。',
+    };
+  }
+  return null;
+}
+
+function isGenerationSuccessMessage(m) {
+  const status = normalizePersistedStatusMessage(m);
+  if (status?.role === 'preview-event') return true;
+  const raw = String(m?.content || '').trim();
+  return /```json#content-graph|故事板规划完成|storyboard (generated|regenerated|restyled)|^✓\s*(?:已生成\s*\d+\s*页预览|预览已更新|updated the HTML preview|HTML preview updated)/i.test(raw);
+}
+
 function renderMessage(m, idx) {
   if (m.role === 'user') {
+    const userContent = (m.content ?? '').trim();
+    if (
+      document.getElementById('chat-log')?.classList.contains('generation-chat-log') &&
+      /^\[(?:hv-confirm|hv-form):/.test(userContent)
+    ) {
+      return '';
+    }
     // User-side form-submission marker carries hidden JSON the user can't read;
     // show a friendlier label instead of a wall of "topic=foo\nheadline=bar…".
     const formMatch = /^\[hv-form:submit\]\n([\s\S]*)$/.exec(m.content ?? '');
@@ -3397,6 +3470,18 @@ function renderMessage(m, idx) {
   }
   // assistant: try each card protocol in turn
   const raw = m.content ?? '';
+  const statusMessage = normalizePersistedStatusMessage(m);
+  if (statusMessage) {
+    const cls = statusMessage.role === 'system' ? 'system' : 'preview-event';
+    return `<div class="msg ${cls}">${esc(statusMessage.content)}</div>`;
+  }
+  const parsedOptions = parseHvOptions(raw);
+  if (
+    parsedOptions.options?.meta?.phase === 'type' &&
+    state.messages.slice(0, idx).some(isGenerationSuccessMessage)
+  ) {
+    return '';
+  }
   const formP = parseHvForm(raw);
   if (formP.form) {
     // Resolve "submitted" from history: any user turn after this card with
@@ -3460,7 +3545,7 @@ function renderMessage(m, idx) {
     </div>`;
   }
   // Default: hv-options + prose
-  const { prose, options } = parseHvOptions(raw);
+  const { prose, options } = parsedOptions;
   // m.pickedOption is in-memory only — wiped on reload. Recover it from
   // history: any user turn AFTER this card is implicitly the answer.
   let picked = m.pickedOption;
@@ -3724,8 +3809,6 @@ function renderOptionCard(opts, picked, msgIdx) {
 function renderPreview() {
   const stage = document.getElementById('preview-stage');
   if (!stage) return;
-  stage.classList.toggle('preview-mobile', state.previewMode === 'mobile');
-  stage.classList.toggle('preview-desktop', state.previewMode !== 'mobile');
   const p = state.selected;
   if (!p) {
     stage.innerHTML = `<div class="preview-placeholder"><div><div class="ico">🎞️</div>${t('preview.placeholder.pick_project')}</div></div>`;
@@ -3759,6 +3842,8 @@ function renderPreview() {
   // at the design's native pixel size and is scaled to fit (scale set on resize).
   const res = p.preferences?.resolution ?? { width: 1920, height: 1080 };
   const vw = res.width || 1920, vh = res.height || 1080;
+  const previewZoom = stage.classList.contains('generation-preview-shell') ? getPreviewZoom() : 1;
+  const zoomStyle = `--preview-user-zoom:${previewZoom};`;
   // Constrain the preview frame along the *long* axis so the whole frame stays
   // contained in the (bounded-height) stage. The base CSS only limits width
   // (width:100%; max-width:1280px) which is right for landscape, but for a
@@ -3766,8 +3851,8 @@ function renderPreview() {
   // only see the top slice. For portrait, limit height instead and let width
   // follow the aspect-ratio. Square stays width-bound.
   const sizeStyle = vh > vw
-    ? 'width:auto;max-width:none;height:100%;max-height:100%'
-    : 'width:100%;max-width:1280px';
+    ? `${zoomStyle}width:auto;max-width:none;height:min(${Math.round(78 * previewZoom)}vh, ${Math.round(820 * previewZoom)}px);max-height:none`
+    : `${zoomStyle}width:${Math.round(100 * previewZoom)}%;max-width:${Math.round(1280 * previewZoom)}px`;
   // A native (enhanced) frame has no HTML — play its rendered preview MP4 and
   // hide the data-hv-text edit affordance (there's no HTML text to edit).
   const activeFrame = sortedFrames.find((f) => f.graphNodeId === state.activeFrameId);
@@ -3782,33 +3867,17 @@ function renderPreview() {
     renderFramesStrip();
     return;
   }
-  // sandbox now grants same-origin so we can attach a text-edit overlay
-  // from the parent window. allow-scripts keeps the page's own animations
-  // running. forms / popups / top-navigation stay blocked.
-  stage.innerHTML = `<div class="preview-frame ${state.editTextMode ? 'editing' : ''}" style="aspect-ratio:${vw}/${vh};${sizeStyle}">
+  // sandbox grants same-origin so Studio can inspect album pages and text fields.
+  // allow-scripts keeps the page's own animations running; forms / popups /
+  // top-navigation stay blocked.
+  stage.innerHTML = `<div class="preview-frame" style="aspect-ratio:${vw}/${vh};${sizeStyle}">
     <iframe id="preview-iframe" sandbox="allow-scripts allow-same-origin" src="${iframeSrc}" style="width:${vw}px;height:${vh}px"></iframe>
     ${stamp ? `<div class="stamp">${esc(stamp)}</div>` : ''}
-    <button class="edit-toggle" id="btn-edit-text"
-      title="${state.editTextMode ? t('preview.edit_text_done_title') : t('preview.edit_text_title')}">
-      ${state.editTextMode ? t('preview.edit_text_on') : t('preview.edit_text_off')}
-    </button>
   </div>`;
   attachPreviewScaler();
-  const editBtn = document.getElementById('btn-edit-text');
-  if (editBtn) editBtn.onclick = togglePreviewEdit;
-  // If the user just toggled into edit mode, attach the overlay once the
-  // iframe loads. If already in edit mode and we re-rendered, attach now
-  // (iframe might already be loaded when reusing a cached preview).
   const iframe = document.getElementById('preview-iframe');
   if (iframe) {
     iframe.addEventListener('load', () => syncAlbumPagesFromPreview(iframe), { once: true });
-  }
-  if (iframe && state.editTextMode) {
-    if (iframe.contentDocument && iframe.contentDocument.readyState === 'complete') {
-      attachTextEditOverlay(iframe);
-    } else {
-      iframe.addEventListener('load', () => attachTextEditOverlay(iframe), { once: true });
-    }
   }
   renderFramesStrip();
   // Convergence point for every frame/preview change → keep soundtrack buttons
@@ -3897,159 +3966,6 @@ function updateAlbumPageTabActive() {
     const pageIndex = Number(btn.dataset.albumPage) || 0;
     btn.classList.toggle('active', pageIndex === state.activeAlbumPage);
   });
-}
-
-function togglePreviewEdit() {
-  state.editTextMode = !state.editTextMode;
-  // When leaving edit mode, force-reload preview so any in-iframe styling
-  // is dropped cleanly.
-  renderPreview();
-}
-
-// Inject hover highlight + click-to-edit on every [data-hv-text] node in
-// the preview iframe. On commit we replace text content in the iframe DOM,
-// serialize it, and PUT to the right endpoint (frame-specific or whole-
-// project preview).
-function attachTextEditOverlay(iframe) {
-  let doc;
-  try { doc = iframe.contentDocument; } catch (err) {
-    console.warn('[hv-edit] iframe.contentDocument blocked:', err);
-    return;
-  }
-  if (!doc) {
-    console.warn('[hv-edit] iframe.contentDocument is null (still loading? sandbox blocking?)');
-    return;
-  }
-  if (!doc.body) {
-    console.warn('[hv-edit] iframe document has no body yet — re-attaching on next load tick');
-    iframe.addEventListener('load', () => attachTextEditOverlay(iframe), { once: true });
-    return;
-  }
-  const tagged = doc.querySelectorAll('[data-hv-text]');
-  console.log(`[hv-edit] attached overlay; found ${tagged.length} [data-hv-text] elements`);
-  if (tagged.length === 0) {
-    toast(t('preview.no_hv_text'), 'warn');
-  }
-  // Idempotent: tear down any prior overlay first.
-  doc.querySelectorAll('[data-hv-edit-style]').forEach((el) => el.remove());
-  const style = doc.createElement('style');
-  style.setAttribute('data-hv-edit-style', '');
-  style.textContent = `
-    [data-hv-text] { outline: 1px dashed rgba(201, 100, 66, .6) !important;
-      outline-offset: 3px !important; cursor: text !important;
-      transition: outline-color .12s, background .12s; }
-    [data-hv-text]:hover { outline: 2px solid rgb(201, 100, 66) !important;
-      background: rgba(201, 100, 66, .08) !important; }
-    [data-hv-text][contenteditable="true"] { outline: 2px solid rgb(201, 100, 66) !important;
-      outline-offset: 3px !important; background: rgba(201, 100, 66, .12) !important; }
-  `;
-  (doc.head || doc.documentElement).appendChild(style);
-
-  let dirty = false;
-  const enableEdit = (el) => {
-    if (el.getAttribute('contenteditable') === 'true') return;
-    el.setAttribute('contenteditable', 'true');
-    el.focus();
-    // Place caret at end
-    const range = doc.createRange();
-    range.selectNodeContents(el);
-    range.collapse(false);
-    const sel = doc.getSelection();
-    if (sel) { sel.removeAllRanges(); sel.addRange(range); }
-  };
-  const finishEdit = async (el) => {
-    if (el.getAttribute('contenteditable') !== 'true') return;
-    el.removeAttribute('contenteditable');
-    if (!dirty) return;
-    dirty = false;
-    await commitInlineTextEdits(iframe);
-  };
-
-  doc.addEventListener('click', (e) => {
-    const target = e.target.closest('[data-hv-text]');
-    if (!target) return;
-    e.preventDefault();
-    e.stopPropagation();
-    enableEdit(target);
-  }, true);
-  doc.addEventListener('input', (e) => {
-    if (e.target.closest && e.target.closest('[data-hv-text]')) {
-      dirty = true;
-    }
-  });
-  doc.addEventListener('keydown', (e) => {
-    const target = e.target.closest && e.target.closest('[data-hv-text][contenteditable="true"]');
-    if (!target) return;
-    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); target.blur(); }
-    if (e.key === 'Escape') { e.preventDefault(); target.blur(); }
-  });
-  doc.addEventListener('focusout', (e) => {
-    const t = e.target;
-    if (t && t.matches && t.matches('[data-hv-text][contenteditable="true"]')) {
-      finishEdit(t);
-    }
-  }, true);
-}
-
-async function commitInlineTextEdits(iframe) {
-  if (!state.selected) return;
-  const projectId = state.selected.id;
-  const fid = state.activeFrameId;
-  const url = fid
-    ? `/api/projects/${projectId}/frames/${encodeURIComponent(fid)}/raw-html`
-    : `/api/projects/${projectId}/raw-html`;
-  // Read the current frame HTML from disk, walk its [data-hv-text] nodes,
-  // sync each one's text from the iframe DOM. We do server-side merging
-  // on the client to keep it simple.
-  let serverHtml;
-  try {
-    const r = await fetch(url);
-    if (!r.ok) throw new Error(`fetch failed ${r.status}`);
-    serverHtml = await r.text();
-  } catch (e) {
-    toast(`保存失败：${e.message}`, 'error');
-    return;
-  }
-  const parser = new DOMParser();
-  const target = parser.parseFromString(serverHtml, 'text/html');
-  const live = iframe.contentDocument;
-  const liveByKey = new Map();
-  if (live) {
-    live.querySelectorAll('[data-hv-text]').forEach((el) => {
-      const k = el.getAttribute('data-hv-text');
-      if (k) liveByKey.set(k, el.textContent ?? '');
-    });
-  }
-  let changed = 0;
-  target.querySelectorAll('[data-hv-text]').forEach((el) => {
-    const k = el.getAttribute('data-hv-text');
-    if (!k || !liveByKey.has(k)) return;
-    const newText = liveByKey.get(k);
-    if (el.textContent !== newText) {
-      el.textContent = newText;
-      changed += 1;
-    }
-  });
-  if (changed === 0) return;
-  // Serialize the doc + ship it back.
-  const out = '<!doctype html>\n' + target.documentElement.outerHTML;
-  try {
-    const r = await fetch(url, {
-      method: 'PUT',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ html: out }),
-    });
-    if (!r.ok) throw new Error(`save failed ${r.status}`);
-    toast(`已保存 ${changed} 处修改`, 'success');
-    // Refresh local project state so frames-strip thumbnails cache-bust.
-    if (fid) {
-      const pr = await API.getProject(projectId);
-      state.selected = pr.project;
-      renderFramesStrip();
-    }
-  } catch (e) {
-    toast(`保存失败：${e.message}`, 'error');
-  }
 }
 
 // Keep --preview-scale on .preview-frame in sync with its rendered width
@@ -4359,6 +4275,7 @@ function autoResize(el) {
 const TEXT_FIELD_LABELS_ZH = {
   company_tagline: '公司标语',
   brand_name: '品牌名称',
+  brand_mark: '品牌标识',
   cover_eyebrow: '封面眉标题',
   cover_title: '封面标题',
   cover_subtitle: '封面副标题',
@@ -4379,6 +4296,7 @@ const TEXT_FIELD_LABELS_ZH = {
   cta_title: '行动引导标题',
   cta_desc: '行动引导说明',
   cta_button: '行动按钮',
+  scroll_hint: '滚动提示',
   contact_title: '联系标题',
   contact_desc: '联系说明',
   contact_phone: '联系电话',
@@ -4393,6 +4311,17 @@ const TEXT_FIELD_LABELS_ZH = {
   description: '描述',
   eyebrow: '眉标题',
   body: '正文',
+  section_label_1: '第 1 组标签',
+  section_label_2: '第 2 组标签',
+  section_label_3: '第 3 组标签',
+  strength_title: '实力标题',
+  strength_desc: '实力介绍',
+  metric_1_num: '数据 1 数值',
+  metric_1_label: '数据 1 标签',
+  metric_2_num: '数据 2 数值',
+  metric_2_label: '数据 2 标签',
+  metric_3_num: '数据 3 数值',
+  metric_3_label: '数据 3 标签',
 };
 
 const TEXT_FIELD_TOKEN_LABELS_ZH = {
@@ -4419,14 +4348,19 @@ const TEXT_FIELD_TOKEN_LABELS_ZH = {
   label: '标签',
   left: '左侧',
   logo: 'Logo',
+  mark: '标识',
   meta: '提示',
+  metric: '数据',
   name: '名称',
   page: '页面',
   phone: '电话',
   product: '产品',
   projects: '项目',
   right: '右侧',
+  scroll: '滚动',
+  section: '区块',
   stat: '数据',
+  strength: '实力',
   subtitle: '副标题',
   tagline: '标语',
   title: '标题',

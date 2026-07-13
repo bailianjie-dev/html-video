@@ -1667,6 +1667,9 @@ export async function startStudioServer(
             exampleHtml = await readFile(exampleHtmlPath, 'utf8');
           }
         }
+        const hasGeneratedPreview =
+          (project.frames ?? []).length > 0 ||
+          !!(priorHtml && (!exampleHtml || priorHtml.trim() !== exampleHtml.trim()));
 
         // Carry source material across turns: a link/file is usually attached
         // on an early turn (e.g. while picking a content type), but generation
@@ -1692,6 +1695,7 @@ export async function startStudioServer(
           }
         }
 
+        const openingTopic = resolveOpeningTopic(project, history);
         const fullPrompt = buildHtmlGenerationPrompt({
           tmpl,
           exampleHtml,
@@ -1700,7 +1704,8 @@ export async function startStudioServer(
           userText,
           attachments,
           focusFrameId: focusFrameId || undefined,
-          openingTopic: resolveOpeningTopic(project, history),
+          hasGeneratedPreview,
+          openingTopic,
         });
         const phaseInfo = detectPhase(
           history,
@@ -1708,6 +1713,7 @@ export async function startStudioServer(
           !!project.templateId,
           attachments.some((a) => !!a.inlineText),
           focusFrameId,
+          hasGeneratedPreview,
         );
         if (phaseInfo.phase === 'generate' || phaseInfo.phase === 'iterate-format') {
           try {
@@ -1767,7 +1773,11 @@ export async function startStudioServer(
         // call individually is reliable, so we orchestrate them ourselves and
         // stream progress events to the UI.
         const routePickedType = phaseInfo.inputs.pickedType ?? lastCardPickByPhase(history, 'type') ?? '';
-        const isAlbumGenerate = isAlbumType(routePickedType) || project.templateId === 'album-scroll-story';
+        const isAlbumGenerate =
+          isAlbumType(routePickedType) ||
+          project.templateId === 'album-scroll-story' ||
+          isAlbumType(openingTopic ?? '') ||
+          looksLikeAlbumHtml(priorHtml);
         const isMultiGenerate =
           phaseInfo.phase === 'generate' &&
           !isAlbumGenerate &&
@@ -1784,7 +1794,7 @@ export async function startStudioServer(
           Number(phaseInfo.inputs.collected?.frame_count ?? '1') > 1;
         let rewriteInputs: PhaseInputs | undefined;
         let restyleOnly = false;
-        if (phaseInfo.phase === 'restyle' && isMultiFrameProject) {
+        if (!isAlbumGenerate && phaseInfo.phase === 'restyle' && isMultiFrameProject) {
           // Keep text, change visual style. pickedStyle is the user's new pick.
           restyleOnly = true;
           rewriteInputs = {
@@ -1793,7 +1803,7 @@ export async function startStudioServer(
             pickedStyle: phaseInfo.inputs.pickedStyle || userText.trim(),
             contentTurns: collectContentTurns(history),
           };
-        } else if (phaseInfo.phase === 'iterate-content' && isMultiFrameProject) {
+        } else if (!isAlbumGenerate && phaseInfo.phase === 'iterate-content' && isMultiFrameProject) {
           // Re-plan around the user's new content instruction.
           const turns = [...collectContentTurns(history), userText].filter((s) => !isControlPhrase(s));
           rewriteInputs = {
@@ -1802,7 +1812,7 @@ export async function startStudioServer(
             pickedStyle: lastCardPickByPhase(history, 'style') ?? phaseInfo.inputs.pickedStyle ?? '',
             contentTurns: turns,
           };
-        } else if (phaseInfo.phase === 'iterate-format' && isMultiFrameProject) {
+        } else if (!isAlbumGenerate && phaseInfo.phase === 'iterate-format' && isMultiFrameProject) {
           // New per-frame timing was submitted; keep content + style, re-render.
           restyleOnly = true; // reuse the existing graph text; only timing/visual recompute
           rewriteInputs = {
@@ -1833,7 +1843,7 @@ export async function startStudioServer(
               priorHtml,
               inputs: rewriteInputs ?? phaseInfo.inputs,
               attachments,
-              openingTopic: resolveOpeningTopic(project, history),
+              openingTopic,
               restyleOnly,
               operationId,
               onProgress: (msg) => {
@@ -1997,6 +2007,12 @@ export async function startStudioServer(
               const extracted = extractHtmlDocument(assistantText);
               if (extracted) {
                 await ctx.orchestrator.writePreviewHtmlRaw(id, isAlbumGenerate ? hardenAlbumHtml(extracted) : extracted);
+                if (isAlbumGenerate) {
+                  const refreshed = await ctx.projects.load(id);
+                  refreshed.frames = [];
+                  delete refreshed.contentGraphPath;
+                  await ctx.projects.save(refreshed);
+                }
                 sseWrite({ type: 'preview_ready', preview_url: `/preview/${id}` });
                 summaryLine = '✓ updated the HTML preview';
               }
@@ -3266,6 +3282,8 @@ interface BuildPromptArgs {
   attachments: Attachment[];
   /** When set, iterate-phase prompts target only this frame's HTML. */
   focusFrameId?: string;
+  /** True when the project already has a real generated preview, not just a template seed. */
+  hasGeneratedPreview?: boolean;
   /** The user's original opening subject, locked across phases. */
   openingTopic?: string;
 }
@@ -3464,9 +3482,11 @@ function detectPhase(
   hasTemplate: boolean,
   hasSourceMaterial = false,
   focusFrameId = '',
+  hasGeneratedPreview = false,
 ): PhaseResult {
   const trimmed = userText.trim();
   const inputs: PhaseInputs = {};
+  const generated = hasGeneratedPreview || hadGenerationYet(history);
 
   // Explicit markers always win.
   if (trimmed.startsWith('[hv-form:submit]')) {
@@ -3492,7 +3512,7 @@ function detectPhase(
   // as a format answer, treat it like a card submit and advance to confirm.
   // This stops the loop where a typed "16:9 横屏 / 5s / 10" goes unrecognised
   // and the flow re-asks the same params in a different shape.
-  if (!hadGenerationYet(history) && lastAssistantAskedFormat(history)) {
+  if (!generated && lastAssistantAskedFormat(history)) {
     const parsed = parseFormatReply(trimmed);
     if (parsed) {
       // Merge over any earlier card submit so partial typed answers keep
@@ -3500,6 +3520,25 @@ function detectPhase(
       inputs.collected = { ...(lastFormSubmission(history) ?? {}), ...parsed };
       return { phase: 'confirm', inputs };
     }
+  }
+
+  if (generated) {
+    const previousFormat = lastFormSubmission(history);
+    if (previousFormat) inputs.collected = previousFormat;
+    const pinned = !!focusFrameId;
+    if (pinned) {
+      return { phase: 'iterate', inputs };
+    }
+
+    inputs.pickedType = lastCardPickByPhase(history, 'type');
+    if (/style|template|brutal|cyber|swiss|\u98ce\u683c|\u6837\u5f0f|\u914d\u8272|\u89c6\u89c9|\u4e3b\u9898\u8272|\u6a21\u677f/i.test(trimmed)) {
+      inputs.pickedStyle = trimmed;
+      return { phase: 'restyle', inputs, postGen: true };
+    }
+
+    inputs.pickedStyle = lastCardPickByPhase(history, 'style') ?? '';
+    inputs.contentTurns = [...collectContentTurns(history), trimmed].filter((s) => !isControlPhrase(s));
+    return { phase: 'iterate-content', inputs, postGen: true };
   }
 
   // Post-generation iteration. Previously ANY message after a generation was
@@ -4044,6 +4083,10 @@ function isAlbumType(text: string): boolean {
   return /电子相册|相册|画册|照片集|photo\s*album|photobook|photo\s*book|album|gallery|scroll\s*story/i.test(text);
 }
 
+function looksLikeAlbumHtml(html: string): boolean {
+  return /ALBUM-SCROLL-STORY|album-scroll-story|scroll-snap-type|data-album-page|albumPage|photo\s*album|electronic\s*album/i.test(html);
+}
+
 function buildStylePhasePrompt(pickedType: string): string {
   const p: string[] = [];
   p.push(`The user has shared their content for a "${pickedType}". Now ask them about visual style with ONE hv-options card. JSON shape EXACTLY as shown — keep "meta" verbatim:`);
@@ -4069,7 +4112,7 @@ function buildStylePhasePrompt(pickedType: string): string {
 }
 
 function buildHtmlGenerationPrompt(args: BuildPromptArgs): string {
-  const { tmpl, exampleHtml, priorHtml, history, userText, attachments, openingTopic } = args;
+  const { tmpl, exampleHtml, priorHtml, history, userText, attachments, openingTopic, hasGeneratedPreview } = args;
 
   // When a template is selected, its own source HTML is the style ground truth —
   // NOT a prior render. Otherwise a project that was previously rendered in some
@@ -4084,7 +4127,16 @@ function buildHtmlGenerationPrompt(args: BuildPromptArgs): string {
   // the topic, so we should not interrogate the user about what the video is
   // about. The source rides into every phase's prompt via `attachments`.
   const hasSourceMaterial = attachments.some((a) => !!a.inlineText);
-  const { phase, inputs } = detectPhase(history, userText, !!tmpl, hasSourceMaterial, args.focusFrameId ?? '');
+  const { phase, inputs } = detectPhase(history, userText, !!tmpl, hasSourceMaterial, args.focusFrameId ?? '', !!hasGeneratedPreview);
+  const isAlbumIteration =
+    !!hasGeneratedPreview &&
+    !args.focusFrameId &&
+    (
+      isAlbumType(inputs.pickedType ?? '') ||
+      tmpl?.id === 'album-scroll-story' ||
+      isAlbumType(openingTopic ?? '') ||
+      looksLikeAlbumHtml(baseHtml ?? '')
+    );
 
   // ---- edit-menu: post-generation "what do you want to change?" card ----
   if (phase === 'edit-menu') {
@@ -4399,6 +4451,7 @@ function buildHtmlGenerationPrompt(args: BuildPromptArgs): string {
     }
     p.push(`Inputs (use these LITERALLY — do NOT make up brand names or facts beyond what is stated):`);
     p.push(`- 类型 / type: ${pickedType || '(未指定)'}`);
+    p.push(`- Output language: use the user's language for ALL visible text. If the request is Chinese, every visible title, label, CTA, hint, and section heading must be Chinese. English is allowed only for proper nouns, URLs, product names, or deliberately requested bilingual copy.`);
     if (contentTurns.length > 0) {
       p.push(`- 内容 / content (what the user told us in the chat):`);
       for (const t of contentTurns) p.push(`  · ${t.replace(/\n/g, ' ').slice(0, 280)}`);
@@ -4438,7 +4491,7 @@ function buildHtmlGenerationPrompt(args: BuildPromptArgs): string {
       p.push(`- Tag visible text with data-hv-text keys so Studio can edit it after generation.`);
       p.push('');
     }
-    p.push(`Constraints: full-bleed ${resolution}, opens with an animation timeline, inline CSS + JS, single complete <!doctype html>...</html> document(s). CDN imports (Tailwind, GSAP) are fine. Tag every visible text node with data-hv-text set to a stable key (brand_name, headline, item_1, cta…). No prose outside code blocks.`);
+    p.push(`Constraints: full-bleed ${resolution}, opens with an animation timeline, inline CSS + JS, single complete <!doctype html>...</html> document(s). CDN imports (Tailwind, GSAP) are fine. Tag every visible text node with data-hv-text set to a stable English key (brand_name, headline, item_1, cta…), but keep the visible text itself in the user's language. No prose outside code blocks.`);
     p.push('');
     // Frame-count safety: claude --print can truncate / stall on very large
     // multi-frame batches. Cap at 10 (high frame counts get progressively
@@ -4557,6 +4610,9 @@ h1{font-size:8vw;letter-spacing:-.03em;animation:in 1.2s ease forwards;opacity:0
   const it: string[] = [];
   if (args.focusFrameId) {
     it.push(`The user has pinned frame "${args.focusFrameId}" and wants to revise ONLY that frame. Apply their request below — write a fresh complete HTML page that delivers the same content, in roughly the same visual style, but with the requested change.`);
+  } else if (isAlbumIteration) {
+    it.push(`The user is iterating on an existing electronic album HTML. Apply their request below by rewriting the CURRENT album as ONE complete standalone interactive HTML document.`);
+    it.push(`Preserve the current album's visual style and existing content unless the user explicitly asks to change them. If the user asks to add a page, add a new scroll-snap album page. If they provide a CTA URL, make the relevant button/link point to that URL. If they attach an image, use its Browser URL as a real <img> asset in the album.`);
   } else {
     it.push(`The user is iterating on an existing HTML video. Apply their request below — write a fresh complete HTML page that delivers the same content, in roughly the same visual style, but with the requested change.`);
   }
@@ -4575,7 +4631,7 @@ h1{font-size:8vw;letter-spacing:-.03em;animation:in 1.2s ease forwards;opacity:0
     // 1 byte ~70% of the time (verified by hand). A summary of the
     // existing content + palette is enough to anchor a clean rewrite.
     const summary = summariseHtmlForIterate(baseHtml);
-    it.push(`# Current frame — what's there now`);
+    it.push(isAlbumIteration ? `# Current album — what's there now` : `# Current frame — what's there now`);
     if (summary.headline) it.push(`Headline: ${summary.headline}`);
     if (summary.subheads.length) it.push(`Sub-text:\n${summary.subheads.map((s) => `  · ${s}`).join('\n')}`);
     if (summary.dataPoints.length) it.push(`Data points:\n${summary.dataPoints.map((s) => `  · ${s}`).join('\n')}`);
@@ -4583,7 +4639,12 @@ h1{font-size:8vw;letter-spacing:-.03em;animation:in 1.2s ease forwards;opacity:0
     if (summary.fontFamilies.length) it.push(`Fonts: ${summary.fontFamilies.join(', ')}`);
     it.push('');
   }
-  it.push(`Output: ONE complete HTML document. Begin your reply with \`\`\`html and end with \`\`\`. Inline all CSS / JS. Full-bleed 1920×1080. Tag visible text with data-hv-text (preserve existing keys when meaningful). No prose outside the block. Do NOT return an empty reply.`);
+  const iterateResolution = resolutionForAspect(inputs.collected?.aspect).resolution;
+  if (isAlbumIteration) {
+    it.push(`Electronic album output requirements: ONE complete <!doctype html> document in a fenced \`\`\`html block. Keep vertical scroll-snap pages, page dots/counter or controls, and data-hv-text tags. Use the current aspect/resolution (${iterateResolution}). All visible text must stay in the user's language; for Chinese requests, translate/avoid English labels like "BRAND STRENGTH" unless they are proper nouns. No prose outside the block. Do NOT return an empty reply.`);
+  } else {
+    it.push(`Output: ONE complete HTML document. Begin your reply with \`\`\`html and end with \`\`\`. Inline all CSS / JS. Full-bleed ${iterateResolution}. Tag visible text with data-hv-text (preserve existing keys when meaningful). All visible text must stay in the user's language. No prose outside the block. Do NOT return an empty reply.`);
+  }
   it.push('');
   it.push(`Skeleton to extend (replace with the real content + visual style):`);
   it.push('```html');
