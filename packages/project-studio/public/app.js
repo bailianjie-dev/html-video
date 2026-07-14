@@ -79,6 +79,9 @@ const state = {
   projectAssetsError: '',
   composing: false,
   textFields: [],          // [{key, original, current}]
+  imageFields: [],         // [{key, original, current, kind}]
+  ctaFields: [],           // [{key, original, current}]
+  colorFields: [],         // [{key, original, current}]
   textSaveTimer: null,
   pendingAttachments: [],  // [{file, dataUrl?, name, kind, size}] before send
   // v0.8: multi-frame timeline state
@@ -89,17 +92,21 @@ const state = {
   lastGraph: null,         // last fetched ContentGraph (for download)
   generationMeta: null,    // create-page selections shown on the generation page
   generationComposerOpen: false,
-  previewZoom: 1.15,
+  previewZoom: 1, // 1 = 刚好适合预览壳；>1 放大可滚动
   albumPageCount: 0,
   activeAlbumPage: 0,
+  albumPageTextEditActive: false, // 电子相册：点「编辑本页」后右侧只显示当前页字段
   // Phase C: per-frame native Remotion enhancement
   frameKinds: {},          // { [graphNodeId]: 'entity'|'data'|'text' } for the selected project
   enhancing: null,         // { nodeId, pct, stage } while a single-frame enhance render is in flight
+  templatePickContext: null, // { source:'chat'|'create', msgIdx?, resumeLabel? }
+  createTemplateId: null,
 };
 
 const ROUTES = {
   create: '/',
   album: '/image-album',
+  templates: '/style-templates',
   history: '/album-history',
   studioPrefix: '/album-studio',
 };
@@ -128,6 +135,7 @@ function routeGenerationJobIdFromSearch(search = window.location.search) {
 function routePageFromPath(pathname = window.location.pathname) {
   if (pathname === ROUTES.history) return 'history';
   if (pathname === ROUTES.album) return 'album';
+  if (pathname === ROUTES.templates) return 'templates';
   if (pathname === '/' || pathname === '/index.html') return 'create';
   return '';
 }
@@ -334,11 +342,15 @@ function clearSessionState() {
   state.generationComposerOpen = false;
   state.albumPageCount = 0;
   state.activeAlbumPage = 0;
+  state.albumPageTextEditActive = false;
   state.activeFrameId = null;
   state.iterateFocusFrameId = null;
   state.frameKinds = {};
   state.enhancing = null;
   state.textFields = [];
+  state.imageFields = [];
+  state.ctaFields = [];
+  state.colorFields = [];
   if (state.textSaveTimer) {
     clearTimeout(state.textSaveTimer);
     state.textSaveTimer = null;
@@ -745,6 +757,7 @@ async function selectProject(id, options = {}) {
   state.iterateFocusFrameId = null;
   state.albumPageCount = 0;
   state.activeAlbumPage = 0;
+  state.albumPageTextEditActive = false;
   state.enhancing = null;
   // Phase C: map graph node id → kind so the strip can show the "⚡ Enhance"
   // toggle only on data frames. One fetch per project switch.
@@ -788,6 +801,7 @@ async function selectProject(id, options = {}) {
 const NAV_ITEMS = [
   { id: 'create', label: '新建相册', desc: 'Agent 规划结构与文案', icon: 'plus' },
   { id: 'album', label: '图片转相册', desc: '照片按顺序一键成片', icon: 'image' },
+  { id: 'templates', label: '风格模板', desc: '预览并套用视觉风格', icon: 'templates' },
   { id: 'history', label: '历史项目', desc: '管理已生成项目', icon: 'history' },
 ];
 
@@ -862,6 +876,7 @@ function setActivePage(page) {
   }
   renderMain();
   renderToolbar();
+  renderFeatureNav();
 }
 
 async function createAlbumProject() {
@@ -1074,6 +1089,50 @@ function selectedOptionText(id) {
   return el?.selectedOptions?.[0]?.textContent?.trim() || el?.value || '';
 }
 
+function selectedCreateTemplate() {
+  const id = state.createTemplateId;
+  if (!id) return null;
+  return state.templates.find((tpl) => tpl.id === id) || null;
+}
+
+function selectedCreateTemplateLabel() {
+  const tpl = selectedCreateTemplate();
+  return tpl?.name || state.createTemplateId || '未选择（使用默认相册模板）';
+}
+
+function selectedCreateTemplateText() {
+  const tpl = selectedCreateTemplate();
+  return tpl ? `从模板库选择：${tpl.name}` : '未选择，按场景自动匹配';
+}
+
+function createSupportedAspects() {
+  const tpl = selectedCreateTemplate();
+  const supported = tpl?.output?.resolution?.supported_aspects;
+  return Array.isArray(supported) && supported.length > 0 ? supported : ['9:16', '16:9', '1:1'];
+}
+
+function createRatioOptionsHtml(selected = '') {
+  const labels = {
+    '9:16': '9:16 竖屏',
+    '16:9': '16:9 横屏',
+    '1:1': '1:1 方形',
+    '4:5': '4:5 小红书',
+  };
+  const aspects = createSupportedAspects();
+  return aspects.map((aspect) => {
+    const label = labels[aspect] || aspect;
+    const isSelected = selected ? label === selected || aspect === selected : aspect === aspects[0];
+    return `<option value="${esc(label)}"${isSelected ? ' selected' : ''}>${esc(label)}</option>`;
+  }).join('');
+}
+
+function syncCreateRatioOptions() {
+  const select = document.getElementById('create-ratio');
+  if (!select) return;
+  const previous = selectedOptionText('create-ratio');
+  select.innerHTML = createRatioOptionsHtml(previous);
+}
+
 function buildCreateGenerationMeta(raw) {
   const title = makeAlbumProjectName(raw);
   return {
@@ -1081,13 +1140,10 @@ function buildCreateGenerationMeta(raw) {
     status: 'draft',
     kind: '电子相册',
     pages: selectedOptionText('create-pages') || '5 页',
-    audience: selectedOptionText('create-audience') || '潜在客户',
     scene: selectedOptionText('create-scene') || '公司介绍',
-    tone: selectedOptionText('create-tone') || '温柔',
     ratio: selectedOptionText('create-ratio') || '9:16 竖屏',
-    style: selectedOptionText('create-style') || '科技深蓝',
-    materialUse: selectedOptionText('create-material-use') || '没有素材也可生成',
-    cta: selectedOptionText('create-cta') || '联系咨询',
+    templateId: state.createTemplateId || null,
+    template: selectedCreateTemplateText(),
   };
 }
 
@@ -1112,8 +1168,10 @@ function buildAlbumPromptFromCreatePage() {
   const pick = (id) => document.getElementById(id)?.value || '';
   const raw = document.getElementById('create-topic-input')?.value.trim() || '';
   const wantsThinking = document.getElementById('btn-create-thinking')?.classList.contains('active');
+  const template = selectedCreateTemplate();
+  const templateText = selectedCreateTemplateText();
   const attachmentNote = state.pendingAttachments.length
-    ? `\n已上传 ${state.pendingAttachments.length} 个素材，请按照“素材使用方式”处理这些素材。`
+    ? `\n已上传 ${state.pendingAttachments.length} 个素材，请优先围绕这些素材组织页面；不足的部分再用文字、图形或合理占位补足。`
     : '';
   return `帮我生成一个电子相册。
 
@@ -1123,17 +1181,14 @@ ${raw}
 生成要求：
 1. 内容类型：电子相册。
 2. 页数：${pick('create-pages')}。
-3. 受众：${pick('create-audience')}。
-4. 场景：${pick('create-scene')}。
-5. 语气：${pick('create-tone')}。
-6. 比例：${pick('create-ratio')}。
-7. 风格：${pick('create-style')}。
-8. 素材使用方式：${pick('create-material-use')}。
-9. 行动引导：${pick('create-cta')}。
-10. 这些页数、受众、场景、语气、比例、风格、素材使用方式、行动引导都已由用户在输入前确认，不要再追问“想做哪种内容”或重复确认配置。
-11. 必须是手机端下滑翻页、PC 端点击下一页查看下一页的交互式 HTML 电子相册。
-12. 页面文案要服务于企业宣传相册，适合直接对外展示：表达可信、重点清晰、避免夸张空话；最后一页必须按“行动引导”生成明确 CTA。
-13. ${wantsThinking ? '请先梳理内容结构，再生成最终 HTML。' : '直接生成最终 HTML。'}${attachmentNote}`;
+3. 场景：${pick('create-scene')}。
+4. 模板：${templateText}。
+5. 比例：${pick('create-ratio')}。
+6. 这些页数、场景、模板、比例都已由用户在输入前确认，不要再追问“想做哪种内容”或重复确认配置。
+7. 必须是手机端下滑翻页、PC 端点击下一页查看下一页的交互式 HTML 电子相册。
+8. 上传了素材就优先使用真实素材；未上传素材也要基于主题生成完整相册，可使用排版、色块、图标、数据卡片和合理占位，不要要求用户补充素材。
+9. 页面文案要服务于当前场景，适合直接对外展示：表达可信、重点清晰、避免夸张空话；如果场景适合转化，最后一页自动生成明确 CTA。
+10. ${template ? `已选择模板：${template.name}（${template.description || template.id}）。请参考该模板的版式、配色、字体和动效生成，而不是简单照搬示例内容。\n` : ''}${wantsThinking ? '请先梳理内容结构，再生成最终 HTML。' : '直接生成最终 HTML。'}${attachmentNote}`;
 }
 
 function renderLandingAttachments() {
@@ -1244,7 +1299,7 @@ async function startImageAlbumFromUploadPage() {
     if (!r?.project) throw new Error('project create failed');
     await refreshProjects();
     try {
-      await API.setTemplate(r.project.id, 'album-scroll-story');
+      await API.setTemplate(r.project.id, state.createTemplateId || 'album-scroll-story');
     } catch (e) {
       toast(`电子相册模板应用失败：${e?.message ?? e}`, 'error');
     }
@@ -1288,7 +1343,7 @@ async function startAlbumFromCreatePage() {
     if (!r?.project) throw new Error('project create failed');
     await refreshProjects();
     try {
-      await API.setTemplate(r.project.id, 'album-scroll-story');
+      await API.setTemplate(r.project.id, state.createTemplateId || 'album-scroll-story');
     } catch (e) {
       toast(`电子相册模板应用失败：${e?.message ?? e}`, 'error');
     }
@@ -1329,28 +1384,12 @@ function renderCreatePage() {
         </div>
 
         <div class="generator-controls">
-          <label><span>页数</span><select id="create-pages"><option>5 页</option><option>3 页</option><option>8 页</option><option>10 页</option></select></label>
-          <label><span>受众</span><select id="create-audience">${renderAlbumAudienceOptions('潜在客户')}</select></label>
           <label><span>场景</span><select id="create-scene">${renderAlbumSceneOptions('公司介绍')}</select></label>
-          <label><span>语气</span><select id="create-tone"><option>温柔</option><option>专业</option><option>活泼</option><option>克制</option></select></label>
-          <label><span>比例</span><select id="create-ratio"><option>9:16 竖屏</option><option>16:9 横屏</option><option>1:1 方形</option></select></label>
-          <label><span>风格</span><select id="create-style">${renderAlbumStyleOptions('科技深蓝')}</select></label>
-          <label><span>素材使用方式</span><select id="create-material-use">
-            <option value="没有素材也可生成：即使用户没有上传素材，也要基于主题生成完整电子相册，可使用排版、色块、图标、数据卡片和合理占位，不要要求用户补充素材。">没有素材也可生成</option>
-            <option value="优先使用上传素材：如果用户上传了图片、Logo、截图或资料，应优先围绕这些素材组织页面；不足的部分再用文字、图形或合理占位补足。">优先使用上传素材</option>
-            <option value="图片为主文字为辅：页面以图片、产品图、场景图或上传素材为主要视觉，文字保持短句说明和标题，不要堆叠长段落。">图片为主文字为辅</option>
-            <option value="文字为主图片点缀：页面以清晰文案、数据、卖点和结构化信息为主，图片只作为品牌氛围、图标或局部点缀。">文字为主图片点缀</option>
-          </select></label>
-          <label><span>行动引导</span><select id="create-cta">
-            <option value="联系咨询：最后一页突出联系方式、咨询按钮或电话/微信入口，引导客户直接联系。">联系咨询</option>
-            <option value="扫码添加：最后一页预留二维码区域，文案引导扫码添加客服、企业微信或公众号。">扫码添加</option>
-            <option value="预约演示：最后一页突出预约演示、体验产品或安排顾问讲解的行动按钮。">预约演示</option>
-            <option value="了解产品：最后一页引导查看产品详情、核心功能、解决方案或产品手册。">了解产品</option>
-            <option value="报名活动：最后一页突出活动报名、席位预约、参会时间和报名入口。">报名活动</option>
-            <option value="下载资料：最后一页引导下载白皮书、产品资料、报价单、案例集或宣传册。">下载资料</option>
-          </select></label>
+          <label class="template-control"><span>模板</span><button type="button" class="template-select-btn" id="btn-create-template">${esc(selectedCreateTemplateLabel())}</button></label>
+          <label><span>页数</span><select id="create-pages"><option>5 页</option><option>3 页</option><option>8 页</option><option>10 页</option></select></label>
+          <label><span>比例</span><select id="create-ratio">${createRatioOptionsHtml('9:16 竖屏')}</select></label>
         </div>
-        <p class="generator-help">以文字主题为主，Agent 自动规划页面结构；上传参考图可选。下方选项调整页数、受众、场景、语气、比例、视觉风格和最后一页 CTA。</p>
+        <p class="generator-help">只需确定场景、模板、页数和比例；素材、语气、行动引导由 Agent 按主题与场景自动处理，生成后仍可继续调整。</p>
 
         <p class="prompt-guide">可以写公司介绍、产品亮点、客户案例、联系方式；也可以直接粘贴公司简介。</p>
         <div class="prompt-field">
@@ -1388,6 +1427,13 @@ function wireCreatePage() {
       }
     };
   });
+  const templateBtn = document.getElementById('btn-create-template');
+  if (templateBtn) {
+    templateBtn.onclick = () => {
+      state.templatePickContext = { source: 'create' };
+      openGallery();
+    };
+  }
   const attachBtn = document.getElementById('btn-create-attach');
   const fileInput = document.getElementById('create-file-input');
   if (attachBtn && fileInput) {
@@ -1407,6 +1453,54 @@ function wireCreatePage() {
   const sendBtn = document.getElementById('btn-create-send');
   if (sendBtn) sendBtn.onclick = startAlbumFromCreatePage;
   renderLandingAttachments();
+  renderCreateTemplateState();
+  syncCreateRatioOptions();
+}
+
+function renderCreateTemplateState() {
+  const el = document.getElementById('btn-create-template');
+  if (el) el.textContent = selectedCreateTemplateLabel();
+}
+
+function chooseTemplateForCreate(tpl) {
+  if (!tpl?.id) return;
+  state.createTemplateId = tpl.id;
+  closeTemplatePreviewModal();
+  closeGallery();
+  setActivePage('create');
+  renderCreateTemplateState();
+  syncCreateRatioOptions();
+  toast(`已选择模板：${tpl.name ?? tpl.id}`, 'success');
+}
+
+async function applyTemplateToCurrentProject(tpl) {
+  if (!tpl?.id) return;
+  if (!state.selected?.id) {
+    toast('请先打开一个项目，再应用模板。', 'warn');
+    return;
+  }
+  const projectId = state.selected.id;
+  const current = state.selected.templateId;
+  if (current && current !== tpl.id) {
+    if (!confirm(t('tpl_preview.replace_confirm', { name: tpl.name ?? tpl.id }))) return;
+  }
+  try {
+    if (current !== tpl.id) await API.setTemplate(projectId, tpl.id);
+    await refreshProjects();
+    state.selected = (await API.getProject(projectId)).project;
+    renderMain();
+    renderToolbar();
+    renderFeatureNav();
+    toast(t('tpl_preview.applied', { name: tpl.name ?? tpl.id }), 'success');
+  } catch (e) {
+    toast(`模板应用失败：${e?.message ?? e}`, 'error');
+  }
+}
+
+function currentGalleryTemplateId() {
+  return state.templatePickContext?.source === 'create'
+    ? state.createTemplateId
+    : state.selected?.templateId;
 }
 
 function renderAlbumPage() {
@@ -1531,23 +1625,15 @@ function renderGenerationPage() {
     status: 'draft',
     kind: '电子相册',
     pages: '5 页',
-    audience: '潜在客户',
     scene: '公司介绍',
-    tone: '温柔',
     ratio: '9:16 竖屏',
-    style: '科技深蓝',
-    materialUse: '没有素材也可生成',
-    cta: '联系咨询',
+    template: '默认相册模板',
   };
   const summaryRows = [
-    ['页数', meta.pages || '5 页'],
-    ['受众', meta.audience || '潜在客户'],
     ['场景', meta.scene || '公司介绍'],
-    ['语气', meta.tone || '温柔'],
+    ['模板', meta.template || '默认相册模板'],
+    ['页数', meta.pages || '5 页'],
     ['比例', meta.ratio || '9:16 竖屏'],
-    ['风格', meta.style || '科技深蓝'],
-    ['素材', meta.materialUse || '没有素材也可生成'],
-    ['行动引导', meta.cta || '联系咨询'],
   ];
   const hasPreview = hasProjectPreview(state.selected);
   const needsRegenerate = !!state.selected && !hasPreview && !state.composing;
@@ -1600,9 +1686,9 @@ function renderGenerationPage() {
           </div>
         </div>
         <div class="generation-actions">
-          <button type="button" class="generation-btn" id="btn-generation-copy">调整文案</button>
+          <button type="button" class="generation-btn" id="btn-generation-copy">改文案</button>
           <button type="button" class="generation-btn" id="btn-generation-style">换风格</button>
-          <button type="button" class="generation-btn" id="btn-generation-pages">改页数</button>
+          <button type="button" class="generation-btn" id="btn-generation-pages">新增页面</button>
           <button type="button" class="generation-btn" id="btn-generation-image">替换图片</button>
           <button type="button" class="generation-btn" id="btn-generation-cta">调整结尾 CTA</button>
           <button type="button" class="generation-btn" id="btn-generation-regenerate">重新生成</button>
@@ -1619,13 +1705,16 @@ function renderGenerationPage() {
         </aside>
 
         <div class="generation-main">
-          <div class="preview-toolbar" aria-label="预览工具">
-            <div class="preview-zoom-controls" aria-label="预览缩放">
+          <div class="preview-toolbar zoom-collapsed" id="preview-toolbar" aria-label="预览工具">
+            <button type="button" class="preview-toolbar-drag" id="preview-toolbar-drag" title="拖动工具栏" aria-label="拖动工具栏">⠿</button>
+            <button type="button" class="preview-edit-page-btn" id="btn-edit-album-page" hidden title="${t('text_pane.edit_page_title')}">${t('text_pane.edit_page')}</button>
+            <button type="button" class="preview-toolbar-chip" id="btn-preview-toolbar-toggle" title="展开/收起缩放" aria-expanded="false">缩放</button>
+            <div class="preview-zoom-controls" id="preview-zoom-panel" aria-label="预览缩放">
               <button type="button" id="btn-preview-zoom-out" title="缩小预览">−</button>
               <input type="range" id="preview-zoom-range" min="70" max="180" step="5" value="${Math.round(getPreviewZoom() * 100)}" aria-label="预览缩放比例" />
               <button type="button" id="btn-preview-zoom-in" title="放大预览">+</button>
               <span id="preview-zoom-value">${Math.round(getPreviewZoom() * 100)}%</span>
-              <button type="button" class="fit" id="btn-preview-zoom-fit" title="恢复为适合屏幕">适合</button>
+              <button type="button" class="fit" id="btn-preview-zoom-fit" title="适合预览区域">适合</button>
             </div>
           </div>
           <div class="generation-preview-shell" id="preview-stage">
@@ -1633,46 +1722,51 @@ ${previewEmptyHtml}
           </div>
           <div class="right-footer generation-footer">
             <span class="status" id="footer-status">${esc(footerText)}</span>
+            <span class="export-format-inline"><b>HTML</b> 网页分享 · <b>MP4</b> 短视频投放</span>
             <span class="grow"></span>
             <button class="reload-btn" id="btn-reload">刷新预览</button>
           </div>
-          <div class="export-format-help">
-            <span><b>HTML</b> 适合网页分享 / 嵌入官网</span>
-            <span><b>MP4</b> 适合视频号、朋友圈、展会屏幕播放</span>
-          </div>
         </div>
 
-        <aside class="generation-assistant">
-          <div class="generation-assistant-head">
-            <div>
-              <h2>AI助手</h2>
-              <p>${state.composing ? '正在生成相册...' : '用户提示与生成过程'}</p>
+        <aside class="text-pane generation-text-pane">
+          <button type="button" class="panel-rail-tab" id="btn-textfields-rail" title="展开本页编辑">本页编辑</button>
+          <div class="text-pane-body">
+            <div class="text-pane-head">
+              <h2>${t('text_pane.title')}</h2>
+              <span class="save-state" id="text-save-state">${t('text_pane.save_state.idle')}</span>
+              <button type="button" class="textfields-done" id="btn-textfields-done" hidden title="${t('text_pane.done_title')}">${t('text_pane.done')}</button>
+              <button type="button" class="panel-collapse-btn textfields-toggle" id="btn-textfields-toggle" title="${t('text_pane.collapse')}">收起</button>
             </div>
+            <div class="text-fields" id="text-fields"></div>
           </div>
-          <div class="generation-progress">
-            <span>执行进度</span>
-            <b>${esc(progressText)}</b>
-          </div>
-          <div class="chat-log generation-chat-log" id="chat-log"></div>
         </aside>
 
-        <aside class="text-pane generation-text-pane">
-          <div class="text-pane-head">
-            <h2>${t('text_pane.title')}</h2>
-            <span class="save-state" id="text-save-state">${t('text_pane.save_state.idle')}</span>
-            <button class="textfields-toggle" id="btn-textfields-toggle" title="${t('text_pane.collapse')}">&lsaquo;</button>
-          </div>
-          <div class="text-fields" id="text-fields"></div>
-          <div class="generation-side-composer ${state.generationComposerOpen ? 'open' : ''}">
-            <button type="button" class="composer-disclosure" id="btn-generation-composer-toggle">还有其它修改要求？</button>
-            <div class="generation-composer-shell composer-shell" id="composer-shell">
-              <div class="attachments" id="attachments"></div>
-              <textarea id="composer-input" rows="3" placeholder="点击上方按钮快速调整，也可以直接输入具体修改要求..."></textarea>
-              <div class="actions">
-                <button class="icon-btn attach-btn" id="btn-attach" title="${t('composer.attach')}" aria-label="${t('composer.attach')}">${navIcon('attach')}</button>
-                <input type="file" id="file-input" multiple style="display:none" />
-                <span class="hint">可上传参考图或补充资料</span>
-                <button class="send-btn" id="btn-send" disabled>发送调整</button>
+        <aside class="generation-assistant">
+          <button type="button" class="panel-rail-tab" id="btn-assistant-rail" title="展开 AI 助手">AI 助手</button>
+          <div class="generation-assistant-body">
+            <div class="generation-assistant-head">
+              <div class="generation-assistant-title">
+                <h2>AI 助手</h2>
+                <p>${state.composing ? '正在生成相册...' : '对话与生成过程'}</p>
+              </div>
+              <button type="button" class="panel-collapse-btn assistant-toggle" id="btn-assistant-toggle" title="收起 AI 助手">收起</button>
+            </div>
+            <div class="generation-progress">
+              <span>执行进度</span>
+              <b>${esc(progressText)}</b>
+            </div>
+            <div class="chat-log generation-chat-log" id="chat-log"></div>
+            <div class="generation-side-composer ${state.generationComposerOpen ? 'open' : ''}">
+              <button type="button" class="composer-disclosure" id="btn-generation-composer-toggle">还有其它修改要求？</button>
+              <div class="generation-composer-shell composer-shell" id="composer-shell">
+                <div class="attachments" id="attachments"></div>
+                <textarea id="composer-input" rows="3" placeholder="点击上方按钮快速调整，也可以直接输入具体修改要求..."></textarea>
+                <div class="actions">
+                  <button class="icon-btn attach-btn" id="btn-attach" title="${t('composer.attach')}" aria-label="${t('composer.attach')}">${navIcon('attach')}</button>
+                  <input type="file" id="file-input" multiple style="display:none" />
+                  <span class="hint">可上传参考图或补充资料</span>
+                  <button class="send-btn" id="btn-send" disabled>发送调整</button>
+                </div>
               </div>
             </div>
           </div>
@@ -1684,27 +1778,66 @@ ${previewEmptyHtml}
 
 function wireGenerationPage() {
   const copyBtn = document.getElementById('btn-generation-copy');
-  if (copyBtn) copyBtn.onclick = () => sendGenerationQuickAdjust('请优化这本电子相册的文案：标题更有吸引力，正文更简洁有说服力，CTA 更明确；保持当前页数、比例和整体结构。');
+  if (copyBtn) copyBtn.onclick = () => openGenerationAdjustModal('copy');
   const styleBtn = document.getElementById('btn-generation-style');
   if (styleBtn) styleBtn.onclick = () => state.selected ? openGenerationStyleModal() : null;
   const pagesBtn = document.getElementById('btn-generation-pages');
-  if (pagesBtn) pagesBtn.onclick = () => state.selected ? openGenerationPagesModal() : null;
+  if (pagesBtn) pagesBtn.onclick = () => state.selected ? openGenerationAdjustModal('add-page') : null;
   const imageBtn = document.getElementById('btn-generation-image');
   if (imageBtn) {
-    imageBtn.onclick = () => {
-      openGenerationComposer('请替换或补充这本电子相册中的图片素材：优先使用我新上传的图片，保持当前内容结构和风格。');
-      document.getElementById('file-input')?.click();
-    };
+    imageBtn.onclick = () => state.selected ? openGenerationAdjustModal('image') : null;
   }
   const ctaBtn = document.getElementById('btn-generation-cta');
-  if (ctaBtn) ctaBtn.onclick = () => openGenerationComposer('请调整最后一页的行动引导 CTA：让联系方式、咨询入口或扫码添加更明确，文案更适合企业客户转化。');
+  if (ctaBtn) ctaBtn.onclick = () => state.selected ? openGenerationAdjustModal('cta') : null;
   const regenerateBtn = document.getElementById('btn-generation-regenerate');
   if (regenerateBtn) regenerateBtn.onclick = () => sendGenerationQuickAdjust('请基于当前需求重新生成一版电子相册，保留用户已选择的受众、场景、语气、比例、风格、素材使用方式和行动引导，但重新组织页面结构与表达。');
   const recoverRegenerateBtn = document.getElementById('btn-recover-regenerate');
   if (recoverRegenerateBtn) recoverRegenerateBtn.onclick = () => sendGenerationQuickAdjust('请基于当前需求重新生成这本电子相册，保留用户已选择的页数、受众、场景、语气、比例、风格、素材使用方式和行动引导。');
+  const editPageBtn = document.getElementById('btn-edit-album-page');
+  if (editPageBtn) editPageBtn.onclick = () => startAlbumPageTextEdit();
   wirePreviewZoomControls();
+  wirePreviewToolbarDrag();
+  // 常态：只收起编辑栏放大预览；AI 助手保持展开，方便看对话
+  document.body.classList.add('textfields-collapsed');
+  document.body.classList.remove('assistant-collapsed');
+  state.albumPageTextEditActive = false;
+  updateAlbumPageEditControls();
+  syncTextPaneToggleUi();
+  syncAssistantToggleUi();
   const composerToggle = document.getElementById('btn-generation-composer-toggle');
   if (composerToggle) composerToggle.onclick = () => toggleGenerationComposer();
+  const assistantToggle = document.getElementById('btn-assistant-toggle');
+  const assistantRail = document.getElementById('btn-assistant-rail');
+  const toggleAssistant = () => {
+    document.body.classList.toggle('assistant-collapsed');
+    syncAssistantToggleUi();
+    scheduleGenerationPreviewLayout();
+  };
+  if (assistantToggle) assistantToggle.onclick = toggleAssistant;
+  if (assistantRail) assistantRail.onclick = () => {
+    document.body.classList.remove('assistant-collapsed');
+    syncAssistantToggleUi();
+    scheduleGenerationPreviewLayout();
+  };
+  const doneBtn = document.getElementById('btn-textfields-done');
+  if (doneBtn) doneBtn.onclick = () => collapsePageTextEdit();
+  const textToggle = document.getElementById('btn-textfields-toggle');
+  const textRail = document.getElementById('btn-textfields-rail');
+  const expandTextPane = async () => {
+    if (isElectronicAlbumProject()) await startAlbumPageTextEdit();
+    else {
+      document.body.classList.remove('textfields-collapsed');
+      syncTextPaneToggleUi();
+      scheduleGenerationPreviewLayout();
+    }
+  };
+  if (textToggle) {
+    textToggle.onclick = async () => {
+      if (document.body.classList.contains('textfields-collapsed')) await expandTextPane();
+      else await collapsePageTextEdit();
+    };
+  }
+  if (textRail) textRail.onclick = () => expandTextPane();
   const exportHtmlBtn = document.getElementById('btn-generation-export-html');
   if (exportHtmlBtn) {
     exportHtmlBtn.onclick = () => {
@@ -1728,32 +1861,245 @@ async function sendGenerationQuickAdjust(text) {
   await sendMessage();
 }
 
-function openGenerationComposer(text = '') {
-  state.generationComposerOpen = true;
-  const panel = document.querySelector('.generation-side-composer');
-  if (panel) panel.classList.add('open');
-  const input = document.getElementById('composer-input');
-  if (input) {
-    if (text) input.value = text;
-    input.focus();
-  }
-}
-
 function toggleGenerationComposer() {
   state.generationComposerOpen = !state.generationComposerOpen;
   const panel = document.querySelector('.generation-side-composer');
   if (panel) panel.classList.toggle('open', state.generationComposerOpen);
-  if (state.generationComposerOpen) document.getElementById('composer-input')?.focus();
+  if (state.generationComposerOpen) {
+    document.body.classList.remove('assistant-collapsed');
+    syncAssistantToggleUi();
+    document.getElementById('composer-input')?.focus();
+  }
+}
+
+function syncAssistantToggleUi() {
+  const btn = document.getElementById('btn-assistant-toggle');
+  const rail = document.getElementById('btn-assistant-rail');
+  const collapsed = document.body.classList.contains('assistant-collapsed');
+  if (btn) {
+    btn.textContent = '收起';
+    btn.title = '收起 AI 助手';
+  }
+  if (rail) {
+    rail.hidden = !collapsed;
+    rail.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+  }
+}
+
+function syncTextPaneToggleUi() {
+  const btn = document.getElementById('btn-textfields-toggle');
+  const rail = document.getElementById('btn-textfields-rail');
+  const collapsed = document.body.classList.contains('textfields-collapsed');
+  if (btn) {
+    btn.textContent = '收起';
+    btn.title = t('text_pane.collapse');
+  }
+  if (rail) {
+    rail.hidden = !collapsed;
+    rail.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+  }
+}
+
+function openGenerationComposer(text = '') {
+  state.generationComposerOpen = true;
+  document.body.classList.remove('assistant-collapsed');
+  syncAssistantToggleUi();
+  scheduleGenerationPreviewLayout();
+  const panel = document.querySelector('.generation-side-composer');
+  if (panel) panel.classList.add('open');
+  const input = document.getElementById('composer-input');
+  if (input) {
+    if (text) {
+      input.value = text;
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+    }
+    input.focus();
+  }
+}
+
+function generationAdjustField(id) {
+  return document.getElementById(`generation-adjust-${id}`)?.value.trim() || '';
+}
+
+function generationAdjustTextarea(id) {
+  return document.getElementById(`generation-adjust-${id}`)?.value.trim() || '';
+}
+
+function renderGenerationAdjustAttachmentCount() {
+  const el = document.getElementById('generation-adjust-attachment-count');
+  if (!el) return;
+  const count = state.pendingAttachments.length;
+  el.textContent = count > 0
+    ? `已选择 ${count} 个附件：${state.pendingAttachments.map((a) => a.name).join('、')}`
+    : '未选择附件';
+}
+
+function generationAdjustFormHtml(type) {
+  if (type === 'copy') {
+    return `
+      <label><span>优化方向</span><textarea id="generation-adjust-requirement" rows="4" placeholder="例如：标题更有吸引力，正文更短，卖点更突出，语气更专业。"></textarea></label>
+      <label><span>需要保留的内容</span><input id="generation-adjust-keep" placeholder="例如：页数、整体风格、已有联系方式、公司名称" /></label>
+      <label><span>不希望出现的内容</span><input id="generation-adjust-avoid" placeholder="例如：不要夸张口号，不要英文标题" /></label>
+    `;
+  }
+  if (type === 'add-page') {
+    return `
+      <label><span>新增页面位置</span><select id="generation-adjust-position">
+        <option>最后一页</option>
+        <option>第一页后</option>
+        <option>当前选中页后</option>
+      </select></label>
+      <label><span>页面标题</span><input id="generation-adjust-title" placeholder="例如：联系我们" /></label>
+      <label><span>页面内容</span><textarea id="generation-adjust-content" rows="4" placeholder="例如：客服电话 400-888-0000、邮箱 contact@example.com。"></textarea></label>
+      <label><span>按钮文案</span><input id="generation-adjust-button" placeholder="例如：立即咨询" /></label>
+      <label><span>按钮链接</span><input id="generation-adjust-link" placeholder="例如：https://www.example.com/contact" /></label>
+      <div class="generation-adjust-upload">
+        <button type="button" id="generation-adjust-upload">上传配图</button>
+        <span id="generation-adjust-attachment-count">未选择附件</span>
+      </div>
+    `;
+  }
+  if (type === 'image') {
+    return `
+      <label><span>图片使用方式</span><select id="generation-adjust-image-mode">
+        <option>替换当前不合适的图片</option>
+        <option>新增到当前相册中</option>
+        <option>作为最后一页主图</option>
+        <option>作为背景图</option>
+      </select></label>
+      <label><span>希望放在哪一页</span><input id="generation-adjust-page" placeholder="例如：第 2 页 / 最后一页 / 由 AI 判断" /></label>
+      <label><span>图片说明</span><textarea id="generation-adjust-content" rows="4" placeholder="说明这张图代表什么，以及希望怎么使用。"></textarea></label>
+      <div class="generation-adjust-upload">
+        <button type="button" id="generation-adjust-upload">上传图片</button>
+        <span id="generation-adjust-attachment-count">未选择附件</span>
+      </div>
+    `;
+  }
+  return `
+    <label><span>CTA 标题</span><input id="generation-adjust-title" placeholder="例如：联系我们 / 开启合作 / 立即咨询" /></label>
+    <label><span>联系方式</span><textarea id="generation-adjust-content" rows="3" placeholder="例如：客服电话 400-888-0000，邮箱 contact@example.com，微信 xxx。"></textarea></label>
+    <label><span>按钮文案</span><input id="generation-adjust-button" placeholder="例如：立即咨询" /></label>
+    <label><span>按钮链接</span><input id="generation-adjust-link" placeholder="例如：https://www.example.com/contact" /></label>
+    <label><span>补充要求</span><textarea id="generation-adjust-requirement" rows="3" placeholder="例如：放在最后一页，按钮更醒目，适合企业客户转化。"></textarea></label>
+  `;
+}
+
+function generationAdjustTitle(type) {
+  return {
+    copy: ['改文案', '只调整相册里的文字表达，尽量保留当前结构、页数和视觉风格。'],
+    'add-page': ['新增页面', '在当前电子相册中新增一页，可以指定标题、内容、按钮和配图。'],
+    image: ['替换图片', '上传参考图或新素材，并说明要替换/新增到哪一页。'],
+    cta: ['调整结尾 CTA', '明确最后一页的联系方式、咨询入口和转化按钮。'],
+  }[type] || ['调整相册', '填写修改要求后，AI 会基于当前相册重新调整。'];
+}
+
+function openGenerationAdjustModal(type) {
+  const modal = document.getElementById('generation-adjust-modal');
+  const title = document.getElementById('generation-adjust-modal-title');
+  const desc = document.getElementById('generation-adjust-desc');
+  const body = document.getElementById('generation-adjust-body');
+  const submit = document.getElementById('generation-adjust-submit');
+  if (!modal || !title || !desc || !body || !submit) return;
+  const [text, sub] = generationAdjustTitle(type);
+  modal.dataset.adjustType = type;
+  title.textContent = text;
+  desc.textContent = sub;
+  body.innerHTML = generationAdjustFormHtml(type);
+  submit.textContent = type === 'add-page' ? '新增页面' : '提交调整';
+  body.querySelector('#generation-adjust-upload')?.addEventListener('click', () => {
+    document.getElementById('file-input')?.click();
+  });
+  renderGenerationAdjustAttachmentCount();
+  modal.classList.add('show');
+  body.querySelector('input, textarea, select')?.focus();
+}
+
+function closeGenerationAdjustModal() {
+  document.getElementById('generation-adjust-modal')?.classList.remove('show');
+}
+
+function buildGenerationAdjustPrompt(type) {
+  if (type === 'copy') {
+    const requirement = generationAdjustTextarea('requirement') || '标题更有吸引力，正文更简洁有说服力，CTA 更明确。';
+    const keep = generationAdjustField('keep');
+    const avoid = generationAdjustField('avoid');
+    return [
+      '请优化这本电子相册的文案。',
+      `优化方向：${requirement}`,
+      keep ? `需要保留：${keep}` : '需要保留：当前页数、整体结构、视觉风格和事实信息。',
+      avoid ? `不要出现：${avoid}` : '',
+      '只修改可见文案，不要无故改变页面数量和主要布局。',
+    ].filter(Boolean).join('\n');
+  }
+  if (type === 'add-page') {
+    const position = generationAdjustField('position') || '最后一页';
+    const title = generationAdjustField('title') || '联系我们';
+    const content = generationAdjustTextarea('content') || '请根据当前相册主题补充联系信息和行动引导。';
+    const button = generationAdjustField('button');
+    const link = generationAdjustField('link');
+    const hasAttachments = state.pendingAttachments.length > 0;
+    return [
+      `请在当前电子相册的${position}新增一页。`,
+      `新增页标题：${title}`,
+      `新增页内容：${content}`,
+      button ? `按钮文案：${button}` : '',
+      link ? `按钮链接：${link}` : '',
+      hasAttachments ? '如果本次上传了图片，请把上传图片作为新增页的主图或背景图使用。' : '',
+      '保持当前相册的比例、整体视觉风格和交互方式不变，只在必要处调整页码、导航点和页面计数。',
+    ].filter(Boolean).join('\n');
+  }
+  if (type === 'image') {
+    const mode = generationAdjustField('image-mode') || '替换当前不合适的图片';
+    const page = generationAdjustField('page') || '由 AI 根据内容判断';
+    const content = generationAdjustTextarea('content');
+    return [
+      '请根据我上传的图片调整这本电子相册的图片素材。',
+      `图片使用方式：${mode}`,
+      `目标页面：${page}`,
+      content ? `图片说明：${content}` : '',
+      '必须优先使用本次上传的图片资源，使用附件里提供的 Browser URL 写入 HTML 的 img src，不要使用本地文件路径或只有文件名。',
+      '保持当前相册文案、页数和视觉风格，除非为了放置图片必须做轻微布局调整。',
+    ].filter(Boolean).join('\n');
+  }
+  const title = generationAdjustField('title') || '联系我们';
+  const content = generationAdjustTextarea('content');
+  const button = generationAdjustField('button') || '立即咨询';
+  const link = generationAdjustField('link');
+  const requirement = generationAdjustTextarea('requirement');
+  return [
+    '请调整这本电子相册最后一页的行动引导 CTA。',
+    `CTA 标题：${title}`,
+    content ? `联系方式/说明：${content}` : '',
+    `按钮文案：${button}`,
+    link ? `按钮链接：${link}` : '',
+    requirement ? `补充要求：${requirement}` : '',
+    '让 CTA 更明确、更适合企业客户转化，并保持当前整体风格。',
+  ].filter(Boolean).join('\n');
+}
+
+async function submitGenerationAdjustModal() {
+  const modal = document.getElementById('generation-adjust-modal');
+  const type = modal?.dataset.adjustType || 'copy';
+  const prompt = buildGenerationAdjustPrompt(type);
+  closeGenerationAdjustModal();
+  openGenerationComposer(prompt);
+  await sendMessage();
 }
 
 function getPreviewZoom() {
   const zoom = Number(state.previewZoom);
-  return Number.isFinite(zoom) ? Math.max(0.7, Math.min(1.8, zoom)) : 1.15;
+  return Number.isFinite(zoom) ? Math.max(0.7, Math.min(1.8, zoom)) : 1;
 }
 
 function setPreviewZoom(zoom, { render = true } = {}) {
   state.previewZoom = Math.round(Math.max(0.7, Math.min(1.8, Number(zoom) || 1)) * 100) / 100;
   updatePreviewZoomControls();
+  const stage = document.getElementById('preview-stage');
+  const frame = stage?.querySelector?.('.preview-frame');
+  if (stage?.classList.contains('generation-preview-shell') && frame) {
+    layoutGenerationPreview(frame);
+    return;
+  }
   if (render) renderPreview();
 }
 
@@ -1771,10 +2117,89 @@ function wirePreviewZoomControls() {
   const inBtn = document.getElementById('btn-preview-zoom-in');
   const fitBtn = document.getElementById('btn-preview-zoom-fit');
   const range = document.getElementById('preview-zoom-range');
+  const toggle = document.getElementById('btn-preview-toolbar-toggle');
+  const toolbar = document.getElementById('preview-toolbar');
   if (outBtn) outBtn.onclick = () => setPreviewZoom(getPreviewZoom() - 0.1);
   if (inBtn) inBtn.onclick = () => setPreviewZoom(getPreviewZoom() + 0.1);
   if (fitBtn) fitBtn.onclick = () => setPreviewZoom(1);
   if (range) range.oninput = (e) => setPreviewZoom(Number(e.target.value) / 100);
+  if (toggle && toolbar) {
+    toggle.onclick = () => {
+      toolbar.classList.toggle('zoom-collapsed');
+      const collapsed = toolbar.classList.contains('zoom-collapsed');
+      toggle.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+      toggle.textContent = collapsed ? '缩放' : '收起';
+    };
+  }
+}
+
+const PREVIEW_TOOLBAR_POS_KEY = 'hv.previewToolbarPos';
+
+function wirePreviewToolbarDrag() {
+  const bar = document.getElementById('preview-toolbar');
+  const main = document.querySelector('.generation-main');
+  const handle = document.getElementById('preview-toolbar-drag');
+  if (!bar || !main || !handle) return;
+
+  try {
+    const saved = JSON.parse(localStorage.getItem(PREVIEW_TOOLBAR_POS_KEY) || 'null');
+    if (saved && Number.isFinite(saved.x) && Number.isFinite(saved.y)) {
+      bar.style.left = `${saved.x}px`;
+      bar.style.top = `${saved.y}px`;
+      bar.style.right = 'auto';
+      bar.classList.add('is-dragged');
+    }
+  } catch { /* ignore */ }
+
+  let dragging = false;
+  let offsetX = 0;
+  let offsetY = 0;
+
+  const clampPos = (x, y) => {
+    const maxX = Math.max(8, main.clientWidth - bar.offsetWidth - 8);
+    const maxY = Math.max(8, main.clientHeight - bar.offsetHeight - 8);
+    return {
+      x: Math.max(8, Math.min(x, maxX)),
+      y: Math.max(8, Math.min(y, maxY)),
+    };
+  };
+
+  handle.addEventListener('pointerdown', (e) => {
+    if (e.button != null && e.button !== 0) return;
+    dragging = true;
+    bar.classList.add('is-dragging');
+    const rect = bar.getBoundingClientRect();
+    offsetX = e.clientX - rect.left;
+    offsetY = e.clientY - rect.top;
+    try { handle.setPointerCapture(e.pointerId); } catch { /* ignore */ }
+    e.preventDefault();
+  });
+
+  handle.addEventListener('pointermove', (e) => {
+    if (!dragging) return;
+    const mainRect = main.getBoundingClientRect();
+    const next = clampPos(
+      e.clientX - mainRect.left - offsetX,
+      e.clientY - mainRect.top - offsetY,
+    );
+    bar.style.left = `${next.x}px`;
+    bar.style.top = `${next.y}px`;
+    bar.style.right = 'auto';
+    bar.classList.add('is-dragged');
+  });
+
+  const endDrag = () => {
+    if (!dragging) return;
+    dragging = false;
+    bar.classList.remove('is-dragging');
+    const x = parseFloat(bar.style.left);
+    const y = parseFloat(bar.style.top);
+    if (Number.isFinite(x) && Number.isFinite(y)) {
+      localStorage.setItem(PREVIEW_TOOLBAR_POS_KEY, JSON.stringify({ x, y }));
+    }
+  };
+  handle.addEventListener('pointerup', endDrag);
+  handle.addEventListener('pointercancel', endDrag);
 }
 
 function openGenerationStyleModal() {
@@ -1970,18 +2395,16 @@ function renderProjectHistoryCover(project, className = 'history-cover') {
 
 function renderProjectHistoryInfo(project, { compact = false } = {}) {
   const meta = projectGenerationMeta(project);
-  const audience = meta.audience || '潜在客户';
   const scene = meta.scene || '企业宣传';
-  const style = meta.style || meta.tone || '可预览';
-  const tone = meta.tone || '';
+  const template = meta.template || meta.style || '默认模板';
   const pageLabel = projectPageLabel(project);
   const ratioLabel = projectRatioLabel(project);
   const chips = compact
-    ? [audience, scene, style]
-    : [`受众 ${audience}`, `场景 ${scene}`, `风格 ${style}`];
+    ? [scene, template, ratioLabel]
+    : [`场景 ${scene}`, `模板 ${template}`, `比例 ${ratioLabel}`];
   return {
-    subtitle: style,
-    detail: tone ? `受众：${audience}  场景：${scene}  语气：${tone}` : `受众：${audience}  场景：${scene}`,
+    subtitle: template,
+    detail: `场景：${scene}  模板：${template}  页数：${pageLabel}`,
     pageLabel,
     ratioLabel,
     chips,
@@ -2185,8 +2608,8 @@ function renderTemplatesPage() {
       <div class="feature-page-inner">
         <section class="feature-hero">
           <div class="kicker">Template Library</div>
-          <h2>模板库</h2>
-          <p>先浏览模板效果，再决定是否应用到当前项目。</p>
+          <h2>风格模板</h2>
+          <p>可视化预览模板效果，选择后用于新建相册；已有项目也可以直接套用。</p>
         </section>
         <section class="feature-panel">
           <div class="feature-panel-head">
@@ -2194,7 +2617,7 @@ function renderTemplatesPage() {
               <h3>可用模板</h3>
               <p>${state.templates.length} 个模板</p>
             </div>
-            <button class="feature-btn primary" id="btn-template-new">新建项目</button>
+            <button class="feature-btn primary" id="btn-template-new">返回创建相册</button>
           </div>
           <div class="gallery feature-template-grid" id="feature-template-grid"></div>
         </section>
@@ -2526,6 +2949,7 @@ function wireToolbar() {
         toast(t('composer.placeholder.no_project'), 'error');
         return;
       }
+      state.templatePickContext = null;
       openGallery();
     };
   }
@@ -2611,7 +3035,12 @@ function renderMain() {
         renderPreview();
       }
       const textToggle = document.getElementById('btn-textfields-toggle');
-      if (textToggle) textToggle.onclick = () => document.body.classList.toggle('textfields-collapsed');
+      // Generation page wires its own collapse/expand (default collapsed).
+      if (textToggle && !document.querySelector('.generation-page')) {
+        textToggle.onclick = () => document.body.classList.toggle('textfields-collapsed');
+      }
+      const doneBtn = document.getElementById('btn-textfields-done');
+      if (doneBtn) doneBtn.onclick = () => collapsePageTextEdit();
       const sendBtn = document.getElementById('btn-send');
       if (sendBtn) sendBtn.onclick = sendMessage;
       const composerInput = document.getElementById('composer-input');
@@ -2644,7 +3073,7 @@ function renderMain() {
     const grid = document.getElementById('feature-template-grid');
     if (grid) renderTemplateGrid(grid);
     const newBtn = document.getElementById('btn-template-new');
-    if (newBtn) newBtn.onclick = createDefaultProject;
+    if (newBtn) newBtn.onclick = () => setActivePage('create');
     return;
   }
   if (page === 'settings') {
@@ -3050,6 +3479,7 @@ function addAttachments(files) {
     }
   }
   renderAttachments();
+  renderGenerationAdjustAttachmentCount();
   renderImageAlbumAttachments();
   renderLandingAttachments();
 }
@@ -3057,6 +3487,7 @@ function addAttachments(files) {
 function removeAttachment(i) {
   state.pendingAttachments.splice(i, 1);
   renderAttachments();
+  renderGenerationAdjustAttachmentCount();
 }
 
 function renderAttachments() {
@@ -3193,6 +3624,11 @@ function renderChatLog() {
       if (!options) return;
       const picked = options.options[optI];
       const label = picked?.label ?? '';
+      if (shouldOpenTemplateGalleryOption(label, options)) {
+        state.templatePickContext = { source: 'chat', msgIdx, resumeLabel: label };
+        openGallery();
+        return;
+      }
       m.pickedOption = label;
       // Fire as a new user turn
       pickAndSend(label);
@@ -3353,6 +3789,15 @@ async function pickAndSend(label) {
   if (ta) ta.value = label;
   renderChatLog(); // shows the picked highlight on the previous message
   await sendMessage();
+}
+
+function shouldOpenTemplateGalleryOption(label, options) {
+  const phase = options?.meta?.phase;
+  if (phase !== 'style' && phase !== 'need-template') return false;
+  const text = String(label || '').trim();
+  if (!text) return false;
+  if (/已选|选好|继续|done|ready|next|continue/i.test(text)) return false;
+  return /模板|模版|template|design template|template gallery/i.test(text);
 }
 
 function parseCreatePromptSummary(content) {
@@ -3842,17 +4287,16 @@ function renderPreview() {
   // at the design's native pixel size and is scaled to fit (scale set on resize).
   const res = p.preferences?.resolution ?? { width: 1920, height: 1080 };
   const vw = res.width || 1920, vh = res.height || 1080;
-  const previewZoom = stage.classList.contains('generation-preview-shell') ? getPreviewZoom() : 1;
-  const zoomStyle = `--preview-user-zoom:${previewZoom};`;
-  // Constrain the preview frame along the *long* axis so the whole frame stays
-  // contained in the (bounded-height) stage. The base CSS only limits width
-  // (width:100%; max-width:1280px) which is right for landscape, but for a
-  // portrait frame (vh>vw) that lets it grow ~2275px tall and overflow — you'd
-  // only see the top slice. For portrait, limit height instead and let width
-  // follow the aspect-ratio. Square stays width-bound.
-  const sizeStyle = vh > vw
-    ? `${zoomStyle}width:auto;max-width:none;height:min(${Math.round(78 * previewZoom)}vh, ${Math.round(820 * previewZoom)}px);max-height:none`
-    : `${zoomStyle}width:${Math.round(100 * previewZoom)}%;max-width:${Math.round(1280 * previewZoom)}px`;
+  const isGenShell = stage.classList.contains('generation-preview-shell');
+  // Non-generation workspace still uses the older %-of-container sizing.
+  // Generation shell uses layoutGenerationPreview() → contain + center in avail box.
+  const previewZoom = isGenShell ? 1 : getPreviewZoom();
+  const zoomStyle = `--preview-user-zoom:${getPreviewZoom()};`;
+  const sizeStyle = isGenShell
+    ? `${zoomStyle}width:auto;height:auto;max-width:none;max-height:none`
+    : (vh > vw
+      ? `${zoomStyle}width:auto;max-width:none;height:min(${Math.round(78 * previewZoom)}vh, ${Math.round(820 * previewZoom)}px);max-height:none`
+      : `${zoomStyle}width:${Math.round(100 * previewZoom)}%;max-width:${Math.round(1280 * previewZoom)}px`);
   // A native (enhanced) frame has no HTML — play its rendered preview MP4 and
   // hide the data-hv-text edit affordance (there's no HTML text to edit).
   const activeFrame = sortedFrames.find((f) => f.graphNodeId === state.activeFrameId);
@@ -3877,7 +4321,10 @@ function renderPreview() {
   attachPreviewScaler();
   const iframe = document.getElementById('preview-iframe');
   if (iframe) {
-    iframe.addEventListener('load', () => syncAlbumPagesFromPreview(iframe), { once: true });
+    iframe.addEventListener('load', () => {
+      syncAlbumPagesFromPreview(iframe);
+      wirePreviewTextLocate(iframe);
+    });
   }
   renderFramesStrip();
   // Convergence point for every frame/preview change → keep soundtrack buttons
@@ -3896,6 +4343,115 @@ function getAlbumPagesFromIframe(iframe) {
   }
 }
 
+function getAlbumPagesFromDoc(doc) {
+  if (!doc) return [];
+  return Array.from(doc.querySelectorAll('[data-page]'));
+}
+
+function isElectronicAlbumProject() {
+  const p = state.selected;
+  if (!p) return false;
+  if (Array.isArray(p.frames) && p.frames.length > 0) return false;
+  return (Number(state.albumPageCount) || 0) > 0;
+}
+
+function syncTextPaneTitle() {
+  const h2 = document.querySelector('.text-pane-head h2');
+  if (!h2) return;
+  if (isElectronicAlbumProject() && state.albumPageTextEditActive) {
+    h2.textContent = t('text_pane.page_title', { n: (state.activeAlbumPage || 0) + 1 });
+  } else {
+    h2.textContent = t('text_pane.title');
+  }
+}
+
+function updateAlbumPageEditControls() {
+  const btn = document.getElementById('btn-edit-album-page');
+  const show = isElectronicAlbumProject();
+  if (btn) {
+    btn.hidden = !show;
+    btn.classList.toggle('active', !!state.albumPageTextEditActive);
+    const pageNo = (state.activeAlbumPage || 0) + 1;
+    btn.textContent = state.albumPageTextEditActive
+      ? t('text_pane.editing_page', { n: pageNo })
+      : t('text_pane.edit_page');
+    btn.title = t('text_pane.edit_page_title');
+  }
+  document.querySelectorAll('.album-page-edit').forEach((el) => {
+    const pageIndex = Number(el.dataset.albumPage) || 0;
+    el.classList.toggle(
+      'active',
+      !!state.albumPageTextEditActive && pageIndex === state.activeAlbumPage,
+    );
+  });
+  const doneBtn = document.getElementById('btn-textfields-done');
+  if (doneBtn) {
+    const showDone = !!state.albumPageTextEditActive && !document.body.classList.contains('textfields-collapsed');
+    doneBtn.hidden = !showDone;
+  }
+  syncTextPaneTitle();
+  syncTextPaneToggleUi();
+}
+
+async function flushTextEditsIfNeeded() {
+  clearTimeout(state.textSaveTimer);
+  state.textSaveTimer = null;
+  const dirty = state.textFields.some((f) => f.current !== f.original);
+  if (dirty) await commitTextEdits();
+}
+
+/** 收起编辑栏，预览回到最大。换页 / 点完成时调用。 */
+async function collapsePageTextEdit() {
+  await flushTextEditsIfNeeded();
+  const wasActive = state.albumPageTextEditActive;
+  state.albumPageTextEditActive = false;
+  document.body.classList.add('textfields-collapsed');
+  clearPreviewFieldHighlight();
+  updateAlbumPageEditControls();
+  if (wasActive) await refreshTextFields();
+  scheduleGenerationPreviewLayout();
+}
+
+async function startAlbumPageTextEdit(pageIndex) {
+  if (!state.selected || !isElectronicAlbumProject()) return;
+  if (typeof pageIndex === 'number' && !Number.isNaN(pageIndex)) {
+    state.activeAlbumPage = Math.max(0, Math.min((state.albumPageCount || 1) - 1, pageIndex));
+    updateAlbumPageTabActive();
+    scrollPreviewToAlbumPage(state.activeAlbumPage);
+  }
+  await flushTextEditsIfNeeded();
+  state.albumPageTextEditActive = true;
+  document.body.classList.remove('textfields-collapsed');
+  updateAlbumPageEditControls();
+  await refreshTextFields();
+  scheduleGenerationPreviewLayout();
+  const wrap = document.getElementById('text-fields');
+  wrap?.querySelector('textarea')?.focus();
+}
+
+async function selectAlbumPage(pageIndex, { startEdit = false } = {}) {
+  const safeIndex = Math.max(0, Math.min((state.albumPageCount || 1) - 1, Number(pageIndex) || 0));
+  const pageChanged = safeIndex !== state.activeAlbumPage;
+  if (pageChanged) await flushTextEditsIfNeeded();
+  state.activeAlbumPage = safeIndex;
+  updateAlbumPageTabActive();
+  scrollPreviewToAlbumPage(safeIndex);
+  if (startEdit) {
+    state.albumPageTextEditActive = true;
+    document.body.classList.remove('textfields-collapsed');
+    updateAlbumPageEditControls();
+    await refreshTextFields();
+    scheduleGenerationPreviewLayout();
+    return;
+  }
+  // 换页且不是点「编辑本页」：自动收起，预览最大化
+  if (pageChanged || state.albumPageTextEditActive) {
+    await collapsePageTextEdit();
+  } else {
+    updateAlbumPageEditControls();
+  }
+}
+
 function syncAlbumPagesFromPreview(iframe) {
   const p = state.selected;
   const hasFrames = Array.isArray(p?.frames) && p.frames.length > 0;
@@ -3905,8 +4461,10 @@ function syncAlbumPagesFromPreview(iframe) {
   if (nextCount !== state.albumPageCount) {
     state.albumPageCount = nextCount;
     state.activeAlbumPage = Math.min(state.activeAlbumPage, Math.max(0, nextCount - 1));
+    if (nextCount === 0) state.albumPageTextEditActive = false;
     renderFramesStrip();
   }
+  updateAlbumPageEditControls();
   scrollPreviewToAlbumPage(state.activeAlbumPage, 'auto');
   wireAlbumPageScrollSync(iframe);
 }
@@ -3932,8 +4490,12 @@ function wireAlbumPageScrollSync(iframe) {
         }
       });
       if (bestIndex !== state.activeAlbumPage) {
+        const wasEditing = state.albumPageTextEditActive;
         state.activeAlbumPage = bestIndex;
         updateAlbumPageTabActive();
+        // 滑动换页视为浏览，不继续改字 → 自动收起编辑栏
+        if (wasEditing) collapsePageTextEdit();
+        else updateAlbumPageEditControls();
       }
     };
     album.addEventListener('scroll', () => {
@@ -3966,22 +4528,87 @@ function updateAlbumPageTabActive() {
     const pageIndex = Number(btn.dataset.albumPage) || 0;
     btn.classList.toggle('active', pageIndex === state.activeAlbumPage);
   });
+  updateAlbumPageEditControls();
 }
 
 // Keep --preview-scale on .preview-frame in sync with its rendered width
 // so the 1920×1080 iframe shrinks proportionally rather than getting
 // cropped by a smaller viewport.
 let _previewResizeObserver = null;
+
+/** Generation shell: fit preview into available box and keep it centered. */
+function layoutGenerationPreview(frame) {
+  const stage = document.getElementById('preview-stage');
+  if (!stage || !frame || !stage.classList.contains('generation-preview-shell')) return;
+  const p = state.selected;
+  const res = p?.preferences?.resolution ?? { width: 1920, height: 1080 };
+  const vw = res.width || 1920;
+  const vh = res.height || 1080;
+  const styles = getComputedStyle(stage);
+  const padX = (parseFloat(styles.paddingLeft) || 0) + (parseFloat(styles.paddingRight) || 0);
+  const padY = (parseFloat(styles.paddingTop) || 0) + (parseFloat(styles.paddingBottom) || 0);
+  const availW = Math.max(48, stage.clientWidth - padX);
+  const availH = Math.max(48, stage.clientHeight - padY);
+  const fit = Math.min(availW / vw, availH / vh);
+  const zoom = getPreviewZoom();
+  let displayW = Math.max(1, Math.floor(vw * fit * zoom));
+  let displayH = Math.max(1, Math.floor(vh * fit * zoom));
+  // zoom<=1：严格装进可视区域，避免横向溢出贴左
+  if (zoom <= 1.001) {
+    if (displayW > availW) {
+      displayW = availW;
+      displayH = Math.max(1, Math.floor(displayW * vh / vw));
+    }
+    if (displayH > availH) {
+      displayH = availH;
+      displayW = Math.max(1, Math.floor(displayH * vw / vh));
+    }
+  }
+  frame.style.width = `${displayW}px`;
+  frame.style.height = `${displayH}px`;
+  frame.style.maxWidth = 'none';
+  frame.style.maxHeight = 'none';
+  frame.style.aspectRatio = `${vw} / ${vh}`;
+  frame.style.setProperty('--preview-scale', (displayW / vw).toFixed(4));
+  frame.style.setProperty('--preview-user-zoom', String(zoom));
+  // 居中：滚动容器在溢出时也尽量落在中间
+  if (zoom > 1.001) {
+    const maxScrollX = Math.max(0, stage.scrollWidth - stage.clientWidth);
+    const maxScrollY = Math.max(0, stage.scrollHeight - stage.clientHeight);
+    stage.scrollLeft = maxScrollX / 2;
+    stage.scrollTop = maxScrollY / 2;
+  } else {
+    stage.scrollLeft = 0;
+    stage.scrollTop = 0;
+  }
+}
+
+function scheduleGenerationPreviewLayout() {
+  requestAnimationFrame(() => {
+    const frame = document.querySelector('.generation-preview-shell .preview-frame');
+    if (frame) layoutGenerationPreview(frame);
+  });
+}
+
 function attachPreviewScaler() {
-  const frame = document.querySelector('.preview-frame');
+  const stage = document.getElementById('preview-stage');
+  const frame = stage?.querySelector?.('.preview-frame');
   if (!frame) return;
+
+  if (stage.classList.contains('generation-preview-shell')) {
+    const apply = () => layoutGenerationPreview(frame);
+    apply();
+    if (_previewResizeObserver) _previewResizeObserver.disconnect();
+    _previewResizeObserver = new ResizeObserver(apply);
+    _previewResizeObserver.observe(stage);
+    const workbench = document.querySelector('.generation-workbench');
+    if (workbench) _previewResizeObserver.observe(workbench);
+    return;
+  }
+
   const apply = () => {
     const w = frame.clientWidth;
     if (!w) return;
-    // Scale by the inner element's native design width (not a hardcoded 1920)
-    // so non-16:9 aspects (1080-wide) shrink correctly too. A native (enhanced)
-    // frame uses a <video> instead of an <iframe> — scale it the same way, else
-    // the 1920×1080 MP4 overflows and the frame gets cropped.
     const inner = frame.querySelector('iframe, video');
     const nativeW = inner ? (parseFloat(inner.style.width) || 1920) : 1920;
     frame.style.setProperty('--preview-scale', (w / nativeW).toFixed(4));
@@ -4104,6 +4731,7 @@ function renderAlbumPagesStrip(strip, p) {
   if (!p || count <= 0) {
     strip.classList.remove('has-frames');
     strip.innerHTML = '';
+    updateAlbumPageEditControls();
     return;
   }
   strip.classList.add('has-frames');
@@ -4119,7 +4747,8 @@ function renderAlbumPagesStrip(strip, p) {
   const thumbStyle = `--thumb-native-w:${nativeW}px;--thumb-native-h:${nativeH}px;--thumb-scale:${thumbScale};--thumb-offset-y:${thumbOffsetY}px`;
   const tabs = Array.from({ length: count }, (_, index) => {
     const isActive = index === state.activeAlbumPage;
-    const cls = ['frame-tab', 'album-page-tab', isActive && 'active'].filter(Boolean).join(' ');
+    const isEditing = state.albumPageTextEditActive && isActive;
+    const cls = ['frame-tab', 'album-page-tab', isActive && 'active', isEditing && 'editing'].filter(Boolean).join(' ');
     return `<button class="${cls}" data-album-page="${index}">
       <div class="frame-thumb">
         <iframe sandbox="allow-scripts allow-same-origin"
@@ -4130,15 +4759,21 @@ function renderAlbumPagesStrip(strip, p) {
         <span class="order">${String(index + 1).padStart(2, '0')}</span>
         <span class="fid">第 ${index + 1} 页</span>
       </div>
+      <span class="album-page-edit${isEditing ? ' active' : ''}" data-album-page="${index}" title="${esc(t('text_pane.edit_page_title'))}">${t('text_pane.edit_page')}</span>
     </button>`;
   }).join('');
   strip.innerHTML = `<span class="label">相册页</span>${tabs}`;
   strip.querySelectorAll('button.album-page-tab').forEach((btn) => {
-    btn.addEventListener('click', () => {
+    btn.addEventListener('click', (e) => {
       const pageIndex = Number(btn.dataset.albumPage) || 0;
-      state.activeAlbumPage = pageIndex;
-      updateAlbumPageTabActive();
-      scrollPreviewToAlbumPage(pageIndex);
+      const editEl = e.target.closest('.album-page-edit');
+      if (editEl) {
+        e.preventDefault();
+        e.stopPropagation();
+        selectAlbumPage(pageIndex, { startEdit: true });
+        return;
+      }
+      selectAlbumPage(pageIndex);
     });
   });
   strip.querySelectorAll('iframe[data-album-thumb]').forEach((iframe) => {
@@ -4146,6 +4781,7 @@ function renderAlbumPagesStrip(strip, p) {
       scrollAlbumThumbToPage(iframe, Number(iframe.dataset.albumThumb) || 0);
     }, { once: true });
   });
+  updateAlbumPageEditControls();
 }
 
 async function openGraphModal() {
@@ -4209,6 +4845,9 @@ async function fetchActiveFrameHtml() {
 async function refreshTextFields() {
   if (!state.selected) {
     state.textFields = [];
+    state.imageFields = [];
+    state.ctaFields = [];
+    state.colorFields = [];
     renderTextFields();
     return;
   }
@@ -4217,11 +4856,39 @@ async function refreshTextFields() {
   const html = await fetchActiveFrameHtml();
   if (!html) {
     state.textFields = [];
+    state.imageFields = [];
+    state.ctaFields = [];
+    state.colorFields = [];
     renderTextFields();
     return;
   }
   const doc = new DOMParser().parseFromString(html, 'text/html');
-  const nodes = doc.querySelectorAll('[data-hv-text]');
+  const albumPages = getAlbumPagesFromDoc(doc);
+  const hasFrames = Array.isArray(state.selected.frames) && state.selected.frames.length > 0;
+  const isAlbum = !hasFrames && albumPages.length > 0;
+
+  // Electronic album: until user clicks「编辑本页」, don't dump every page's fields.
+  if (isAlbum && !state.albumPageTextEditActive) {
+    if ((Number(state.albumPageCount) || 0) !== albumPages.length) {
+      state.albumPageCount = albumPages.length;
+      state.activeAlbumPage = Math.min(state.activeAlbumPage, Math.max(0, albumPages.length - 1));
+    }
+    state.textFields = [];
+    state.imageFields = [];
+    state.ctaFields = [];
+    state.colorFields = scanEditableColors(doc);
+    renderTextFields({ albumAwaitEdit: true });
+    updateAlbumPageEditControls();
+    return;
+  }
+
+  let scanRoot = doc;
+  if (isAlbum && state.albumPageTextEditActive) {
+    const idx = Math.max(0, Math.min(albumPages.length - 1, state.activeAlbumPage || 0));
+    scanRoot = albumPages[idx] || doc;
+  }
+
+  const nodes = scanRoot.querySelectorAll('[data-hv-text]');
   const seen = new Set();
   const fields = [];
   for (const el of nodes) {
@@ -4232,28 +4899,115 @@ async function refreshTextFields() {
     fields.push({ key, original: text, current: text });
   }
   state.textFields = fields;
-  renderTextFields();
+  state.imageFields = scanEditableImages(scanRoot);
+  state.ctaFields = scanEditableCtas(scanRoot);
+  state.colorFields = scanEditableColors(doc);
+  renderTextFields({ albumEmptyPage: isAlbum && fields.length === 0 && state.imageFields.length === 0 && state.ctaFields.length === 0 && state.colorFields.length === 0 });
+  updateAlbumPageEditControls();
 }
 
-function renderTextFields() {
+function scanEditableImages(root) {
+  const seen = new Set();
+  return Array.from(root.querySelectorAll('[data-hv-image]')).map((el, index) => {
+    const key = el.getAttribute('data-hv-image') || `image_${index + 1}`;
+    if (seen.has(key)) return null;
+    seen.add(key);
+    const current = readImageValue(el);
+    return { key, original: current, current, kind: imageFieldKind(el) };
+  }).filter(Boolean);
+}
+
+function scanEditableCtas(root) {
+  const explicit = Array.from(root.querySelectorAll('[data-hv-cta]'));
+  const fallback = explicit.length ? [] : Array.from(root.querySelectorAll('a, button'))
+    .filter((el) => /cta|contact|phone|wechat|email|咨询|联系|预约|购买|报名/i.test(`${el.className || ''} ${el.id || ''} ${el.textContent || ''}`));
+  const seen = new Set();
+  return [...explicit, ...fallback].map((el, index) => {
+    const key = el.getAttribute('data-hv-cta') || el.getAttribute('data-hv-text') || `cta_${index + 1}`;
+    if (seen.has(key)) return null;
+    seen.add(key);
+    const text = el.textContent ?? '';
+    return { key, original: text, current: text };
+  }).filter(Boolean);
+}
+
+function scanEditableColors(doc) {
+  const styleText = Array.from(doc.querySelectorAll('style')).map((style) => style.textContent || '').join('\n');
+  const vars = [];
+  const seen = new Set();
+  const re = /(--(?:primary|brand|accent|theme|main)(?:-[a-z0-9]+)*-?color|--primary-color)\s*:\s*(#[0-9a-f]{3,8}|rgba?\([^)]+\)|hsla?\([^)]+\))/gi;
+  let match;
+  while ((match = re.exec(styleText)) !== null) {
+    const key = match[1];
+    const value = normalizeColorInput(match[2]);
+    if (!key || !value || seen.has(key)) continue;
+    seen.add(key);
+    vars.push({ key, original: value, current: value });
+  }
+  return vars;
+}
+
+function imageFieldKind(el) {
+  if (el.tagName === 'IMG') return 'src';
+  const style = el.getAttribute('style') || '';
+  if (/background-image|background\s*:/i.test(style)) return 'background';
+  return el.getAttribute('src') != null ? 'src' : 'background';
+}
+
+function readImageValue(el) {
+  if (el.tagName === 'IMG' || el.getAttribute('src') != null) return el.getAttribute('src') || '';
+  const inline = el.getAttribute('style') || '';
+  const m = inline.match(/background(?:-image)?\s*:\s*[^;]*url\((['"]?)(.*?)\1\)/i);
+  return m?.[2] || '';
+}
+
+function normalizeColorInput(value) {
+  const raw = String(value || '').trim();
+  const hex = raw.match(/^#([0-9a-f]{3}|[0-9a-f]{6}|[0-9a-f]{8})$/i);
+  if (hex) return raw;
+  const rgb = raw.match(/^rgba?\(\s*(\d{1,3})\s*,\s*(\d{1,3})\s*,\s*(\d{1,3})/i);
+  if (!rgb) return raw;
+  const parts = rgb.slice(1, 4).map((n) => Math.max(0, Math.min(255, Number(n) || 0)).toString(16).padStart(2, '0'));
+  return `#${parts.join('')}`;
+}
+
+function renderTextFields(opts = {}) {
   const wrap = document.getElementById('text-fields');
   if (!wrap) return;
+  syncTextPaneTitle();
   if (!state.selected) {
     wrap.innerHTML = `<div class="text-empty">${t('text_pane.no_project')}</div>`;
     return;
   }
+  if (opts.albumAwaitEdit) {
+    wrap.innerHTML = `<div class="text-empty">${t('text_pane.edit_page_hint')}</div>`;
+    return;
+  }
   if (state.textFields.length === 0) {
+    if (opts.albumEmptyPage) {
+      wrap.innerHTML = `<div class="text-empty">${t('text_pane.empty_page')}</div>`;
+      return;
+    }
     const hasFrames = (state.selected.frames?.length ?? 0) > 0;
     const hint = hasFrames ? t('text_pane.empty_with_frames') : t('text_pane.empty_no_frames');
     wrap.innerHTML = `<div class="text-empty">${hint}</div>`;
     return;
   }
   // Always render as textarea — agent decides text length, no hard cap.
-  wrap.innerHTML = state.textFields.map((f, i) => {
-    const labelKey = humanizeKey(f.key);
-    return `<div class="text-field">
-      <div class="key">${esc(labelKey)}<span class="badge">${esc(f.key)}</span></div>
-      <textarea data-i="${i}" rows="1" placeholder="(empty)">${esc(f.current)}</textarea>
+  const tip = `<p class="text-fields-tip">${t('text_pane.locate_tip')}</p>`;
+  wrap.innerHTML = tip + state.textFields.map((f, i) => {
+    const labelKey = humanizeKey(f.key, i + 1);
+    const snip = summarizeFieldValue(f.current);
+    return `<div class="text-field" data-key="${escAttr(f.key)}" data-i="${i}">
+      <div class="text-field-head">
+        <span class="text-field-index">${i + 1}</span>
+        <div class="text-field-meta">
+          <div class="text-field-label">${esc(labelKey)}</div>
+          <div class="text-field-snip" title="${escAttr(f.current)}">${esc(snip)}</div>
+        </div>
+        <button type="button" class="text-field-locate" data-key="${escAttr(f.key)}" title="${escAttr(t('text_pane.locate_title'))}">${t('text_pane.locate')}</button>
+      </div>
+      <textarea data-i="${i}" data-key="${escAttr(f.key)}" rows="1" placeholder="${escAttr(t('text_pane.placeholder_empty'))}">${esc(f.current)}</textarea>
     </div>`;
   }).join('');
   wrap.querySelectorAll('textarea[data-i]').forEach((el) => {
@@ -4261,10 +5015,176 @@ function renderTextFields() {
     el.addEventListener('input', (e) => {
       const i = Number(e.target.dataset.i);
       state.textFields[i].current = e.target.value;
+      const snip = e.target.closest('.text-field')?.querySelector('.text-field-snip');
+      if (snip) {
+        snip.textContent = summarizeFieldValue(e.target.value);
+        snip.title = e.target.value;
+      }
       autoResize(el);
       scheduleTextSave();
     });
+    el.addEventListener('focus', () => locateTextField(el.dataset.key, { fromPreview: false }));
+    el.addEventListener('mouseenter', () => softHighlightPreviewField(el.dataset.key));
+    el.addEventListener('mouseleave', () => {
+      if (document.activeElement !== el) clearPreviewFieldHighlight();
+    });
   });
+  wrap.querySelectorAll('.text-field-locate').forEach((btn) => {
+    btn.addEventListener('click', (e) => {
+      e.preventDefault();
+      locateTextField(btn.dataset.key, { pulse: true });
+    });
+  });
+}
+
+function summarizeFieldValue(text) {
+  const raw = String(text || '').replace(/\s+/g, ' ').trim();
+  if (!raw) return '(空)';
+  return raw.length > 36 ? `${raw.slice(0, 36)}…` : raw;
+}
+
+function escAttr(s) {
+  return String(s ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/"/g, '&quot;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+
+const HV_FIELD_HIGHLIGHT_STYLE_ID = 'hv-studio-field-highlight';
+
+function ensurePreviewHighlightStyle(doc) {
+  if (!doc?.head || doc.getElementById(HV_FIELD_HIGHLIGHT_STYLE_ID)) return;
+  const style = doc.createElement('style');
+  style.id = HV_FIELD_HIGHLIGHT_STYLE_ID;
+  style.textContent = `
+    [data-hv-text].hv-locate {
+      outline: 3px solid #3b82f6 !important;
+      outline-offset: 4px !important;
+      box-shadow: 0 0 0 8px rgba(59,130,246,.22) !important;
+      border-radius: 6px !important;
+      position: relative;
+      z-index: 2147483000 !important;
+    }
+    [data-hv-text].hv-locate-soft {
+      outline: 2px dashed #60a5fa !important;
+      outline-offset: 3px !important;
+      border-radius: 6px !important;
+    }
+    [data-hv-text] { cursor: pointer; }
+  `;
+  doc.head.appendChild(style);
+}
+
+function getPreviewDocument() {
+  const iframe = document.getElementById('preview-iframe');
+  try {
+    return iframe?.contentDocument || null;
+  } catch {
+    return null;
+  }
+}
+
+function clearPreviewFieldHighlight() {
+  const doc = getPreviewDocument();
+  if (!doc) return;
+  doc.querySelectorAll('.hv-locate, .hv-locate-soft').forEach((el) => {
+    el.classList.remove('hv-locate', 'hv-locate-soft');
+  });
+}
+
+function softHighlightPreviewField(key) {
+  const doc = getPreviewDocument();
+  if (!doc || !key) return;
+  ensurePreviewHighlightStyle(doc);
+  doc.querySelectorAll('.hv-locate-soft').forEach((el) => el.classList.remove('hv-locate-soft'));
+  findPreviewTextNodes(doc, key).forEach((el) => {
+    if (!el.classList.contains('hv-locate')) el.classList.add('hv-locate-soft');
+  });
+}
+
+function findPreviewTextNodes(doc, key) {
+  if (!doc || !key) return [];
+  return Array.from(doc.querySelectorAll('[data-hv-text]')).filter(
+    (el) => el.getAttribute('data-hv-text') === key,
+  );
+}
+
+function findTextFieldCard(key) {
+  if (!key) return null;
+  return Array.from(document.querySelectorAll('.text-field')).find((el) => el.dataset.key === key) || null;
+}
+
+function highlightPreviewField(key, { scroll = true, pulse = false } = {}) {
+  const doc = getPreviewDocument();
+  if (!doc || !key) return false;
+  ensurePreviewHighlightStyle(doc);
+  clearPreviewFieldHighlight();
+  const nodes = findPreviewTextNodes(doc, key);
+  if (!nodes.length) return false;
+  nodes.forEach((el) => el.classList.add('hv-locate'));
+  if (scroll) {
+    nodes[0].scrollIntoView({ behavior: 'smooth', block: 'center', inline: 'nearest' });
+  }
+  if (pulse) {
+    nodes.forEach((el) => {
+      el.style.transition = 'box-shadow .2s ease';
+      el.style.boxShadow = '0 0 0 14px rgba(59,130,246,.35)';
+      setTimeout(() => { el.style.boxShadow = ''; }, 420);
+    });
+  }
+  return true;
+}
+
+function setActiveTextFieldCard(key) {
+  document.querySelectorAll('.text-field.is-locate').forEach((el) => el.classList.remove('is-locate'));
+  const card = findTextFieldCard(key);
+  if (!card) return null;
+  card.classList.add('is-locate');
+  return card;
+}
+
+function locateTextField(key, { fromPreview = false, pulse = false } = {}) {
+  if (!key) return;
+  const card = setActiveTextFieldCard(key);
+  if (card && fromPreview) {
+    card.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    const ta = card.querySelector('textarea');
+    if (ta && document.activeElement !== ta) ta.focus({ preventScroll: true });
+  }
+  highlightPreviewField(key, { scroll: !fromPreview, pulse });
+}
+
+function wirePreviewTextLocate(iframe) {
+  try {
+    const doc = iframe?.contentDocument;
+    if (!doc || doc.documentElement.dataset.hvLocateWired === '1') return;
+    doc.documentElement.dataset.hvLocateWired = '1';
+    ensurePreviewHighlightStyle(doc);
+    doc.addEventListener('click', (e) => {
+      const target = e.target?.closest?.('[data-hv-text]');
+      if (!target) return;
+      const key = target.getAttribute('data-hv-text');
+      if (!key) return;
+      // Prefer locating the text field over following in-album navigation.
+      e.preventDefault();
+      e.stopPropagation();
+      if (!(state.albumPageTextEditActive || (state.selected?.frames?.length > 0))) {
+        // Album not in page-edit mode yet — enter edit for the page that owns this node.
+        const pages = getAlbumPagesFromIframe(iframe);
+        if (pages.length) {
+          const pageIndex = pages.findIndex((page) => page.contains(target));
+          if (pageIndex >= 0) {
+            selectAlbumPage(pageIndex, { startEdit: true }).then(() => {
+              locateTextField(key, { fromPreview: true, pulse: true });
+            });
+            return;
+          }
+        }
+      }
+      locateTextField(key, { fromPreview: true, pulse: true });
+    }, true);
+  } catch {}
 }
 
 function autoResize(el) {
@@ -4282,9 +5202,27 @@ const TEXT_FIELD_LABELS_ZH = {
   cover_caption: '封面说明',
   cover_meta_left: '封面左侧提示',
   cover_meta_right: '封面右侧提示',
+  eyebrow_cover: '封面眉标题',
+  headline_cover: '封面主标题',
+  caption_cover: '封面副文案',
+  subtitle_cover: '封面副标题',
   about_eyebrow: '关于我们眉标题',
   about_title: '关于我们标题',
   about_desc: '关于我们介绍',
+  eyebrow_pain: '痛点页眉标题',
+  headline_pain: '痛点页主标题',
+  caption_pain: '痛点页说明',
+  badge_1: '底部标签 1',
+  badge_2: '底部标签 2',
+  badge_3: '底部标签 3',
+  badge_4: '底部标签 4',
+  badge_5: '底部标签 5',
+  chip_1: '小标签 1',
+  chip_2: '小标签 2',
+  chip_3: '小标签 3',
+  tip_1: '提示 1',
+  tip_2: '提示 2',
+  tip_3: '提示 3',
   stat_year: '成立年份',
   stat_year_label: '成立年份标签',
   stat_clients: '客户数量',
@@ -4324,73 +5262,198 @@ const TEXT_FIELD_LABELS_ZH = {
   metric_3_label: '数据 3 标签',
 };
 
+/** English key fragments → Chinese. Unknown Latin tokens are dropped, never shown as titles. */
 const TEXT_FIELD_TOKEN_LABELS_ZH = {
   about: '关于我们',
+  address: '地址',
+  advantage: '优势',
+  album: '相册',
   audience: '受众',
+  author: '作者',
+  award: '荣誉',
+  awards: '荣誉',
+  badge: '底部标签',
+  benefit: '收益',
   body: '正文',
   brand: '品牌',
   button: '按钮',
+  card: '卡片',
+  case: '案例',
+  cases: '案例',
   caption: '说明',
+  cert: '认证',
+  certification: '认证',
+  chapter: '章节',
+  chip: '小标签',
   clients: '客户',
   closing: '结尾',
   company: '公司',
   contact: '联系',
+  content: '内容',
+  copy: '文案',
   cover: '封面',
   cta: '行动引导',
+  customer: '客户',
+  customers: '客户',
+  date: '日期',
   desc: '介绍',
   description: '描述',
+  detail: '详情',
+  details: '详情',
+  display: '展示',
   email: '邮箱',
+  enterprise: '企业',
   eyebrow: '眉标题',
+  faq: '问答',
   feature: '亮点',
+  features: '亮点',
+  footer: '页脚',
+  header: '页头',
   headline: '主标题',
+  hint: '提示',
+  honor: '荣誉',
+  honors: '荣誉',
   intro: '介绍',
   item: '条目',
+  kicker: '引导语',
+  kpi: '关键指标',
   label: '标签',
+  lead: '导语',
   left: '左侧',
-  logo: 'Logo',
+  logo: '标志',
   mark: '标识',
   meta: '提示',
   metric: '数据',
+  mobile: '手机',
+  motto: '口号',
   name: '名称',
+  nav: '导航',
+  note: '备注',
+  num: '数值',
+  number: '数值',
+  overline: '眉标题',
   page: '页面',
+  pain: '痛点',
   phone: '电话',
+  pill: '标签',
+  plan: '方案',
+  prefix: '前缀',
+  price: '价格',
+  pricing: '价格',
   product: '产品',
   projects: '项目',
+  quote: '引用',
   right: '右侧',
+  scene: '场景',
   scroll: '滚动',
   section: '区块',
+  service: '服务',
+  services: '服务',
+  showcase: '展示',
+  slogan: '口号',
+  solution: '方案',
+  solutions: '方案',
   stat: '数据',
+  stats: '数据',
+  step: '步骤',
+  steps: '步骤',
+  story: '故事',
   strength: '实力',
+  subheadline: '副标题',
   subtitle: '副标题',
+  suffix: '后缀',
+  summary: '摘要',
+  tag: '标签',
   tagline: '标语',
+  team: '团队',
+  text: '文案',
+  tip: '提示',
   title: '标题',
+  unit: '单位',
+  value: '数值',
+  values: '价值',
   users: '用户',
   wechat: '微信',
   year: '年份',
 };
 
-function humanizeKey(key) {
-  const raw = String(key || '').trim();
+const TEXT_FIELD_ROLE_TOKENS = new Set([
+  'eyebrow', 'headline', 'subheadline', 'caption', 'subtitle', 'title', 'body',
+  'desc', 'description', 'tagline', 'slogan', 'copy', 'text', 'lead', 'kicker', 'overline',
+]);
+const TEXT_FIELD_SECTION_TOKENS = new Set([
+  'cover', 'pain', 'about', 'product', 'solution', 'solutions', 'cta', 'contact',
+  'closing', 'intro', 'feature', 'features', 'team', 'case', 'cases', 'service',
+  'services', 'showcase', 'footer', 'header', 'scene',
+]);
+
+function translateFieldToken(part) {
+  const raw = String(part || '').trim();
   if (!raw) return '';
+  if (/^\d+$/.test(raw)) return String(Number(raw));
+  const mapped = TEXT_FIELD_TOKEN_LABELS_ZH[raw.toLowerCase()];
+  if (mapped) return mapped;
+  // Keep CJK. Never surface unknown English in UI titles.
+  if (/[A-Za-z]/.test(raw) && !/[\u4e00-\u9fff]/.test(raw)) return '';
+  return raw;
+}
+
+function finalizeZhFieldLabel(label, fallbackIndex) {
+  let s = String(label || '')
+    .replace(/[A-Za-z][A-Za-z0-9+./-]*/g, ' ')
+    .replace(/\s*[·•|/_-]+\s*/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!s) return fallbackIndex ? `文案 ${fallbackIndex}` : '文案';
+  return s;
+}
+
+/** Convert data-hv-text key → Chinese UI label. Never show BADGE/CTA/logo-style English titles. */
+function humanizeKey(key, fallbackIndex) {
+  const raw = String(key || '').trim();
+  if (!raw) return fallbackIndex ? `文案 ${fallbackIndex}` : '文案';
   if (TEXT_FIELD_LABELS_ZH[raw]) return TEXT_FIELD_LABELS_ZH[raw];
 
-  const pageMatch = raw.match(/^page_(\d+)_(.+)$/);
+  const pageMatch = raw.match(/^page_(\d+)_(.+)$/i);
   if (pageMatch) {
     const pageNo = String(Number(pageMatch[1]));
-    return `第 ${pageNo} 页${humanizeKey(pageMatch[2])}`;
+    return finalizeZhFieldLabel(`第 ${pageNo} 页${humanizeKey(pageMatch[2])}`, fallbackIndex);
   }
 
-  const parts = raw.split(/[_\s-]+/).filter(Boolean);
-  const translated = parts.map((part) => {
-    if (/^\d+$/.test(part)) return Number(part).toString();
-    return TEXT_FIELD_TOKEN_LABELS_ZH[part] || part;
-  });
-  return translated.join('');
+  const numbered = raw.match(/^([a-z]+)[_-](\d+)(?:[_-](.+))?$/i);
+  if (numbered) {
+    const base = translateFieldToken(numbered[1]) || '文案';
+    const n = String(Number(numbered[2]));
+    const rest = numbered[3] ? humanizeKey(numbered[3]) : '';
+    return finalizeZhFieldLabel(rest ? `${base} ${n} ${rest}` : `${base} ${n}`, fallbackIndex);
+  }
+
+  const roleSection = raw.match(/^([a-z]+)[_-]([a-z]+)(?:[_-](.+))?$/i);
+  if (roleSection) {
+    const a = roleSection[1].toLowerCase();
+    const b = roleSection[2].toLowerCase();
+    const rest = roleSection[3] ? humanizeKey(roleSection[3]) : '';
+    if (TEXT_FIELD_ROLE_TOKENS.has(a) && TEXT_FIELD_SECTION_TOKENS.has(b)) {
+      return finalizeZhFieldLabel(
+        `${translateFieldToken(b)}${translateFieldToken(a)}${rest ? ` ${rest}` : ''}`,
+        fallbackIndex,
+      );
+    }
+    if (TEXT_FIELD_SECTION_TOKENS.has(a) && TEXT_FIELD_ROLE_TOKENS.has(b)) {
+      return finalizeZhFieldLabel(
+        `${translateFieldToken(a)}${translateFieldToken(b)}${rest ? ` ${rest}` : ''}`,
+        fallbackIndex,
+      );
+    }
+  }
+
+  const parts = raw.split(/[_\s-]+/).filter(Boolean).map(translateFieldToken).filter(Boolean);
+  return finalizeZhFieldLabel(parts.join(''), fallbackIndex);
 }
 
 function scheduleTextSave() {
   clearTimeout(state.textSaveTimer);
-  setSaveState('typing…');
+  setSaveState(t('text_pane.save_state.typing'));
   state.textSaveTimer = setTimeout(commitTextEdits, 500);
 }
 
@@ -4406,14 +5469,14 @@ async function commitTextEdits() {
   if (!state.selected) return;
   const dirty = state.textFields.filter((f) => f.current !== f.original);
   if (dirty.length === 0) {
-    setSaveState('—');
+    setSaveState(t('text_pane.save_state.idle'));
     return;
   }
-  setSaveState('saving…', 'saving');
+  setSaveState(t('text_pane.save_state.saving'), 'saving');
   // Read the SAME source we'll write back to — the active frame's HTML
   // when there is one, otherwise the whole-project preview.
   const html = await fetchActiveFrameHtml();
-  if (!html) { setSaveState('error', 'error'); return; }
+  if (!html) { setSaveState(t('text_pane.save_state.error'), 'error'); return; }
   const doc = new DOMParser().parseFromString(html, 'text/html');
   for (const f of state.textFields) {
     const nodes = doc.querySelectorAll(`[data-hv-text="${cssEscape(f.key)}"]`);
@@ -4435,11 +5498,11 @@ async function commitTextEdits() {
     });
     r = await res.json();
   } catch (e) {
-    setSaveState('error: ' + (e?.message ?? e), 'error');
+    setSaveState(`${t('text_pane.save_state.error')}: ${e?.message ?? e}`, 'error');
     return;
   }
   if (r?.error) {
-    setSaveState('error: ' + r.error, 'error');
+    setSaveState(`${t('text_pane.save_state.error')}: ${r.error}`, 'error');
     return;
   }
   // Refresh project so frames-strip thumbnails cache-bust.
@@ -4452,7 +5515,7 @@ async function commitTextEdits() {
   } else if (r?.project) {
     state.selected = r.project;
   }
-  setSaveState('saved', 'saved');
+  setSaveState(t('text_pane.save_state.saved'), 'saved');
   reloadPreview();
 }
 
@@ -4484,6 +5547,9 @@ async function sendMessage() {
 
   ta.value = '';
   state.composing = true;
+  document.body.classList.remove('assistant-collapsed');
+  syncAssistantToggleUi();
+  scheduleGenerationPreviewLayout();
   // The project this send belongs to — used to ignore late events / not clobber
   // a different project if the user switches away mid-generation.
   const genProjectId = state.selectedId;
@@ -4522,6 +5588,7 @@ async function sendMessage() {
       // Clear UI attachments before request so user sees them disappear
       state.pendingAttachments = [];
       renderAttachments();
+      renderGenerationAdjustAttachmentCount();
       res = await fetch(`/api/projects/${state.selected.id}/messages`, {
         method: 'POST',
         body: fd,
@@ -4648,8 +5715,15 @@ async function sendMessage() {
 
 // ============== gallery modal ==============
 function openGallery() {
-  if (!state.selected) return;
-  document.getElementById('gallery-modal').classList.add('show');
+  if (!state.selected && state.templatePickContext?.source !== 'create') return;
+  const modal = document.getElementById('gallery-modal');
+  modal.classList.add('show');
+  const title = modal.querySelector('.modal-head h2');
+  if (title) {
+    title.textContent = state.templatePickContext
+      ? '选择一个模板'
+      : t('gallery.title');
+  }
   const grid = document.getElementById('gallery');
 
   // Each card's iframe loads the template's actual entry HTML (`index.html`,
@@ -4657,7 +5731,7 @@ function openGallery() {
   // it). The 1920×1080 (or 1080×1920) source is transform-scaled to fit
   // the card via a CSS variable set per-card after layout.
   grid.innerHTML = state.templates.map(t => {
-    const sel = state.selected?.templateId === t.id ? ' selected' : '';
+    const sel = currentGalleryTemplateId() === t.id ? ' selected' : '';
     const tags = (t.tags || []).slice(0, 4).map((tg) => `<span class="tag">${esc(tg)}</span>`).join('');
     const portrait = isPortraitTemplate(t);
     const entry = templateEntryPath(t);
@@ -4707,7 +5781,10 @@ function renderTemplateGrid(grid) {
     card.onclick = () => {
       const tid = card.dataset.id;
       const tpl = state.templates.find((x) => x.id === tid);
-      if (tpl) openTemplatePreviewModal(tpl);
+      if (tpl) {
+        state.templatePickContext = { source: 'library' };
+        openTemplatePreviewModal(tpl);
+      }
     };
   });
   setTimeout(() => applyGalleryScales(grid), 0);
@@ -4717,7 +5794,7 @@ function renderTemplateGrid(grid) {
 }
 
 function templateCardHtml(t) {
-  const sel = state.selected?.templateId === t.id ? ' selected' : '';
+  const sel = currentGalleryTemplateId() === t.id ? ' selected' : '';
   const tags = (t.tags || []).slice(0, 4).map((tg) => `<span class="tag">${esc(tg)}</span>`).join('');
   const portrait = isPortraitTemplate(t);
   const entry = templateEntryPath(t);
@@ -4767,6 +5844,7 @@ function templateEntryPath(t) {
 
 function closeGallery() {
   document.getElementById('gallery-modal').classList.remove('show');
+  state.templatePickContext = null;
   if (galleryResizeObserver) {
     galleryResizeObserver.disconnect();
     galleryResizeObserver = null;
@@ -4778,6 +5856,7 @@ let _tplPreviewResizeObserver = null;
 let _tplPreviewCurrent = null;
 function openTemplatePreviewModal(tpl) {
   _tplPreviewCurrent = tpl;
+  const pickContext = state.templatePickContext;
   const modal = document.getElementById('tpl-preview-modal');
   if (!modal) return;
   modal.classList.add('show');
@@ -4831,27 +5910,50 @@ function openTemplatePreviewModal(tpl) {
   _tplPreviewResizeObserver.observe(frame);
 
   const useBtn = document.getElementById('tpl-preview-use');
+  const applyCurrentBtn = document.getElementById('tpl-preview-apply-current');
   const cancelBtn = document.getElementById('tpl-preview-cancel');
   const closeBtn = document.getElementById('tpl-preview-close');
 
   // If the project already has this template applied, downgrade the primary
   // action to a no-op "in use" label so the user doesn't reapply needlessly.
   const isCurrent = state.selected?.templateId === tpl.id;
-  useBtn.textContent = !state.selected
-    ? '新建项目并使用'
+  const isCreatePick = pickContext?.source === 'create';
+  const isChatPick = pickContext?.source === 'chat';
+  const isLibraryPick = pickContext?.source === 'library';
+  useBtn.textContent = isCreatePick
+    ? '选择这个模板'
+    : isLibraryPick
+      ? '用此模板创建相册'
+    : isChatPick
+      ? t('tpl_preview.use')
+    : !state.selected
+    ? '用此模板创建相册'
     : isCurrent
       ? t('settings.agent.in_use')
       : t('tpl_preview.use');
-  useBtn.disabled = isCurrent;
+  useBtn.disabled = isCurrent && !isChatPick && !isLibraryPick;
+  if (applyCurrentBtn) {
+    applyCurrentBtn.hidden = !isLibraryPick || !state.selected?.id;
+    applyCurrentBtn.disabled = isCurrent;
+    applyCurrentBtn.textContent = isCurrent ? t('settings.agent.in_use') : '应用到当前项目';
+    applyCurrentBtn.onclick = async () => {
+      applyCurrentBtn.disabled = true;
+      try {
+        await applyTemplateToCurrentProject(tpl);
+        closeTemplatePreviewModal();
+      } finally {
+        applyCurrentBtn.disabled = false;
+      }
+    };
+  }
 
   useBtn.onclick = async () => {
-    let projectId = state.selected?.id ?? '';
-    if (!projectId) {
-      const r = await API.createProject({ name: tpl.name ?? 'Untitled' });
-      if (!r?.project?.id) return;
-      projectId = r.project.id;
-      await refreshProjects();
+    const context = state.templatePickContext;
+    if (context?.source === 'create' || context?.source === 'library' || !state.selected) {
+      chooseTemplateForCreate(tpl);
+      return;
     }
+    const projectId = state.selected.id;
     // If the project already has a different template applied, confirm
     // before replacing — the user may have been just exploring.
     const current = state.selected?.templateId;
@@ -4860,17 +5962,33 @@ function openTemplatePreviewModal(tpl) {
     }
     useBtn.disabled = true;
     try {
-      await API.setTemplate(projectId, tpl.id);
+      if (!isCurrent) await API.setTemplate(projectId, tpl.id);
       closeTemplatePreviewModal();
       closeGallery();
       await selectProject(projectId);
       toast(t('tpl_preview.applied', { name: tpl.name ?? tpl.id }), 'success');
+      if (context?.source === 'chat') {
+        await resumeChatAfterTemplatePick(context, tpl);
+      }
     } finally {
       useBtn.disabled = false;
     }
   };
-  cancelBtn.onclick = closeTemplatePreviewModal;
-  closeBtn.onclick = closeTemplatePreviewModal;
+  const closePreview = () => {
+    closeTemplatePreviewModal();
+    if (state.templatePickContext?.source === 'library') state.templatePickContext = null;
+  };
+  cancelBtn.onclick = closePreview;
+  closeBtn.onclick = closePreview;
+}
+
+async function resumeChatAfterTemplatePick(context, tpl) {
+  void context;
+  if (!state.selected || state.composing) return;
+  const ta = document.getElementById('composer-input');
+  if (!ta) return;
+  ta.value = `从设计模板选：${tpl.name ?? tpl.id}`;
+  await sendMessage();
 }
 
 // Render the three-layer provenance (RFC-07) for the previewed template so the
@@ -4981,6 +6099,15 @@ function wireModals() {
     };
     pagesModal.addEventListener('click', (e) => {
       if (e.target.id === 'generation-pages-modal') closeGenerationPagesModal();
+    });
+  }
+  const adjustModal = document.getElementById('generation-adjust-modal');
+  if (adjustModal) {
+    document.getElementById('generation-adjust-close').onclick = closeGenerationAdjustModal;
+    document.getElementById('generation-adjust-cancel').onclick = closeGenerationAdjustModal;
+    document.getElementById('generation-adjust-submit').onclick = submitGenerationAdjustModal;
+    adjustModal.addEventListener('click', (e) => {
+      if (e.target.id === 'generation-adjust-modal') closeGenerationAdjustModal();
     });
   }
   // Settings

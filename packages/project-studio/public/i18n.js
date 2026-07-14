@@ -98,6 +98,21 @@ const DICT = {
       'No editable text on this frame. Switch to another frame, or click ✎ Edit text on the canvas.',
     'text_pane.empty_no_frames':
       'No editable text yet. Send a chat to generate the first version of the HTML, then per-frame text fields appear here.',
+    'text_pane.edit_page': 'Edit this page',
+    'text_pane.editing_page': 'Editing page {n}',
+    'text_pane.edit_page_title': 'Edit text on the selected page only',
+    'text_pane.edit_page_hint':
+      'Select a page on the left, then click “Edit this page” to open the editor.',
+    'text_pane.page_title': 'Page {n} text',
+    'text_pane.empty_page': 'No editable text on this page.',
+    'text_pane.locate': 'Locate',
+    'text_pane.locate_title': 'Highlight this text in the preview',
+    'text_pane.locate_tip':
+      'Click Locate or focus a field to highlight it in the preview. You can also click text in the preview to jump here.',
+    'text_pane.placeholder_empty': '(empty)',
+    'text_pane.done': 'Done',
+    'text_pane.done_title': 'Finish editing and maximize preview',
+    'text_pane.expand': 'Expand editor',
     'text_pane.collapse': 'Collapse panel',
     'text_pane.save_state.idle': '—',
     'text_pane.save_state.typing': 'typing…',
@@ -350,6 +365,21 @@ const DICT = {
       '当前帧没有可编辑文字。切到别的帧，或在画面里点 ✎ 编辑文字。',
     'text_pane.empty_no_frames':
       '还没有可编辑的字段。发一条消息生成第一版 HTML，逐帧字段会出现在这里。',
+    'text_pane.edit_page': '编辑本页',
+    'text_pane.editing_page': '编辑中 · 第 {n} 页',
+    'text_pane.edit_page_title': '展开编辑栏，只修改当前选中页的文字',
+    'text_pane.edit_page_hint':
+      '先在左侧选择某一页，再点「编辑本页」展开编辑栏。',
+    'text_pane.page_title': '第 {n} 页文字',
+    'text_pane.empty_page': '本页没有可编辑文字。',
+    'text_pane.locate': '定位',
+    'text_pane.locate_title': '在预览中高亮这段文字',
+    'text_pane.locate_tip':
+      '点击「定位」或点进输入框，预览会高亮对应文案；也可直接点预览里的文字，跳到右侧字段。',
+    'text_pane.placeholder_empty': '（空）',
+    'text_pane.done': '完成',
+    'text_pane.done_title': '完成编辑并放大预览',
+    'text_pane.expand': '展开编辑栏',
     'text_pane.collapse': '收起面板',
     'text_pane.save_state.idle': '—',
     'text_pane.save_state.typing': '输入中…',

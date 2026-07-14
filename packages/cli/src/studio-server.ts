@@ -1991,7 +1991,7 @@ export async function startStudioServer(
             // Multi-frame extraction on the off chance the agent did emit it
             // (e.g. on a free-text iterate turn the user's text triggered it).
             const multi = extractContentGraphAndFrames(assistantText);
-            if (multi && multi.frames.length > 0) {
+            if (!isAlbumGenerate && multi && multi.frames.length > 0) {
               await ctx.orchestrator.writeContentGraph(id, multi.graph);
               for (const f of multi.frames) {
                 try {
@@ -2004,7 +2004,62 @@ export async function startStudioServer(
               sseWrite({ type: 'preview_ready', preview_url: `/preview/${id}`, frames: multi.frames.length });
               summaryLine = `✓ ${multi.frames.length}-frame storyboard generated (intent: ${multi.graph.intent})`;
             } else {
-              const extracted = extractHtmlDocument(assistantText);
+              let extracted = extractHtmlDocument(assistantText);
+              if (isAlbumGenerate && !extracted && priorHtml) {
+                sseWrite({ type: 'text', chunk: '\nRetrying as a strict album HTML rewrite...\n' });
+                const sum = summariseHtmlForIterate(priorHtml);
+                const retryParts = [
+                  'The previous answer did not include a usable HTML document.',
+                  'Rewrite the CURRENT electronic album now.',
+                  '',
+                  'Output exactly ONE fenced ```html block containing a complete <!doctype html> document. No prose outside the block.',
+                  'Keep the album as an interactive scroll-snap electronic album with page dots/counter/controls and data-hv-text attributes.',
+                  'Apply the user request literally. If they asked to add a page, add it. If they provided a CTA URL, wire the button/link to it. If they uploaded images, use their Browser URL in <img src="...">.',
+                  'Keep visible text in the user language.',
+                  '',
+                  `User request: ${userText.slice(0, 1000)}`,
+                  sum.headline ? `Current headline: ${sum.headline}` : '',
+                  sum.subheads.length ? `Current visible text:\n${sum.subheads.slice(0, 12).map((s) => `- ${s}`).join('\n')}` : '',
+                  sum.bgColors.length ? `Palette: ${sum.bgColors.join(' / ')}` : '',
+                  sum.fontFamilies.length ? `Fonts: ${sum.fontFamilies.join(', ')}` : '',
+                ].filter(Boolean);
+                if (attachments.length > 0) {
+                  retryParts.push('', 'Attachments:');
+                  for (const a of attachments) retryParts.push(...renderAttachment(a));
+                }
+                const retryText = await callAgentSimple(agentDef, retryParts.join('\n'), projectDir, agentModel, {
+                  ctx,
+                  projectId: id,
+                  generationType: 'page_html',
+                  operationId,
+                  attempt: 2,
+                  requestPayload: {
+                    operation: 'album_iteration_retry',
+                    phase: phaseInfo.phase,
+                    retry_reason: 'missing_html',
+                    attachment_count: attachments.length,
+                  },
+                  validateOutput: (output) => (
+                    extractHtmlDocument(output) ? null : 'Album retry did not contain a complete HTML document'
+                  ),
+                  invalidOutputCode: 'invalid_html',
+                  onSucceeded: (handle, output) => {
+                    successfulMainLog = handle;
+                    successfulMainOutput = output;
+                  },
+                  onEvent: (ev) => {
+                    if (ev.type === 'text') {
+                      textChunks += 1;
+                      sseWrite(ev);
+                    } else if (ev.type === 'error' || ev.type === 'message_end') {
+                      sseWrite(ev);
+                    }
+                  },
+                });
+                assistantText += retryText;
+                extracted = extractHtmlDocument(assistantText);
+                process.stderr.write(`[studio:msg] proj=${id} album retry done text=${retryText.length}B extracted=${!!extracted}\n`);
+              }
               if (extracted) {
                 await ctx.orchestrator.writePreviewHtmlRaw(id, isAlbumGenerate ? hardenAlbumHtml(extracted) : extracted);
                 if (isAlbumGenerate) {
@@ -2015,6 +2070,10 @@ export async function startStudioServer(
                 }
                 sseWrite({ type: 'preview_ready', preview_url: `/preview/${id}` });
                 summaryLine = '✓ updated the HTML preview';
+              } else if (isAlbumGenerate) {
+                const msg = 'AI did not return a usable album HTML document, so the preview was not changed.';
+                sseWrite({ type: 'warning', message: msg });
+                assistantText += `\n\n⚠️ ${msg}`;
               }
             }
           }
