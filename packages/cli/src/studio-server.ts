@@ -98,6 +98,13 @@ function resolveUiRoot(): string {
   return candidates[0]!;
 }
 
+export function isStudioAppRoute(pathname: string): boolean {
+  return pathname === '/album-history'
+    || pathname === '/image-album'
+    || pathname === '/style-templates'
+    || /^\/album-studio\/[^/]+\/?$/.test(pathname);
+}
+
 export async function startStudioServer(
   ctx: CliContext,
   port: number,
@@ -940,7 +947,7 @@ export async function startStudioServer(
           'cache-control': 'no-store, no-cache, must-revalidate',
           pragma: 'no-cache',
         });
-        res.end(html);
+        res.end(hardenAlbumHtml(html));
         return;
       }
 
@@ -959,7 +966,7 @@ export async function startStudioServer(
         if (!html || !/<\/html>/i.test(html)) {
           return json(res, 400, { error: 'Body must be a complete HTML document' });
         }
-        await ctx.orchestrator.writePreviewHtmlRaw(project.id, html);
+        await ctx.orchestrator.writePreviewHtmlRaw(project.id, hardenAlbumHtml(html));
         return json(res, 200, { project: await ctx.orchestrator.load(project.id) });
       }
 
@@ -1762,6 +1769,11 @@ export async function startStudioServer(
           try { if (!res.writableEnded) res.write(`data: ${JSON.stringify(obj)}\n\n`); }
           catch { /* client disconnected — keep generating, result is persisted below */ }
         };
+        sseWrite({
+          type: 'progress',
+          stage: 'phase_detected',
+          message: `已识别生成阶段：${phaseInfo.phase}，正在准备上下文…`,
+        });
 
         let assistantText = '';
         let textChunks = 0;
@@ -1778,6 +1790,13 @@ export async function startStudioServer(
           project.templateId === 'album-scroll-story' ||
           isAlbumType(openingTopic ?? '') ||
           looksLikeAlbumHtml(priorHtml);
+        sseWrite({
+          type: 'progress',
+          stage: isAlbumGenerate ? 'album_context' : 'video_context',
+          message: isAlbumGenerate
+            ? '正在整理相册主题、页数、模板和素材…'
+            : '正在整理视频分镜、样式和素材…',
+        });
         const isMultiGenerate =
           phaseInfo.phase === 'generate' &&
           !isAlbumGenerate &&
@@ -1833,6 +1852,11 @@ export async function startStudioServer(
             sseWrite({ type: 'text', chunk: notice });
           }
           try {
+            sseWrite({
+              type: 'progress',
+              stage: 'split_generating',
+              message: '正在分步生成分镜与页面，完成后会自动刷新预览…',
+            });
             const result = await runSplitMultiFrameGenerate({
               ctx,
               projectId: id,
@@ -1873,6 +1897,13 @@ export async function startStudioServer(
           const htmlPhases = new Set(['generate', 'iterate', 'restyle', 'iterate-content', 'iterate-format']);
           let successfulMainLog: AiGenerationLogHandle | null = null;
           let successfulMainOutput = '';
+          sseWrite({
+            type: 'progress',
+            stage: 'model_generating',
+            message: htmlPhases.has(phaseInfo.phase)
+              ? '正在调用模型生成完整相册 HTML…'
+              : '正在调用模型生成回复…',
+          });
           const primaryText = await callAgentSimple(agentDef, fullPrompt, projectDir, agentModel, {
             ctx,
             projectId: id,
@@ -2061,6 +2092,7 @@ export async function startStudioServer(
                 process.stderr.write(`[studio:msg] proj=${id} album retry done text=${retryText.length}B extracted=${!!extracted}\n`);
               }
               if (extracted) {
+                sseWrite({ type: 'progress', stage: 'saving_preview', message: '模型已返回结果，正在保存预览…' });
                 await ctx.orchestrator.writePreviewHtmlRaw(id, isAlbumGenerate ? hardenAlbumHtml(extracted) : extracted);
                 if (isAlbumGenerate) {
                   const refreshed = await ctx.projects.load(id);
@@ -2260,6 +2292,17 @@ export async function startStudioServer(
           ? project.lastPreviewHtmlPath!
           : join(baseDir, sub);
         if (existsSync(filePath) && statSync(filePath).isFile()) {
+          const albumPage = Number(url.searchParams.get('albumPage') || 0);
+          if (
+            (sub === '/preview.html' || sub === '/')
+            && url.searchParams.get('thumb') === '1'
+            && Number.isFinite(albumPage)
+            && albumPage > 0
+            && extname(filePath).toLowerCase() === '.html'
+          ) {
+            const html = await readFile(filePath, 'utf8');
+            return serveHtml(injectAlbumPageThumbMode(html, albumPage - 1), res);
+          }
           return serveFile(filePath, res);
         }
         // Fallback: also try project assets/
@@ -2364,10 +2407,7 @@ export async function startStudioServer(
         return serveFile(filePath, res);
       }
 
-      const appRoute = url.pathname === '/album-history'
-        || url.pathname === '/image-album'
-        || /^\/album-studio\/[^/]+\/?$/.test(url.pathname);
-      if (appRoute) {
+      if (isStudioAppRoute(url.pathname)) {
         return serveFile(join(uiRoot, 'index.html'), res);
       }
 
@@ -2750,6 +2790,140 @@ async function serveFile(filePath: string, res: ServerResponse): Promise<void> {
     pragma: 'no-cache',
   });
   res.end(buf);
+}
+
+function serveHtml(html: string, res: ServerResponse): void {
+  res.writeHead(200, {
+    'content-type': MIME['.html']!,
+    'cache-control': 'no-store, no-cache, must-revalidate',
+    pragma: 'no-cache',
+  });
+  res.end(html);
+}
+
+function injectAlbumPageThumbMode(html: string, pageIndex: number): string {
+  const safeIndex = Math.max(0, Math.floor(pageIndex));
+  const payload = JSON.stringify({ pageIndex: safeIndex });
+  const snippet = `
+<script id="hv-studio-album-thumb-bootstrap">
+(() => {
+  const config = ${payload};
+  const selectors = [
+    '[data-page]',
+    '[data-album-page]',
+    '.album-page',
+    'section.page',
+    'article.page',
+    'main.page',
+    '#album > .page',
+    '.album > .page',
+    '.pages > .page',
+    '.album-container > .page',
+    '.scroll-container > .page',
+    '.story-container > .page',
+  ];
+  function pages() {
+    const seen = new Set();
+    const out = [];
+    for (const selector of selectors) {
+      document.querySelectorAll(selector).forEach((el) => {
+        if (seen.has(el)) return;
+        seen.add(el);
+        out.push(el);
+      });
+    }
+    return out
+      .filter((page) => page.querySelector('[data-hv-text], [data-hv-image], [data-hv-cta], img, h1, h2, p, button, a'))
+      .filter((page) => !out.some((other) => other !== page && other.contains(page)));
+  }
+  function apply() {
+    const list = pages();
+    if (!list.length) return;
+    const safe = Math.max(0, Math.min(list.length - 1, config.pageIndex || 0));
+    document.documentElement.classList.add('hv-album-thumb');
+    document.body?.classList.add('hv-album-thumb');
+    list.forEach((page, index) => {
+      page.setAttribute('data-hv-thumb-page', String(index));
+      if (index === safe) {
+        const display = getComputedStyle(page).display;
+        page.style.setProperty('display', display && display !== 'none' ? display : 'block', 'important');
+        page.style.setProperty('visibility', 'visible', 'important');
+        page.style.setProperty('opacity', '1', 'important');
+        page.style.setProperty('position', 'relative', 'important');
+        page.style.setProperty('inset', 'auto', 'important');
+        page.style.setProperty('transform', 'none', 'important');
+        page.style.setProperty('width', '100%', 'important');
+        page.style.setProperty('min-height', '100vh', 'important');
+        page.style.setProperty('height', '100vh', 'important');
+        page.style.setProperty('overflow', 'hidden', 'important');
+        page.querySelectorAll('*').forEach((child) => {
+          child.style.setProperty('animation', 'none', 'important');
+          child.style.setProperty('transition', 'none', 'important');
+        });
+      } else {
+        page.style.setProperty('display', 'none', 'important');
+      }
+    });
+    const scroller = document.getElementById('album')
+      || document.querySelector('.album, [data-album], .scroll-container, .story-container, .album-container, .pages')
+      || document.scrollingElement
+      || document.documentElement;
+    if (scroller) scroller.scrollTop = 0;
+    document.documentElement.scrollTop = 0;
+    if (document.body) document.body.scrollTop = 0;
+  }
+  const css = document.createElement('style');
+  css.id = 'hv-studio-album-thumb';
+  css.textContent = \`
+html.hv-album-thumb, html.hv-album-thumb body {
+  margin: 0 !important;
+  overflow: hidden !important;
+  height: 100% !important;
+  min-height: 100% !important;
+  background: #0b1220;
+}
+html.hv-album-thumb #album,
+html.hv-album-thumb .album,
+html.hv-album-thumb [data-album],
+html.hv-album-thumb .scroll-container,
+html.hv-album-thumb .story-container,
+html.hv-album-thumb .album-container,
+html.hv-album-thumb .pages {
+  overflow: hidden !important;
+  height: 100% !important;
+  min-height: 100% !important;
+  max-height: 100% !important;
+  scroll-snap-type: none !important;
+  transform: none !important;
+}
+html.hv-album-thumb .album-controls,
+html.hv-album-thumb .dots,
+html.hv-album-thumb nav.album-controls,
+html.hv-album-thumb #prevPage,
+html.hv-album-thumb #nextPage,
+html.hv-album-thumb .prev-btn,
+html.hv-album-thumb .next-btn {
+  display: none !important;
+}
+html.hv-album-thumb [data-hv-thumb-page] {
+  animation: none !important;
+  transition: none !important;
+  scroll-snap-align: none !important;
+}
+\`;
+  (document.head || document.documentElement).appendChild(css);
+  apply();
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', apply, { once: true });
+  window.addEventListener('load', apply, { once: true });
+  requestAnimationFrame(apply);
+  setTimeout(apply, 80);
+  setTimeout(apply, 250);
+  setTimeout(apply, 800);
+})();
+</script>`;
+  if (html.includes('</head>')) return html.replace('</head>', `${snippet}\n</head>`);
+  if (html.includes('</body>')) return html.replace('</body>', `${snippet}\n</body>`);
+  return html + snippet;
 }
 
 async function readBody(req: IncomingMessage): Promise<Record<string, unknown>> {
@@ -3449,11 +3623,26 @@ async function persistResolutionFromInputs(
 ): Promise<void> {
   const aspect = inputs.collected?.aspect;
   if (!aspect) return;
-  const { width, height } = resolutionForAspect(aspect);
+  const { aspect: normalized, width, height } = resolutionForAspect(aspect);
   const proj = await ctx.projects.load(projectId);
   const current = proj.preferences?.resolution;
-  if (current?.width === width && current?.height === height) return;
-  proj.preferences = { ...proj.preferences, resolution: { width, height } };
+  const prevMeta = (proj.preferences as { generationMeta?: Record<string, unknown> } | undefined)?.generationMeta;
+  const ratioLabel =
+    normalized === '9:16' ? '9:16 竖屏'
+      : normalized === '1:1' ? '1:1 方形'
+        : normalized === '4:5' ? '4:5 小红书'
+          : '16:9 横屏';
+  const nextMeta = prevMeta && typeof prevMeta === 'object'
+    ? { ...prevMeta, ratio: ratioLabel }
+    : prevMeta;
+  const resolutionUnchanged = current?.width === width && current?.height === height;
+  const metaUnchanged = !nextMeta || (prevMeta as { ratio?: unknown } | undefined)?.ratio === ratioLabel;
+  if (resolutionUnchanged && metaUnchanged) return;
+  proj.preferences = {
+    ...proj.preferences,
+    resolution: { width, height },
+    ...(nextMeta ? { generationMeta: nextMeta } : {}),
+  };
   await ctx.projects.save(proj);
 }
 
@@ -4543,6 +4732,9 @@ function buildHtmlGenerationPrompt(args: BuildPromptArgs): string {
       p.push(`- Output ONE standalone interactive HTML document, not a content-graph and not multiple html#frame blocks.`);
       p.push(`- Treat the frame/page count as album page count. Prefer 4-6 pages unless the user specified otherwise.`);
       p.push(`- Mark every album page container with data-album-page or data-page, for example <section class="page" data-album-page="cover">...</section>, so Studio can edit one page at a time.`);
+      p.push(`- Mobile layout (REQUIRED, narrow screens): vertical full-viewport pages with scroll-snap; hide desktop prev/next chrome if needed; keep dots; one page per screen.`);
+      p.push(`- Desktop / PC layout (REQUIRED, wide screens): show Previous/Next controls, page counter, and dots; support Arrow/Page keyboard navigation; allow a more spacious multi-column page layout.`);
+      p.push(`- Deliver BOTH layouts in ONE HTML file via CSS media queries. Do NOT output only mobile or only desktop; opening the same file on phone and PC must both work.`);
       p.push(`- Mobile interaction: vertical scroll with scroll-snap; each page fills one viewport and the next page is reached by swiping/down-scrolling.`);
       p.push(`- Desktop interaction: visible Previous/Next controls, page dots or counter, and keyboard navigation for Arrow/Page keys.`);
       p.push(`- Use uploaded images/screenshots/materials as real album media. For image attachments, put the provided "Browser URL for HTML src/href" into <img src="..."> exactly; never use a Windows/local filesystem path and never use only the filename.`);
@@ -4550,7 +4742,7 @@ function buildHtmlGenerationPrompt(args: BuildPromptArgs): string {
       p.push(`- If the source is HTML, extract its visible content and visual structure into album pages.`);
       p.push(`- Tag visible text with data-hv-text keys so Studio can edit it after generation.`);
       p.push(`- Tag every replaceable album image with data-hv-image using stable keys such as cover.hero_image, page_2.photo, logo. For background-photo blocks, put data-hv-image on the element that owns the inline background-image.`);
-      p.push(`- Tag primary action buttons, contact buttons, phone/wechat/email links, and purchase/booking/contact actions with data-hv-cta. The CTA visible copy must remain editable text.`);
+      p.push(`- Tag primary action buttons, contact buttons, phone/wechat/email links, and purchase/booking/contact actions with data-hv-cta. The CTA visible copy must remain editable text. Prefer real <a href="..."> links (target=_blank) when a URL exists; do not leave outbound URLs only on inert <button> tags.`);
       p.push(`- Define theme colors in :root CSS variables, including --primary-color. Use var(--primary-color) for primary buttons, highlights, active dots, and brand accents instead of hardcoded repeated colors.`);
       p.push('');
     }
@@ -4705,7 +4897,7 @@ h1{font-size:8vw;letter-spacing:-.03em;animation:in 1.2s ease forwards;opacity:0
   }
   const iterateResolution = resolutionForAspect(inputs.collected?.aspect).resolution;
   if (isAlbumIteration) {
-    it.push(`Electronic album output requirements: ONE complete <!doctype html> document in a fenced \`\`\`html block. Keep vertical scroll-snap pages, page dots/counter or controls, and editable tags: data-hv-text for visible text, data-hv-image for replaceable images/background images, data-hv-cta for action/contact links, and :root --primary-color for theme color. Use the current aspect/resolution (${iterateResolution}). All visible text must stay in the user's language; for Chinese requests, translate/avoid English labels like "BRAND STRENGTH" unless they are proper nouns. No prose outside the block. Do NOT return an empty reply.`);
+    it.push(`Electronic album output requirements: ONE complete <!doctype html> document in a fenced \`\`\`html block. Keep BOTH mobile and PC layouts in the same file via CSS media queries: mobile = vertical scroll-snap pages; PC = visible prev/next controls + keyboard paging. Keep page dots/counter or controls, and editable tags: data-hv-text for visible text, data-hv-image for replaceable images/background images, data-hv-cta for action/contact links, and :root --primary-color for theme color. Use the current aspect/resolution (${iterateResolution}). All visible text must stay in the user's language; for Chinese requests, translate/avoid English labels like "BRAND STRENGTH" unless they are proper nouns. No prose outside the block. Do NOT return an empty reply.`);
   } else {
     it.push(`Output: ONE complete HTML document. Begin your reply with \`\`\`html and end with \`\`\`. Inline all CSS / JS. Full-bleed ${iterateResolution}. Preserve or add editable markers: data-hv-text for visible text, data-hv-image for replaceable images/background images, data-hv-cta for action/contact links, and :root --primary-color for theme color. All visible text must stay in the user's language. No prose outside the block. Do NOT return an empty reply.`);
   }
@@ -4785,8 +4977,9 @@ function extractHtmlDocument(text: string): string | null {
 }
 
 function hardenAlbumHtml(html: string): string {
-  if (html.includes('id="hv-album-safety"') || html.includes("id='hv-album-safety'")) return html;
-  const css = `
+  let out = html;
+  if (!out.includes('id="hv-album-safety"') && !out.includes("id='hv-album-safety'")) {
+    const css = `
 <style id="hv-album-safety">
   /* Studio safety patch: generated album pages sometimes leave non-cover media
      in the initial .reveal animation state, which makes uploaded photos look
@@ -4805,10 +4998,48 @@ function hardenAlbumHtml(html: string): string {
     visibility: visible !important;
     display: block !important;
   }
+  a.cta-btn,
+  a.cta-outline,
+  a[data-hv-cta] {
+    text-decoration: none;
+    box-sizing: border-box;
+  }
 </style>`;
-  if (/<\/head>/i.test(html)) return html.replace(/<\/head>/i, `${css}\n</head>`);
-  if (/<\/style>/i.test(html)) return html.replace(/<\/style>/i, `</style>\n${css}`);
-  return `${css}\n${html}`;
+    if (/<\/head>/i.test(out)) out = out.replace(/<\/head>/i, `${css}\n</head>`);
+    else if (/<\/style>/i.test(out)) out = out.replace(/<\/style>/i, `</style>\n${css}`);
+    else out = `${css}\n${out}`;
+  }
+
+  // CTA buttons often only carry data-href after Studio edits; make them clickable.
+  if (!out.includes('id="hv-album-cta-nav"') && !out.includes("id='hv-album-cta-nav'")) {
+    const script = `
+<script id="hv-album-cta-nav">
+(function () {
+  function normalizeHref(href) {
+    var s = String(href || '').trim();
+    if (!s) return '';
+    if (/^(https?:|mailto:|tel:|sms:|\\/\\/|\\/|#)/i.test(s)) return s;
+    if (/^[\\w.-]+\\.[a-z]{2,}([/:?#].*)?$/i.test(s)) return 'https://' + s;
+    return s;
+  }
+  document.addEventListener('click', function (e) {
+    var el = e.target && e.target.closest && e.target.closest('[data-hv-cta]');
+    if (!el) return;
+    if (el.tagName === 'A' && el.getAttribute('href')) return;
+    var href = normalizeHref(el.getAttribute('href') || el.getAttribute('data-href') || '');
+    if (!href) return;
+    e.preventDefault();
+    e.stopPropagation();
+    if (/^(mailto|tel|sms):/i.test(href)) window.location.href = href;
+    else window.open(href, '_blank', 'noopener,noreferrer');
+  }, true);
+})();
+</script>`;
+    if (/<\/body>/i.test(out)) out = out.replace(/<\/body>/i, `${script}\n</body>`);
+    else out = `${out}\n${script}`;
+  }
+
+  return out;
 }
 
 /**

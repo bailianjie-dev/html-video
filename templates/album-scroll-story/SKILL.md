@@ -39,6 +39,7 @@ Required behavior:
 - Use uploaded image/material paths in the media slots when available. If an uploaded asset is an HTML file, extract its meaningful text and visual structure into album pages rather than embedding a broken external page.
 - Prefer 4-6 pages unless the user asks for a different length.
 - Put concise editable text in elements with `data-hv-text` attributes so Studio can edit it later.
+- Tag every replaceable `<img>` (and any inline `background-image` photo slot) with a stable `data-hv-image` key (for example `page_01.photo`, `page_02.photo`) so Studio can swap user uploads after generation. Do not leave media slots unmarked.
 - Avoid lorem ipsum and generic filler. Every page should use the user's described topic, assets, brand, names, numbers, or event details.
 
 Page structure:
