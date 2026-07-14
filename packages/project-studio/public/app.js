@@ -80,7 +80,7 @@ const state = {
   composing: false,
   textFields: [],          // [{key, original, current}]
   imageFields: [],         // [{key, original, current, kind}]
-  ctaFields: [],           // [{key, original, current}]
+  ctaFields: [],           // [{key, original, current, hrefOriginal, href}]
   colorFields: [],         // [{key, original, current}]
   textSaveTimer: null,
   pendingAttachments: [],  // [{file, dataUrl?, name, kind, size}] before send
@@ -101,6 +101,7 @@ const state = {
   enhancing: null,         // { nodeId, pct, stage } while a single-frame enhance render is in flight
   templatePickContext: null, // { source:'chat'|'create', msgIdx?, resumeLabel? }
   createTemplateId: null,
+  createTopicDraft: '',
 };
 
 const ROUTES = {
@@ -1393,7 +1394,7 @@ function renderCreatePage() {
 
         <p class="prompt-guide">可以写公司介绍、产品亮点、客户案例、联系方式；也可以直接粘贴公司简介。</p>
         <div class="prompt-field">
-          <textarea id="create-topic-input" rows="8" placeholder="请输入电子相册主题，例如：大米科技有限公司公司介绍，包含封面、公司简介、核心业务、团队优势、联系方式。"></textarea>
+          <textarea id="create-topic-input" rows="8" placeholder="请输入电子相册主题，例如：大米科技有限公司公司介绍，包含封面、公司简介、核心业务、团队优势、联系方式。">${esc(state.createTopicDraft || '')}</textarea>
           <div class="prompt-bottom">
             <div class="prompt-tools">
               <button type="button" class="tool-btn" id="btn-create-attach" title="可选，上传 Logo、产品图等作为参考">${navIcon('image')}<span>补充参考图（可选）</span></button>
@@ -1418,11 +1419,18 @@ function renderCreatePage() {
 }
 
 function wireCreatePage() {
+  const topicInput = document.getElementById('create-topic-input');
+  if (topicInput) {
+    topicInput.addEventListener('input', () => {
+      state.createTopicDraft = topicInput.value;
+    });
+  }
   document.querySelectorAll('[data-topic]').forEach((btn) => {
     btn.onclick = () => {
       const input = document.getElementById('create-topic-input');
       if (input) {
         input.value = btn.dataset.topic || '';
+        state.createTopicDraft = input.value;
         input.focus();
       }
     };
@@ -1430,6 +1438,7 @@ function wireCreatePage() {
   const templateBtn = document.getElementById('btn-create-template');
   if (templateBtn) {
     templateBtn.onclick = () => {
+      state.createTopicDraft = document.getElementById('create-topic-input')?.value || state.createTopicDraft || '';
       state.templatePickContext = { source: 'create' };
       openGallery();
     };
@@ -4337,7 +4346,7 @@ function getAlbumPagesFromIframe(iframe) {
   try {
     const doc = iframe?.contentDocument;
     if (!doc) return [];
-    return Array.from(doc.querySelectorAll('[data-page]'));
+    return findAlbumPageElements(doc);
   } catch {
     return [];
   }
@@ -4345,7 +4354,36 @@ function getAlbumPagesFromIframe(iframe) {
 
 function getAlbumPagesFromDoc(doc) {
   if (!doc) return [];
-  return Array.from(doc.querySelectorAll('[data-page]'));
+  return findAlbumPageElements(doc);
+}
+
+function findAlbumPageElements(root) {
+  const selectors = [
+    '[data-page]',
+    '[data-album-page]',
+    '.album-page',
+    'section.page',
+    'article.page',
+    'main.page',
+    '#album > .page',
+    '.album > .page',
+    '.pages > .page',
+    '.album-container > .page',
+    '.scroll-container > .page',
+    '.story-container > .page',
+  ];
+  const pages = [];
+  const seen = new Set();
+  for (const selector of selectors) {
+    root.querySelectorAll(selector).forEach((el) => {
+      if (seen.has(el)) return;
+      seen.add(el);
+      pages.push(el);
+    });
+  }
+  return pages
+    .filter((page) => page.querySelector('[data-hv-text], [data-hv-image], [data-hv-cta], img, h1, h2, p, button, a'))
+    .filter((page) => !pages.some((other) => other !== page && other.contains(page)));
 }
 
 function isElectronicAlbumProject() {
@@ -4396,7 +4434,10 @@ function updateAlbumPageEditControls() {
 async function flushTextEditsIfNeeded() {
   clearTimeout(state.textSaveTimer);
   state.textSaveTimer = null;
-  const dirty = state.textFields.some((f) => f.current !== f.original);
+  const dirty = state.textFields.some((f) => f.current !== f.original)
+    || state.imageFields.some((f) => f.current !== f.original)
+    || state.ctaFields.some((f) => isCtaFieldDirty(f))
+    || state.colorFields.some((f) => f.current !== f.original);
   if (dirty) await commitTextEdits();
 }
 
@@ -4886,6 +4927,9 @@ async function refreshTextFields() {
   if (isAlbum && state.albumPageTextEditActive) {
     const idx = Math.max(0, Math.min(albumPages.length - 1, state.activeAlbumPage || 0));
     scanRoot = albumPages[idx] || doc;
+    const pageHasEditableFields = scanRoot.querySelector('[data-hv-text], [data-hv-image], [data-hv-cta]');
+    const docHasEditableFields = doc.querySelector('[data-hv-text], [data-hv-image], [data-hv-cta]');
+    if (!pageHasEditableFields && docHasEditableFields) scanRoot = doc;
   }
 
   const nodes = scanRoot.querySelectorAll('[data-hv-text]');
@@ -4908,12 +4952,16 @@ async function refreshTextFields() {
 
 function scanEditableImages(root) {
   const seen = new Set();
-  return Array.from(root.querySelectorAll('[data-hv-image]')).map((el, index) => {
+  const explicit = Array.from(root.querySelectorAll('[data-hv-image]'));
+  const fallback = explicit.length ? [] : Array.from(root.querySelectorAll('img, [style*="background"]'))
+    .filter((el) => el.tagName === 'IMG' || /url\(/i.test(el.getAttribute('style') || ''));
+  return [...explicit, ...fallback].map((el, index) => {
+    const explicitKey = el.getAttribute('data-hv-image');
     const key = el.getAttribute('data-hv-image') || `image_${index + 1}`;
     if (seen.has(key)) return null;
     seen.add(key);
     const current = readImageValue(el);
-    return { key, original: current, current, kind: imageFieldKind(el) };
+    return { key, original: current, current, kind: imageFieldKind(el), fallbackIndex: explicitKey ? -1 : index };
   }).filter(Boolean);
 }
 
@@ -4926,25 +4974,66 @@ function scanEditableCtas(root) {
     const key = el.getAttribute('data-hv-cta') || el.getAttribute('data-hv-text') || `cta_${index + 1}`;
     if (seen.has(key)) return null;
     seen.add(key);
-    const text = el.textContent ?? '';
-    return { key, original: text, current: text };
+    const text = (el.textContent ?? '').trim();
+    const href = readCtaHref(el);
+    return {
+      key,
+      original: text,
+      current: text,
+      hrefOriginal: href,
+      href,
+    };
   }).filter(Boolean);
+}
+
+function readCtaHref(el) {
+  if (!el) return '';
+  if (el.tagName === 'A') return el.getAttribute('href') || '';
+  return el.getAttribute('href') || el.getAttribute('data-href') || '';
+}
+
+function writeCtaValue(el, text, href) {
+  el.textContent = text ?? '';
+  const nextHref = String(href ?? '').trim();
+  const usesDataHref = el.hasAttribute('data-href') && !el.hasAttribute('href') && el.tagName !== 'A';
+  if (el.tagName === 'A' || el.hasAttribute('href')) {
+    if (nextHref) el.setAttribute('href', nextHref);
+    else el.removeAttribute('href');
+    return;
+  }
+  if (usesDataHref || nextHref) {
+    if (nextHref) el.setAttribute('data-href', nextHref);
+    else el.removeAttribute('data-href');
+  }
+}
+
+function isCtaFieldDirty(f) {
+  if (!f) return false;
+  return f.current !== f.original || String(f.href ?? '') !== String(f.hrefOriginal ?? '');
 }
 
 function scanEditableColors(doc) {
   const styleText = Array.from(doc.querySelectorAll('style')).map((style) => style.textContent || '').join('\n');
   const vars = [];
   const seen = new Set();
-  const re = /(--(?:primary|brand|accent|theme|main)(?:-[a-z0-9]+)*-?color|--primary-color)\s*:\s*(#[0-9a-f]{3,8}|rgba?\([^)]+\)|hsla?\([^)]+\))/gi;
+  const re = /(--[a-z0-9_-]+)\s*:\s*(#[0-9a-f]{3,8}|rgba?\([^)]+\)|hsla?\([^)]+\)|[a-z]+)\s*;/gi;
   let match;
   while ((match = re.exec(styleText)) !== null) {
     const key = match[1];
     const value = normalizeColorInput(match[2]);
-    if (!key || !value || seen.has(key)) continue;
+    if (!key || !value || seen.has(key) || !looksLikeEditableColorVar(key, value)) continue;
     seen.add(key);
     vars.push({ key, original: value, current: value });
   }
   return vars;
+}
+
+function looksLikeEditableColorVar(key, value) {
+  const k = String(key || '').toLowerCase();
+  const v = String(value || '').toLowerCase();
+  if (/font/.test(k)) return false;
+  if (/color|primary|brand|accent|theme|main|blue|red|green|yellow|orange|purple|pink|dark|light|white|black|gray|grey|bg|background/.test(k)) return true;
+  return /^#|^rgb|^hsl|^(white|black|transparent|currentcolor|red|blue|green|yellow|orange|purple|pink|gray|grey)$/i.test(v);
 }
 
 function imageFieldKind(el) {
@@ -4971,7 +5060,7 @@ function normalizeColorInput(value) {
   return `#${parts.join('')}`;
 }
 
-function renderTextFields(opts = {}) {
+function renderTextFieldsLegacy(opts = {}) {
   const wrap = document.getElementById('text-fields');
   if (!wrap) return;
   syncTextPaneTitle();
@@ -5041,6 +5130,236 @@ function summarizeFieldValue(text) {
   const raw = String(text || '').replace(/\s+/g, ' ').trim();
   if (!raw) return '(空)';
   return raw.length > 36 ? `${raw.slice(0, 36)}…` : raw;
+}
+
+function updateFieldSnippet(card, value) {
+  const snip = card?.querySelector('.text-field-snip');
+  if (!snip) return;
+  snip.textContent = summarizeFieldValue(value);
+  snip.title = value;
+}
+
+function colorInputValue(value) {
+  const normalized = normalizeColorInput(value);
+  return /^#[0-9a-f]{6}$/i.test(normalized) ? normalized : '#2563eb';
+}
+
+function humanizeColorKey(key) {
+  const raw = String(key || '').trim();
+  if (raw === '--primary-color') return editPaneText('text_pane.primary_color');
+  if (/brand/i.test(raw)) return editPaneText('text_pane.brand_color');
+  if (/accent/i.test(raw)) return editPaneText('text_pane.accent_color');
+  return raw.replace(/^--/, '').replace(/-/g, ' ');
+}
+
+function editPaneText(key, params = {}) {
+  const fallback = {
+    'text_pane.section_colors': '主题',
+    'text_pane.section_images': '图片',
+    'text_pane.section_cta': 'CTA',
+    'text_pane.section_text': '文字',
+    'text_pane.primary_color': '主色',
+    'text_pane.brand_color': '品牌色',
+    'text_pane.accent_color': '强调色',
+    'text_pane.image_label': '图片 {n}',
+    'text_pane.image_placeholder': '图片 URL',
+    'text_pane.image_upload': '上传',
+    'text_pane.image_uploading': '上传中…',
+    'text_pane.image_upload_error': '图片上传失败',
+    'text_pane.cta_label': 'CTA {n}',
+    'text_pane.cta_placeholder': 'CTA 文案',
+    'text_pane.cta_href_placeholder': '链接 URL（可选）',
+  };
+  let text = t(key, params);
+  if (text === key) text = fallback[key] || key;
+  for (const [name, value] of Object.entries(params)) {
+    text = text.replaceAll(`{${name}}`, String(value));
+  }
+  return text;
+}
+
+function renderTextFields(opts = {}) {
+  const wrap = document.getElementById('text-fields');
+  if (!wrap) return;
+  syncTextPaneTitle();
+  if (!state.selected) {
+    wrap.innerHTML = `<div class="text-empty">${t('text_pane.no_project')}</div>`;
+    return;
+  }
+  if (opts.albumAwaitEdit && state.colorFields.length === 0) {
+    wrap.innerHTML = `<div class="text-empty">${t('text_pane.edit_page_hint')}</div>`;
+    return;
+  }
+  const hasEditableFields = state.textFields.length > 0
+    || state.imageFields.length > 0
+    || state.ctaFields.length > 0
+    || state.colorFields.length > 0;
+  if (!hasEditableFields) {
+    if (opts.albumEmptyPage) {
+      wrap.innerHTML = `<div class="text-empty">${t('text_pane.empty_page')}</div>`;
+      return;
+    }
+    const hasFrames = (state.selected.frames?.length ?? 0) > 0;
+    const hint = hasFrames ? t('text_pane.empty_with_frames') : t('text_pane.empty_no_frames');
+    wrap.innerHTML = `<div class="text-empty">${hint}</div>`;
+    return;
+  }
+
+  const tip = `<p class="text-fields-tip">${t('text_pane.locate_tip')}</p>`;
+  const colorHtml = state.colorFields.length ? `
+    <div class="edit-field-section">
+      <div class="edit-field-section-title">${editPaneText('text_pane.section_colors')}</div>
+      ${state.colorFields.map((f, i) => `
+        <div class="text-field color-edit-field" data-color-i="${i}">
+          <div class="text-field-head">
+            <span class="text-field-index">${i + 1}</span>
+            <div class="text-field-meta">
+              <div class="text-field-label">${esc(humanizeColorKey(f.key))}</div>
+              <div class="text-field-snip">${esc(f.key)}</div>
+            </div>
+          </div>
+          <div class="color-edit-row">
+            <input type="color" data-color-picker-i="${i}" value="${escAttr(colorInputValue(f.current))}" />
+            <input data-color-i="${i}" value="${escAttr(f.current)}" placeholder="#2563eb" />
+          </div>
+        </div>
+      `).join('')}
+    </div>` : '';
+  const imageHtml = state.imageFields.length ? `
+    <div class="edit-field-section">
+      <div class="edit-field-section-title">${editPaneText('text_pane.section_images')}</div>
+      ${state.imageFields.map((f, i) => `
+        <div class="text-field image-edit-field" data-image-i="${i}">
+          <div class="text-field-head">
+            <span class="text-field-index">${i + 1}</span>
+            <div class="text-field-meta">
+              <div class="text-field-label">${esc(humanizeKey(f.key, i + 1) || editPaneText('text_pane.image_label', { n: i + 1 }))}</div>
+              <div class="text-field-snip" title="${escAttr(f.current)}">${esc(summarizeFieldValue(f.current))}</div>
+            </div>
+          </div>
+          <div class="image-edit-row">
+            <input data-image-i="${i}" value="${escAttr(f.current)}" placeholder="${escAttr(editPaneText('text_pane.image_placeholder'))}" />
+            <button type="button" class="image-upload-btn" data-image-upload-i="${i}">${editPaneText('text_pane.image_upload')}</button>
+            <input type="file" accept="image/*" hidden data-image-file-i="${i}" />
+          </div>
+        </div>
+      `).join('')}
+    </div>` : '';
+  const ctaHtml = state.ctaFields.length ? `
+    <div class="edit-field-section">
+      <div class="edit-field-section-title">${editPaneText('text_pane.section_cta')}</div>
+      ${state.ctaFields.map((f, i) => `
+        <div class="text-field cta-edit-field" data-cta-i="${i}">
+          <div class="text-field-head">
+            <span class="text-field-index">${i + 1}</span>
+            <div class="text-field-meta">
+              <div class="text-field-label">${esc(humanizeKey(f.key, i + 1) || editPaneText('text_pane.cta_label', { n: i + 1 }))}</div>
+              <div class="text-field-snip" title="${escAttr(f.current)}">${esc(summarizeFieldValue(f.current))}</div>
+            </div>
+          </div>
+          <div class="cta-edit-row">
+            <input data-cta-i="${i}" value="${escAttr(f.current)}" placeholder="${escAttr(editPaneText('text_pane.cta_placeholder'))}" />
+            <input data-cta-href-i="${i}" value="${escAttr(f.href || '')}" placeholder="${escAttr(editPaneText('text_pane.cta_href_placeholder'))}" />
+          </div>
+        </div>
+      `).join('')}
+    </div>` : '';
+  const textHtml = state.textFields.length ? `
+    <div class="edit-field-section">
+      <div class="edit-field-section-title">${editPaneText('text_pane.section_text')}</div>
+      ${state.textFields.map((f, i) => {
+    const labelKey = humanizeKey(f.key, i + 1);
+    const snip = summarizeFieldValue(f.current);
+    return `<div class="text-field" data-key="${escAttr(f.key)}" data-i="${i}">
+      <div class="text-field-head">
+        <span class="text-field-index">${i + 1}</span>
+        <div class="text-field-meta">
+          <div class="text-field-label">${esc(labelKey)}</div>
+          <div class="text-field-snip" title="${escAttr(f.current)}">${esc(snip)}</div>
+        </div>
+        <button type="button" class="text-field-locate" data-key="${escAttr(f.key)}" title="${escAttr(t('text_pane.locate_title'))}">${t('text_pane.locate')}</button>
+      </div>
+      <textarea data-i="${i}" data-key="${escAttr(f.key)}" rows="1" placeholder="${escAttr(t('text_pane.placeholder_empty'))}">${esc(f.current)}</textarea>
+    </div>`;
+  }).join('')}
+    </div>` : '';
+  wrap.innerHTML = tip + colorHtml + imageHtml + ctaHtml + textHtml;
+
+  wrap.querySelectorAll('textarea[data-i]').forEach((el) => {
+    autoResize(el);
+    el.addEventListener('input', (e) => {
+      const i = Number(e.target.dataset.i);
+      state.textFields[i].current = e.target.value;
+      updateFieldSnippet(e.target.closest('.text-field'), e.target.value);
+      autoResize(el);
+      scheduleTextSave();
+    });
+    el.addEventListener('focus', () => locateTextField(el.dataset.key, { fromPreview: false }));
+    el.addEventListener('mouseenter', () => softHighlightPreviewField(el.dataset.key));
+    el.addEventListener('mouseleave', () => {
+      if (document.activeElement !== el) clearPreviewFieldHighlight();
+    });
+  });
+  wrap.querySelectorAll('.text-field-locate').forEach((btn) => {
+    btn.addEventListener('click', (e) => {
+      e.preventDefault();
+      locateTextField(btn.dataset.key, { pulse: true });
+    });
+  });
+  wrap.querySelectorAll('input[data-image-i]').forEach((el) => {
+    el.addEventListener('input', (e) => {
+      const i = Number(e.target.dataset.imageI);
+      applyImageFieldValue(i, e.target.value, { save: true, syncInput: false });
+    });
+  });
+  wrap.querySelectorAll('button[data-image-upload-i]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const i = Number(btn.dataset.imageUploadI);
+      wrap.querySelector(`input[data-image-file-i="${i}"]`)?.click();
+    });
+  });
+  wrap.querySelectorAll('input[data-image-file-i]').forEach((el) => {
+    el.addEventListener('change', async (e) => {
+      const i = Number(e.target.dataset.imageFileI);
+      const file = e.target.files?.[0];
+      e.target.value = '';
+      if (!file) return;
+      await uploadImageForFieldIndex(i, file);
+    });
+  });
+  wrap.querySelectorAll('input[data-cta-i]').forEach((el) => {
+    el.addEventListener('input', (e) => {
+      const i = Number(e.target.dataset.ctaI);
+      state.ctaFields[i].current = e.target.value;
+      updateFieldSnippet(e.target.closest('.text-field'), e.target.value);
+      scheduleTextSave();
+    });
+  });
+  wrap.querySelectorAll('input[data-cta-href-i]').forEach((el) => {
+    el.addEventListener('input', (e) => {
+      const i = Number(e.target.dataset.ctaHrefI);
+      state.ctaFields[i].href = e.target.value;
+      scheduleTextSave();
+    });
+  });
+  wrap.querySelectorAll('input[data-color-i]').forEach((el) => {
+    el.addEventListener('input', (e) => {
+      const i = Number(e.target.dataset.colorI);
+      state.colorFields[i].current = e.target.value;
+      const picker = wrap.querySelector(`input[data-color-picker-i="${i}"]`);
+      if (picker && /^#[0-9a-f]{6}$/i.test(e.target.value)) picker.value = e.target.value;
+      scheduleTextSave();
+    });
+  });
+  wrap.querySelectorAll('input[data-color-picker-i]').forEach((el) => {
+    el.addEventListener('input', (e) => {
+      const i = Number(e.target.dataset.colorPickerI);
+      state.colorFields[i].current = e.target.value;
+      const text = wrap.querySelector(`input[data-color-i="${i}"]`);
+      if (text) text.value = e.target.value;
+      scheduleTextSave();
+    });
+  });
 }
 
 function escAttr(s) {
@@ -5467,8 +5786,11 @@ function setSaveState(text, kind = '') {
 
 async function commitTextEdits() {
   if (!state.selected) return;
-  const dirty = state.textFields.filter((f) => f.current !== f.original);
-  if (dirty.length === 0) {
+  const dirtyText = state.textFields.filter((f) => f.current !== f.original);
+  const dirtyImages = state.imageFields.filter((f) => f.current !== f.original);
+  const dirtyCtas = state.ctaFields.filter((f) => isCtaFieldDirty(f));
+  const dirtyColors = state.colorFields.filter((f) => f.current !== f.original);
+  if (dirtyText.length === 0 && dirtyImages.length === 0 && dirtyCtas.length === 0 && dirtyColors.length === 0) {
     setSaveState(t('text_pane.save_state.idle'));
     return;
   }
@@ -5481,6 +5803,22 @@ async function commitTextEdits() {
   for (const f of state.textFields) {
     const nodes = doc.querySelectorAll(`[data-hv-text="${cssEscape(f.key)}"]`);
     nodes.forEach((n) => { n.textContent = f.current; });
+    f.original = f.current;
+  }
+  for (const f of state.imageFields) {
+    const nodes = findImageNodesForField(doc, f);
+    nodes.forEach((n) => writeImageValue(n, f.current));
+    f.original = f.current;
+  }
+  for (const f of state.ctaFields) {
+    let nodes = Array.from(doc.querySelectorAll(`[data-hv-cta="${cssEscape(f.key)}"]`));
+    if (nodes.length === 0) nodes = Array.from(doc.querySelectorAll(`[data-hv-text="${cssEscape(f.key)}"]`));
+    nodes.forEach((n) => writeCtaValue(n, f.current, f.href));
+    f.original = f.current;
+    f.hrefOriginal = f.href;
+  }
+  for (const f of state.colorFields) {
+    replaceCssVariable(doc, f.key, f.current);
     f.original = f.current;
   }
   // Serialize back: include doctype because DOMParser drops it
@@ -5517,6 +5855,117 @@ async function commitTextEdits() {
   }
   setSaveState(t('text_pane.save_state.saved'), 'saved');
   reloadPreview();
+}
+
+function writeImageValue(el, value) {
+  if (el.tagName === 'IMG' || el.getAttribute('src') != null) {
+    el.setAttribute('src', value);
+    return;
+  }
+  const style = el.getAttribute('style') || '';
+  const nextUrl = `url("${String(value).replace(/\\/g, '\\\\').replace(/"/g, '\\"')}")`;
+  if (/background(?:-image)?\s*:/i.test(style)) {
+    el.setAttribute('style', style.replace(/background(?:-image)?\s*:\s*[^;]*url\((['"]?).*?\1\)[^;]*/i, (match) => {
+      return match.replace(/url\((['"]?).*?\1\)/i, nextUrl);
+    }));
+  } else {
+    el.setAttribute('style', `${style}${style.trim().endsWith(';') || !style.trim() ? '' : ';'} background-image: ${nextUrl};`);
+  }
+}
+
+/** Same contract as agent prompt: https URL, or /asset?path=… for local files. */
+function browserUrlForProjectAsset(asset) {
+  if (!asset) return '';
+  if (asset.url && /^https?:\/\//i.test(asset.url)) return asset.url;
+  if (asset.path && /^https?:\/\//i.test(asset.path)) return asset.path;
+  if (asset.path) return `/asset?path=${encodeURIComponent(asset.path)}`;
+  if (state.selectedId && asset.id) {
+    return `/api/projects/${encodeURIComponent(state.selectedId)}/assets/${encodeURIComponent(asset.id)}/content`;
+  }
+  return '';
+}
+
+function applyImageFieldValue(index, url, { save = true, syncInput = true } = {}) {
+  const field = state.imageFields[index];
+  if (!field) return;
+  field.current = String(url ?? '');
+  const wrap = document.getElementById('text-fields');
+  const card = wrap?.querySelector(`.image-edit-field[data-image-i="${index}"]`);
+  if (syncInput) {
+    const input = card?.querySelector(`input[data-image-i="${index}"]`);
+    if (input) input.value = field.current;
+  }
+  updateFieldSnippet(card, field.current);
+  const doc = getPreviewDocument();
+  if (doc) {
+    findImageNodesForField(doc, field).forEach((n) => writeImageValue(n, field.current));
+  }
+  if (save) scheduleTextSave();
+}
+
+async function uploadImageForFieldIndex(index, file) {
+  if (!state.selected?.id || !file || !state.imageFields[index]) return;
+  if (!String(file.type || '').startsWith('image/')) {
+    setSaveState(editPaneText('text_pane.image_upload_error'), 'error');
+    return;
+  }
+  const wrap = document.getElementById('text-fields');
+  const btn = wrap?.querySelector(`button[data-image-upload-i="${index}"]`);
+  const prevLabel = btn?.textContent;
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = editPaneText('text_pane.image_uploading');
+  }
+  setSaveState(editPaneText('text_pane.image_uploading'), 'saving');
+  try {
+    const fd = new FormData();
+    fd.append('file', file, file.name);
+    const res = await fetch(`/api/projects/${encodeURIComponent(state.selected.id)}/assets`, {
+      method: 'POST',
+      body: fd,
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.error || `upload ${res.status}`);
+    }
+    const data = await res.json();
+    if (data.project) state.selected = data.project;
+    const assets = data.project?.assets || [];
+    const prevIds = new Set((state.projectAssets || []).map((a) => a.id));
+    const asset = [...assets].reverse().find((a) => a?.id && !prevIds.has(a.id))
+      || assets[assets.length - 1];
+    const url = browserUrlForProjectAsset(asset);
+    if (!url) throw new Error('missing asset url');
+    applyImageFieldValue(index, url, { save: true, syncInput: true });
+    refreshProjectAssets(state.selected.id);
+  } catch (error) {
+    console.warn('[studio] image field upload failed:', error);
+    setSaveState(editPaneText('text_pane.image_upload_error'), 'error');
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = prevLabel || editPaneText('text_pane.image_upload');
+    }
+  }
+}
+
+function findImageNodesForField(doc, field) {
+  const explicit = Array.from(doc.querySelectorAll(`[data-hv-image="${cssEscape(field.key)}"]`));
+  if (explicit.length) return explicit;
+  const fallback = Array.from(doc.querySelectorAll('img, [style*="background"]'))
+    .filter((el) => el.tagName === 'IMG' || /url\(/i.test(el.getAttribute('style') || ''));
+  const index = Number(field.fallbackIndex);
+  return Number.isFinite(index) && index >= 0 && fallback[index] ? [fallback[index]] : [];
+}
+
+function replaceCssVariable(doc, key, value) {
+  const escaped = key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const re = new RegExp(`(${escaped}\\s*:\\s*)(#[0-9a-f]{3,8}|rgba?\\([^)]+\\)|hsla?\\([^)]+\\))`, 'gi');
+  for (const style of doc.querySelectorAll('style')) {
+    const original = style.textContent || '';
+    const next = original.replace(re, `$1${value}`);
+    if (next !== original) style.textContent = next;
+  }
 }
 
 function cssEscape(s) {

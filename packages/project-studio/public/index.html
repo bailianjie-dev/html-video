@@ -1615,7 +1615,16 @@
     justify-content: flex-end;
     flex-wrap: wrap;
     gap: 10px;
-    flex: 0 0 min(680px, 48vw);
+    flex: 0 0 auto;
+  }
+  #btn-generation-copy,
+  #btn-generation-style,
+  #btn-generation-pages,
+  #btn-generation-image,
+  #btn-generation-cta,
+  #btn-generation-regenerate,
+  .generation-side-composer {
+    display: none !important;
   }
   .generation-btn {
     height: 34px;
@@ -2831,6 +2840,16 @@
     font-size: 12px;
     line-height: 1.55;
   }
+  .edit-field-section { margin-bottom: 16px; }
+  .edit-field-section-title {
+    margin: 2px 0 8px;
+    color: var(--text-muted);
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: .08em;
+    text-transform: uppercase;
+    font-family: var(--font-mono);
+  }
   .text-field {
     margin-bottom: 12px;
     padding: 10px;
@@ -2908,6 +2927,48 @@
     font-family: var(--font-sans); line-height: 1.55; }
   .text-field input:focus, .text-field textarea:focus {
     border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+  .color-edit-row {
+    display: grid;
+    grid-template-columns: 42px 1fr;
+    gap: 8px;
+    align-items: center;
+  }
+  .color-edit-row input[type="color"] {
+    width: 42px;
+    height: 34px;
+    padding: 3px;
+    cursor: pointer;
+  }
+  .cta-edit-row {
+    display: grid;
+    gap: 8px;
+  }
+  .image-edit-row {
+    display: grid;
+    grid-template-columns: 1fr auto;
+    gap: 8px;
+    align-items: center;
+  }
+  .image-upload-btn {
+    height: 34px;
+    padding: 0 12px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--bg-elevated, #f8fafc);
+    color: var(--text);
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  .image-upload-btn:hover:not(:disabled) {
+    border-color: var(--accent);
+    color: var(--accent);
+  }
+  .image-upload-btn:disabled {
+    opacity: 0.6;
+    cursor: wait;
+  }
   .text-field textarea { resize: vertical; min-height: 38px; }
 
   /* ===== Centre pane: preview + frames timeline + footer ===== */

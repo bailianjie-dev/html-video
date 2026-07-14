@@ -4542,15 +4542,20 @@ function buildHtmlGenerationPrompt(args: BuildPromptArgs): string {
       p.push(`Electronic album requirements (REQUIRED):`);
       p.push(`- Output ONE standalone interactive HTML document, not a content-graph and not multiple html#frame blocks.`);
       p.push(`- Treat the frame/page count as album page count. Prefer 4-6 pages unless the user specified otherwise.`);
+      p.push(`- Mark every album page container with data-album-page or data-page, for example <section class="page" data-album-page="cover">...</section>, so Studio can edit one page at a time.`);
       p.push(`- Mobile interaction: vertical scroll with scroll-snap; each page fills one viewport and the next page is reached by swiping/down-scrolling.`);
       p.push(`- Desktop interaction: visible Previous/Next controls, page dots or counter, and keyboard navigation for Arrow/Page keys.`);
       p.push(`- Use uploaded images/screenshots/materials as real album media. For image attachments, put the provided "Browser URL for HTML src/href" into <img src="..."> exactly; never use a Windows/local filesystem path and never use only the filename.`);
       p.push(`- If the user asks for image-to-album, preserve the uploaded image order: first image = first page, second image = second page, and so on.`);
       p.push(`- If the source is HTML, extract its visible content and visual structure into album pages.`);
       p.push(`- Tag visible text with data-hv-text keys so Studio can edit it after generation.`);
+      p.push(`- Tag every replaceable album image with data-hv-image using stable keys such as cover.hero_image, page_2.photo, logo. For background-photo blocks, put data-hv-image on the element that owns the inline background-image.`);
+      p.push(`- Tag primary action buttons, contact buttons, phone/wechat/email links, and purchase/booking/contact actions with data-hv-cta. The CTA visible copy must remain editable text.`);
+      p.push(`- Define theme colors in :root CSS variables, including --primary-color. Use var(--primary-color) for primary buttons, highlights, active dots, and brand accents instead of hardcoded repeated colors.`);
       p.push('');
     }
-    p.push(`Constraints: full-bleed ${resolution}, opens with an animation timeline, inline CSS + JS, single complete <!doctype html>...</html> document(s). CDN imports (Tailwind, GSAP) are fine. Tag every visible text node with data-hv-text set to a stable English key (brand_name, headline, item_1, cta…), but keep the visible text itself in the user's language. No prose outside code blocks.`);
+    p.push(`Editable HTML contract (REQUIRED): tag every visible text node with data-hv-text set to a stable English key (brand_name, headline, item_1, cta...), tag replaceable images with data-hv-image, tag action/contact/purchase buttons or links with data-hv-cta, and define :root { --primary-color: ... } plus any related theme variables. Use CSS variables for primary colors throughout.`);
+    p.push(`Constraints: full-bleed ${resolution}, opens with an animation timeline, inline CSS + JS, single complete <!doctype html>...</html> document(s). CDN imports (Tailwind, GSAP) are fine. Keep visible text in the user's language. No prose outside code blocks.`);
     p.push('');
     // Frame-count safety: claude --print can truncate / stall on very large
     // multi-frame batches. Cap at 10 (high frame counts get progressively
@@ -4671,7 +4676,7 @@ h1{font-size:8vw;letter-spacing:-.03em;animation:in 1.2s ease forwards;opacity:0
     it.push(`The user has pinned frame "${args.focusFrameId}" and wants to revise ONLY that frame. Apply their request below — write a fresh complete HTML page that delivers the same content, in roughly the same visual style, but with the requested change.`);
   } else if (isAlbumIteration) {
     it.push(`The user is iterating on an existing electronic album HTML. Apply their request below by rewriting the CURRENT album as ONE complete standalone interactive HTML document.`);
-    it.push(`Preserve the current album's visual style and existing content unless the user explicitly asks to change them. If the user asks to add a page, add a new scroll-snap album page. If they provide a CTA URL, make the relevant button/link point to that URL. If they attach an image, use its Browser URL as a real <img> asset in the album.`);
+    it.push(`Preserve the current album's visual style and existing content unless the user explicitly asks to change them. If the user asks to add a page, add a new scroll-snap album page. If they provide a CTA URL, make the relevant button/link point to that URL. If they attach an image, use its Browser URL as a real <img> asset in the album. Preserve or add data-hv-text, data-hv-image, data-hv-cta, and :root --primary-color so Studio can edit the result.`);
   } else {
     it.push(`The user is iterating on an existing HTML video. Apply their request below — write a fresh complete HTML page that delivers the same content, in roughly the same visual style, but with the requested change.`);
   }
@@ -4700,9 +4705,9 @@ h1{font-size:8vw;letter-spacing:-.03em;animation:in 1.2s ease forwards;opacity:0
   }
   const iterateResolution = resolutionForAspect(inputs.collected?.aspect).resolution;
   if (isAlbumIteration) {
-    it.push(`Electronic album output requirements: ONE complete <!doctype html> document in a fenced \`\`\`html block. Keep vertical scroll-snap pages, page dots/counter or controls, and data-hv-text tags. Use the current aspect/resolution (${iterateResolution}). All visible text must stay in the user's language; for Chinese requests, translate/avoid English labels like "BRAND STRENGTH" unless they are proper nouns. No prose outside the block. Do NOT return an empty reply.`);
+    it.push(`Electronic album output requirements: ONE complete <!doctype html> document in a fenced \`\`\`html block. Keep vertical scroll-snap pages, page dots/counter or controls, and editable tags: data-hv-text for visible text, data-hv-image for replaceable images/background images, data-hv-cta for action/contact links, and :root --primary-color for theme color. Use the current aspect/resolution (${iterateResolution}). All visible text must stay in the user's language; for Chinese requests, translate/avoid English labels like "BRAND STRENGTH" unless they are proper nouns. No prose outside the block. Do NOT return an empty reply.`);
   } else {
-    it.push(`Output: ONE complete HTML document. Begin your reply with \`\`\`html and end with \`\`\`. Inline all CSS / JS. Full-bleed ${iterateResolution}. Tag visible text with data-hv-text (preserve existing keys when meaningful). All visible text must stay in the user's language. No prose outside the block. Do NOT return an empty reply.`);
+    it.push(`Output: ONE complete HTML document. Begin your reply with \`\`\`html and end with \`\`\`. Inline all CSS / JS. Full-bleed ${iterateResolution}. Preserve or add editable markers: data-hv-text for visible text, data-hv-image for replaceable images/background images, data-hv-cta for action/contact links, and :root --primary-color for theme color. All visible text must stay in the user's language. No prose outside the block. Do NOT return an empty reply.`);
   }
   it.push('');
   it.push(`Skeleton to extend (replace with the real content + visual style):`);
@@ -5119,7 +5124,7 @@ async function runSplitMultiFrameGenerate(
       for (const a of frameSourceTexts) fp.push((a.inlineText ?? '').slice(0, 3000));
       fp.push('');
     }
-    fp.push(`Output: begin with \`\`\`html and end with \`\`\`. Inline CSS + JS, full-bleed ${resolution}, opens with an animation timeline. Tag visible text with data-hv-text. CDN imports (Tailwind, GSAP) fine. No prose outside the block.`);
+    fp.push(`Output: begin with \`\`\`html and end with \`\`\`. Inline CSS + JS, full-bleed ${resolution}, opens with an animation timeline. Tag visible text with data-hv-text, replaceable images with data-hv-image, CTA/contact/purchase actions with data-hv-cta, and define :root --primary-color for theme color. CDN imports (Tailwind, GSAP) fine. No prose outside the block.`);
     fp.push('');
     if (templateHtml) {
       // A template is selected → its HTML is the REQUIRED look for every frame.
