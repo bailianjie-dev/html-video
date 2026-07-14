@@ -1742,7 +1742,6 @@ function renderGenerationPage() {
         </div>
         <div class="generation-topbar-meta">
           <span class="generation-topbar-status" id="footer-status">${esc(footerText)}</span>
-          <button type="button" class="generation-btn quiet" id="btn-reload" title="重新加载中间预览与左侧页缩略图">刷新预览</button>
         </div>
         <div class="generation-actions">
           <button type="button" class="generation-btn" id="btn-generation-copy">改文案</button>
@@ -1752,6 +1751,7 @@ function renderGenerationPage() {
           <button type="button" class="generation-btn" id="btn-generation-cta">调整结尾 CTA</button>
           <button type="button" class="generation-btn" id="btn-generation-regenerate">重新生成</button>
           <div class="generation-export-actions">
+            <button type="button" class="generation-btn secondary" id="btn-reload" title="重新加载中间预览与左侧页缩略图">↻ 刷新预览</button>
             <button type="button" class="generation-btn primary" id="btn-generation-export-html" title="导出 HTML 网页，便于分享浏览"${canExportHtml ? '' : ' disabled'}>导出电子相册</button>
             <button type="button" class="generation-btn primary" id="btn-generation-export-mp4" title="导出 MP4 短视频，便于投放"${canExportMp4 ? '' : ' disabled'}>${state.exporting ? '导出中...' : '导出视频'}</button>
           </div>
@@ -1866,11 +1866,12 @@ function wireGenerationPage() {
   wirePreviewToolbarDrag();
   // 默认：横屏项目先看 PC 版面，竖屏先看手机版面，完整 fit 展示
   state.previewDevice = projectAspectRatioValue(state.selected) >= 1 ? 'desktop' : 'phone';
-  // 默认展开右侧，落在 AI 助手页签；本页编辑按需切过去
-  document.body.classList.remove('generation-side-collapsed', 'assistant-collapsed', 'textfields-collapsed');
+  // 右坞默认展开但宽度已收窄；若用户上次点过「收起」则记住折叠偏好
+  document.body.classList.remove('assistant-collapsed', 'textfields-collapsed');
   state.generationSideTab = state.generationSideTab === 'edit' ? 'edit' : 'assistant';
   state.albumPageTextEditActive = false;
-  setGenerationSideTab(state.generationSideTab, { expand: true });
+  applyGenerationSideCollapsedPref();
+  setGenerationSideTab(state.generationSideTab, { expand: !isGenerationSideCollapsedPref() });
   syncPreviewDeviceSwitchUi();
   updateAlbumPageEditControls();
   const composerToggle = document.getElementById('btn-generation-composer-toggle');
@@ -1891,16 +1892,14 @@ function wireGenerationPage() {
   const sideCollapse = document.getElementById('btn-generation-side-collapse');
   if (sideCollapse) {
     sideCollapse.onclick = () => {
-      document.body.classList.add('generation-side-collapsed');
-      syncGenerationSideDockUi();
+      setGenerationSideCollapsed(true);
       scheduleGenerationPreviewLayout();
     };
   }
   const sideRail = document.getElementById('btn-generation-side-rail');
   if (sideRail) {
     sideRail.onclick = () => {
-      document.body.classList.remove('generation-side-collapsed');
-      syncGenerationSideDockUi();
+      setGenerationSideCollapsed(false);
       scheduleGenerationPreviewLayout();
     };
   }
@@ -1953,6 +1952,31 @@ function isGenerationSideCollapsed() {
   return document.body.classList.contains('generation-side-collapsed');
 }
 
+const HV_GENERATION_SIDE_COLLAPSED_KEY = 'hv.generationSideCollapsed';
+
+function isGenerationSideCollapsedPref() {
+  try {
+    return localStorage.getItem(HV_GENERATION_SIDE_COLLAPSED_KEY) === '1';
+  } catch {
+    return false;
+  }
+}
+
+function setGenerationSideCollapsed(collapsed, { persist = true } = {}) {
+  document.body.classList.toggle('generation-side-collapsed', !!collapsed);
+  if (persist) {
+    try {
+      localStorage.setItem(HV_GENERATION_SIDE_COLLAPSED_KEY, collapsed ? '1' : '0');
+    } catch { /* ignore */ }
+  }
+  syncGenerationSideDockUi();
+}
+
+/** Apply remembered collapse preference when entering the generation workbench. */
+function applyGenerationSideCollapsedPref() {
+  setGenerationSideCollapsed(isGenerationSideCollapsedPref(), { persist: false });
+}
+
 function syncGenerationSideDockUi() {
   const collapsed = isGenerationSideCollapsed();
   const rail = document.getElementById('btn-generation-side-rail');
@@ -1973,7 +1997,8 @@ function syncGenerationSideDockUi() {
 function setGenerationSideTab(tab, { expand = false } = {}) {
   const next = tab === 'edit' ? 'edit' : 'assistant';
   state.generationSideTab = next;
-  if (expand) document.body.classList.remove('generation-side-collapsed');
+  // Temporary expand for edit/chat — don't overwrite user's lasting "收起" preference.
+  if (expand) setGenerationSideCollapsed(false, { persist: false });
   document.querySelectorAll('[data-side-tab]').forEach((btn) => {
     const active = btn.dataset.sideTab === next;
     btn.classList.toggle('active', active);
@@ -2444,10 +2469,7 @@ function renderProjectHistoryPage() {
               <h3>历史项目</h3>
               <p>浏览已创建的电子相册，点击卡片继续预览和编辑。</p>
             </div>
-            <div class="history-toolbar-actions">
-              <div class="history-count">共 ${state.projects.length} 个项目</div>
-              <button class="feature-btn primary" id="btn-history-new">新建项目</button>
-            </div>
+            <div class="history-count">共 ${state.projects.length} 个项目</div>
           </div>
           <div class="history-recent" id="history-recent"></div>
           <div class="history-grid" id="history-list"></div>
@@ -2712,7 +2734,9 @@ function setPreviewDevice(device, { render = true } = {}) {
   document.querySelectorAll('[data-preview-device]').forEach((btn) => {
     btn.classList.toggle('active', btn.dataset.previewDevice === state.previewDevice);
   });
-  if (render) renderPreview();
+  // Device shell only wraps the centre iframe — left-rail thumbs stay on export
+  // canvas size and must not remount (that caused a full-rail flash).
+  if (render) renderPreview({ refreshFramesStrip: false });
 }
 
 function syncPreviewDeviceSwitchUi() {
@@ -2798,13 +2822,31 @@ function renderProjectHistoryCover(project, className = 'history-cover') {
   const res = projectPreviewResolution(project);
   const nativeW = Number(res.width) || 1920;
   const nativeH = Number(res.height) || 1080;
-  // Cover-fit into the visible box (top-left origin); avoid centered
-  // translate+scale which shifts previews to the right.
-  const coverW = className.includes('recent') ? 300 : 280;
-  const coverH = className.includes('recent') ? 154 : 152;
-  const scale = Math.max(coverW / nativeW, coverH / nativeH);
+  const ratio = nativeW / Math.max(1, nativeH);
+  const isRecent = className.includes('recent');
+  // Match the cover frame to the project's export aspect (not a fixed landscape box).
+  let coverW;
+  let coverH;
+  let orientation = 'landscape';
+  if (ratio < 0.92) {
+    orientation = 'portrait';
+    coverW = isRecent ? 140 : 278;
+    coverH = Math.round(coverW / ratio);
+  } else if (Math.abs(ratio - 1) < 0.06) {
+    orientation = 'square';
+    coverW = isRecent ? 168 : 278;
+    coverH = coverW;
+  } else {
+    orientation = 'landscape';
+    coverW = isRecent ? 300 : 278;
+    coverH = Math.round(coverW / ratio);
+  }
+  // Aspects match → cover === contain; use width-based scale, refined on layout.
+  const scale = coverW / nativeW;
   return `
-      <div class="${className} ${src ? 'has-preview' : ''}">
+      <div class="${className} ${src ? 'has-preview' : ''} is-${orientation}"
+        data-history-orientation="${orientation}"
+        style="--history-cover-aspect:${nativeW} / ${nativeH};${isRecent ? `width:${coverW}px;` : ''}">
         ${src ? `<div class="history-cover-preview">
           <iframe sandbox="allow-scripts allow-same-origin"
             src="${src}"
@@ -2881,9 +2923,12 @@ function renderProjectHistory() {
     const status = projectUserStatus(latest);
     const updated = formatProjectTime(latest);
     const info = renderProjectHistoryInfo(latest, { compact: true });
+    const latestRes = projectPreviewResolution(latest);
+    const latestRatio = (Number(latestRes.width) || 1920) / Math.max(1, Number(latestRes.height) || 1080);
+    const recentOrientation = latestRatio < 0.92 ? 'portrait' : (Math.abs(latestRatio - 1) < 0.06 ? 'square' : 'landscape');
     recent.innerHTML = `
       <div class="history-recent-label">最近编辑</div>
-      <article class="history-recent-card" data-open-project="${esc(latest.id)}" tabindex="0" role="button">
+      <article class="history-recent-card is-${recentOrientation}" data-open-project="${esc(latest.id)}" tabindex="0" role="button">
         ${renderProjectHistoryCover(latest, 'history-recent-cover')}
         <div class="history-recent-body">
           <h4 title="${esc(latest.name)}">${esc(latest.name)}</h4>
@@ -2944,15 +2989,34 @@ function renderProjectHistory() {
       renderProjectHistory();
     };
   });
-  // Album covers load full HTML — isolate first page so thumbs are stable/cropped cleanly.
+  // Album covers load full HTML — isolate first page so thumbs are stable.
+  // Re-fit iframe scale after layout so responsive grid widths stay accurate.
   document.querySelectorAll('iframe[data-history-thumb]').forEach((iframe) => {
+    const syncScale = () => {
+      const cover = iframe.closest('.history-cover, .history-recent-cover');
+      if (!cover) return;
+      const nativeW = parseFloat(getComputedStyle(iframe).getPropertyValue('--history-cover-w')) || 1920;
+      const nativeH = parseFloat(getComputedStyle(iframe).getPropertyValue('--history-cover-h')) || 1080;
+      const boxW = cover.clientWidth;
+      const boxH = cover.clientHeight;
+      if (!(boxW > 8) || !(boxH > 8) || !(nativeW > 0) || !(nativeH > 0)) return;
+      const scale = Math.min(boxW / nativeW, boxH / nativeH);
+      iframe.style.setProperty('--history-cover-scale', String(scale));
+    };
     const onReady = () => {
       if (typeof prepareAlbumThumbIframe === 'function') prepareAlbumThumbIframe(iframe, 0);
+      syncScale();
     };
     iframe.addEventListener('load', onReady);
     try {
       if (iframe.contentDocument?.readyState === 'complete') onReady();
     } catch { /* ignore */ }
+    const cover = iframe.closest('.history-cover, .history-recent-cover');
+    if (cover && typeof ResizeObserver !== 'undefined') {
+      const ro = new ResizeObserver(() => syncScale());
+      ro.observe(cover);
+      syncScale();
+    }
   });
 }
 
@@ -3506,8 +3570,6 @@ function renderMain() {
   if (page === 'history') {
     body.innerHTML = renderProjectHistoryPage();
     renderProjectHistory();
-    const newBtn = document.getElementById('btn-history-new');
-    if (newBtn) newBtn.onclick = createDefaultProject;
     return;
   }
   if (page === 'templates') {
@@ -4697,19 +4759,19 @@ function renderOptionCard(opts, picked, msgIdx) {
 }
 
 // ============== preview ==============
-function renderPreview() {
+function renderPreview({ refreshFramesStrip = true } = {}) {
   const stage = document.getElementById('preview-stage');
   if (!stage) return;
   const p = state.selected;
   if (!p) {
     stage.innerHTML = `<div class="preview-placeholder"><div><div class="ico">🎞️</div>${t('preview.placeholder.pick_project')}</div></div>`;
-    renderFramesStrip();
+    if (refreshFramesStrip) renderFramesStrip();
     return;
   }
   // No template + no prior preview → show "send a chat first" placeholder
   if (!hasProjectPreview(p)) {
     stage.innerHTML = `<div class="preview-placeholder"><div><div class="ico">🎞️</div>这个项目还没有生成成功，请点击“重新生成”。</div></div>`;
-    renderFramesStrip();
+    if (refreshFramesStrip) renderFramesStrip();
     return;
   }
   // v0.8: if multi-frame, default-iframe shows the active frame (first by default).
@@ -4805,12 +4867,12 @@ function renderPreview() {
   if (iframe && tag === 'iframe') {
     iframe.addEventListener('load', () => {
       applyStudioDevicePreview(iframe);
-      syncAlbumPagesFromPreview(iframe);
+      syncAlbumPagesFromPreview(iframe, { refreshStrip: refreshFramesStrip });
       wirePreviewTextLocate(iframe);
       scheduleGenerationPreviewLayout();
     });
   }
-  renderFramesStrip();
+  if (refreshFramesStrip) renderFramesStrip();
   // Convergence point for every frame/preview change → keep soundtrack buttons
   // (draft / fit) and the per-frame narration line in sync, regardless of which
   // path triggered the change.
@@ -4876,7 +4938,7 @@ async function enrichFrameLabelsFromHtml(projectId) {
       const html = await r.text();
       if (!html) return;
       const doc = new DOMParser().parseFromString(html, 'text/html');
-      const topic = summarizeAlbumPageElement(doc.body) || normalizeAlbumPageTopic(doc.body?.textContent);
+      const topic = summarizeAlbumPageElement(doc.body);
       if (topic) {
         state.frameLabels[id] = topic;
         changed = true;
@@ -4886,17 +4948,74 @@ async function enrichFrameLabelsFromHtml(projectId) {
   return changed;
 }
 
-/** Short label for a page rail card: prefer headings / data-hv-text, else first text. */
+/** Map common data-album-page / role tokens to short Chinese labels. */
+const ALBUM_PAGE_ROLE_LABELS = {
+  cover: '封面',
+  home: '封面',
+  intro: '介绍',
+  about: '关于',
+  company: '关于',
+  business: '业务',
+  biz: '业务',
+  service: '业务',
+  services: '业务',
+  strength: '实力',
+  strength_s: '实力',
+  advantage: '实力',
+  why: '实力',
+  contact: '联系',
+  cta: '联系',
+  ending: '结尾',
+  end: '结尾',
+};
+
+/**
+ * Reject decorative leftovers that look like page chrome, not a topic:
+ * "01/05", bare numbers, "%" stats, nav crumbs concatenated, etc.
+ */
+function isJunkAlbumPageTopic(text) {
+  const t = String(text || '').trim();
+  if (!t) return true;
+  if (t.length < 2) return true;
+  // Page counters: 01/05 · 1 / 5 · 01／05
+  if (/^\d{1,2}\s*[\/／]\s*\d{1,2}$/.test(t)) return true;
+  // Bare index / short numeric chrome
+  if (/^\d{1,3}$/.test(t)) return true;
+  if (/^第?\s*\d{1,2}\s*[页頁]?$/.test(t)) return true;
+  // Stats-only fragments: 15 · 5000+ · 100%
+  if (/^[\d\s.,+%＋\-–—·•]+$/.test(t)) return true;
+  // Huge blob (whole-page textContent fallback)
+  if (t.length > 40 && (t.match(/[\u4e00-\u9fff]/g) || []).length > 20) return true;
+  return false;
+}
+
+function albumPageRoleLabel(raw) {
+  const key = String(raw || '').trim().toLowerCase().replace(/[\s-]+/g, '_');
+  if (!key) return '';
+  if (ALBUM_PAGE_ROLE_LABELS[key]) return ALBUM_PAGE_ROLE_LABELS[key];
+  // "page-cover" / "album_about" → last meaningful token
+  const parts = key.split(/[_\-/]/).filter(Boolean);
+  for (let i = parts.length - 1; i >= 0; i -= 1) {
+    if (ALBUM_PAGE_ROLE_LABELS[parts[i]]) return ALBUM_PAGE_ROLE_LABELS[parts[i]];
+  }
+  return '';
+}
+
+/** Short label for a page rail card: prefer headings / roles, never page chrome. */
 function normalizeAlbumPageTopic(raw) {
   const text = String(raw || '')
     .replace(/\s+/g, ' ')
     .replace(/[\u200b\u00a0]/g, '')
     .trim();
-  if (!text) return '';
-  // Drop tiny decorative leftovers like "·" or single digits alone.
-  if (text.length < 2) return '';
+  if (!text || isJunkAlbumPageTopic(text)) return '';
   const max = 12;
   return text.length > max ? `${text.slice(0, max)}…` : text;
+}
+
+function hvTextKeyLooksLikeChrome(key) {
+  const k = String(key || '').toLowerCase();
+  return /^(section_?number|page_?(no|num|number|index|counter)|sec_?no|nav[_-]|crumb|footer|stat_|label$)/.test(k)
+    || /_(nav|footer|section_number|page_number)(_|$)/.test(k);
 }
 
 function summarizeAlbumPageElement(pageEl) {
@@ -4904,13 +5023,35 @@ function summarizeAlbumPageElement(pageEl) {
   const pickers = [
     () => pageEl.getAttribute('data-page-title'),
     () => pageEl.getAttribute('aria-label'),
-    () => pageEl.querySelector('h1, h2, h3')?.textContent,
-    () => pageEl.querySelector('[data-hv-text="title"], [data-hv-text="headline"], [data-role="title"]')?.textContent,
-    () => pageEl.querySelector('[data-hv-text]')?.textContent,
-    () => pageEl.querySelector('.title, .headline, .page-title, .cover-title')?.textContent,
+    () => albumPageRoleLabel(pageEl.getAttribute('data-album-page') || pageEl.getAttribute('data-page')),
+    () => pageEl.querySelector('.page-title, .cover-title')?.textContent,
+    () => pageEl.querySelector('[data-hv-text="title"], [data-hv-text="headline"], [data-hv-text="brand_name"], [data-role="title"]')?.textContent,
+    () => pageEl.querySelector('.card-title, .title, .headline')?.textContent,
+    () => pageEl.querySelector('.nav-crumb span.active, .nav-crumb .active, nav .active')?.textContent,
+    () => pageEl.querySelector('h1, h2')?.textContent,
     () => {
-      const p = pageEl.querySelector('p');
-      return p?.textContent;
+      // Prefer titled data-hv-text nodes; skip chrome keys like section_number / nav_*.
+      const nodes = [...pageEl.querySelectorAll('[data-hv-text]')];
+      for (const el of nodes) {
+        const key = el.getAttribute('data-hv-text') || '';
+        if (hvTextKeyLooksLikeChrome(key)) continue;
+        if (/(title|headline|brand|name)$/i.test(key) || /^(title|headline|brand_name)$/i.test(key)) {
+          const topic = normalizeAlbumPageTopic(el.textContent);
+          if (topic) return topic;
+        }
+      }
+      for (const el of nodes) {
+        const key = el.getAttribute('data-hv-text') || '';
+        if (hvTextKeyLooksLikeChrome(key)) continue;
+        if (el.closest('.nav-crumb, .sec-no, .page-counter, footer, .footer')) continue;
+        const topic = normalizeAlbumPageTopic(el.textContent);
+        if (topic) return topic;
+      }
+      return '';
+    },
+    () => {
+      const h3 = pageEl.querySelector('h3');
+      return h3?.textContent;
     },
   ];
   for (const pick of pickers) {
@@ -4921,13 +5062,13 @@ function summarizeAlbumPageElement(pageEl) {
       /* ignore bad nodes */
     }
   }
-  const fallback = normalizeAlbumPageTopic(pageEl.textContent);
-  return fallback;
+  // Do NOT fall back to whole-page textContent — that often starts with "01/05".
+  return '';
 }
 
 function summarizeAlbumPagesFromRoot(root) {
   if (!root) return [];
-  return findAlbumPageElements(root).map((page, i) => summarizeAlbumPageElement(page) || `第${i + 1}页`);
+  return findAlbumPageElements(root).map((page) => summarizeAlbumPageElement(page));
 }
 
 function findAlbumPageElements(root) {
@@ -5037,7 +5178,9 @@ async function collapsePageTextEdit() {
   const wasActive = state.albumPageTextEditActive;
   state.albumPageTextEditActive = false;
   if (document.querySelector('.generation-side-dock')) {
-    setGenerationSideTab('assistant', { expand: true });
+    // 回到助手页签；若用户偏好折叠右坞，结束后恢复折叠，预览让位第一焦点
+    setGenerationSideTab('assistant', { expand: !isGenerationSideCollapsedPref() });
+    if (isGenerationSideCollapsedPref()) setGenerationSideCollapsed(true, { persist: false });
   } else {
     document.body.classList.add('textfields-collapsed');
   }
@@ -5097,13 +5240,13 @@ async function selectAlbumPage(pageIndex, { startEdit = false } = {}) {
   }
 }
 
-function syncAlbumPagesFromPreview(iframe) {
+function syncAlbumPagesFromPreview(iframe, { refreshStrip = true } = {}) {
   const p = state.selected;
   const hasFrames = Array.isArray(p?.frames) && p.frames.length > 0;
   if (!p || hasFrames) return;
   const pages = getAlbumPagesFromIframe(iframe);
   const nextCount = pages.length;
-  const nextSummaries = pages.map((page, i) => summarizeAlbumPageElement(page) || `第${i + 1}页`);
+  const nextSummaries = pages.map((page) => summarizeAlbumPageElement(page));
   const countChanged = nextCount !== state.albumPageCount;
   const summariesChanged = JSON.stringify(nextSummaries) !== JSON.stringify(state.albumPageSummaries || []);
   if (countChanged) {
@@ -5112,11 +5255,18 @@ function syncAlbumPagesFromPreview(iframe) {
     if (nextCount === 0) state.albumPageTextEditActive = false;
   }
   if (summariesChanged) state.albumPageSummaries = nextSummaries;
-  // Always rebuild the strip after the centre preview loads: page content may
-  // have changed with the same page count / similar titles, and thumbs need
-  // fresh iframes. (Do NOT mirror this in refreshTextFields — that path
-  // runs on edit/collapse and would flash the whole rail.)
-  if (countChanged || summariesChanged || nextCount > 0) renderFramesStrip();
+  const strip = document.getElementById('frames-strip');
+  const stripEmpty = !strip?.classList.contains('has-frames')
+    || !strip.querySelector('button.album-page-tab');
+  // Phone/PC only remounts the centre preview: refreshStrip=false keeps thumbs still.
+  // Full content refreshes keep refreshStrip=true so thumbs pick up new HTML.
+  if (stripEmpty || countChanged || summariesChanged) {
+    renderFramesStrip();
+  } else if (refreshStrip && nextCount > 0) {
+    renderFramesStrip();
+  } else {
+    updateAlbumPageTabActive();
+  }
   updateAlbumPageEditControls();
   scrollPreviewToAlbumPage(state.activeAlbumPage, 'auto');
   wireAlbumPageScrollSync(iframe);
@@ -5180,6 +5330,7 @@ function isolateAlbumThumbPage(iframe, pageIndex) {
 
   pages.forEach((page, i) => {
     page.setAttribute('data-hv-thumb-page', String(i));
+    page.classList.toggle('active', i === safe);
   });
 
   let style = doc.getElementById('hv-studio-album-thumb');
@@ -5282,9 +5433,32 @@ html.hv-album-thumb [data-hv-thumb-page="${safe}"] * {
   return true;
 }
 
+function fitAlbumThumbIframe(iframe) {
+  if (!iframe) return;
+  const thumb = iframe.closest?.('.frame-thumb');
+  const p = state.selected;
+  if (!thumb || !p) return;
+  const res = projectPreviewResolution(p);
+  const nativeW = Number(res.width) || 1920;
+  const nativeH = Number(res.height) || 1080;
+  const boxW = Math.max(1, Math.floor(thumb.clientWidth || thumb.getBoundingClientRect?.().width || 0));
+  if (!boxW) return;
+  const scale = boxW / Math.max(1, nativeW);
+  const boxH = Math.max(54, Math.ceil(nativeH * scale));
+  thumb.style.height = `${boxH}px`;
+  thumb.style.maxHeight = 'none';
+  iframe.style.setProperty('--thumb-native-w', `${nativeW}px`);
+  iframe.style.setProperty('--thumb-native-h', `${nativeH}px`);
+  iframe.style.setProperty('--thumb-scale', String(scale));
+  iframe.style.setProperty('--thumb-offset-y', '0px');
+}
+
 function prepareAlbumThumbIframe(iframe, pageIndex) {
   if (!iframe) return;
-  const run = () => isolateAlbumThumbPage(iframe, pageIndex);
+  const run = () => {
+    fitAlbumThumbIframe(iframe);
+    isolateAlbumThumbPage(iframe, pageIndex);
+  };
   run();
   requestAnimationFrame(() => {
     run();
@@ -5485,8 +5659,9 @@ function renderFramesStrip() {
       }
     }
     const pageNo = (Number(f.order) || 0) + 1;
-    const displayTopic = state.frameLabels[f.graphNodeId] || `第${pageNo}页`;
-    return `<button class="${cls}${isData ? ' is-data' : ''}" data-fid="${esc(f.graphNodeId)}" title="${esc(`第 ${pageNo} 页 · ${displayTopic}`)}">
+    const displayTopic = String(state.frameLabels[f.graphNodeId] || '').trim();
+    const title = displayTopic ? `第 ${pageNo} 页 · ${displayTopic}` : `第 ${pageNo} 页`;
+    return `<button class="${cls}${isData ? ' is-data' : ''}" data-fid="${esc(f.graphNodeId)}" title="${esc(title)}">
       <div class="frame-thumb">
         ${thumbInner}
         ${enhanceCtl}
@@ -5494,7 +5669,7 @@ function renderFramesStrip() {
       </div>
       <div class="frame-tab-label">
         <span class="order">${pageNo}</span>
-        <span class="page-topic">${esc(displayTopic)}</span>
+        ${displayTopic ? `<span class="page-topic">${esc(displayTopic)}</span>` : ''}
       </div>
     </button>`;
   }).join('');
@@ -5557,29 +5732,26 @@ function renderAlbumPagesStrip(strip, p) {
   const nativeH = res.height || 1080;
   // Compact rail crop: fill width, short height, bias toward vertical mid
   // so centered hero copy is visible (top-only crop looks empty).
-  const thumbBoxW = 112;
-  const thumbBoxH = 88;
+  const thumbBoxW = 96;
   const thumbScale = thumbBoxW / nativeW;
-  const scaledH = nativeH * thumbScale;
-  const thumbOffsetY = scaledH > thumbBoxH
-    ? -Math.round((scaledH - thumbBoxH) * 0.38)
-    : 0;
-  const thumbStyle = `--thumb-native-w:${nativeW}px;--thumb-native-h:${nativeH}px;--thumb-scale:${thumbScale};--thumb-offset-y:${thumbOffsetY}px`;
+  const thumbH = Math.max(54, Math.round(nativeH * thumbScale));
+  const thumbStyle = `--thumb-native-w:${nativeW}px;--thumb-native-h:${nativeH}px;--thumb-scale:${thumbScale};--thumb-offset-y:0px`;
   const summaries = Array.isArray(state.albumPageSummaries) ? state.albumPageSummaries : [];
   const tabs = Array.from({ length: count }, (_, index) => {
     const isActive = index === state.activeAlbumPage;
     const isEditing = state.albumPageTextEditActive && isActive;
-    const topic = summaries[index] || `第${index + 1}页`;
+    const topic = String(summaries[index] || '').trim();
+    const title = topic ? `第 ${index + 1} 页 · ${topic}` : `第 ${index + 1} 页`;
     const cls = ['frame-tab', 'album-page-tab', isActive && 'active', isEditing && 'editing'].filter(Boolean).join(' ');
-    return `<button class="${cls}" data-album-page="${index}" title="第 ${index + 1} 页 · ${esc(topic)}">
-      <div class="frame-thumb">
+    return `<button class="${cls}" data-album-page="${index}" title="${esc(title)}">
+      <div class="frame-thumb" style="height:${thumbH}px;max-height:none">
         <iframe sandbox="allow-scripts allow-same-origin"
           src="/preview/${p.id}?thumb=1&albumPage=${index + 1}&v=${ver}"
           data-album-thumb="${index}" tabindex="-1" loading="lazy" style="${thumbStyle}"></iframe>
       </div>
       <div class="frame-tab-label">
         <span class="order">${index + 1}</span>
-        <span class="page-topic">${esc(topic)}</span>
+        ${topic ? `<span class="page-topic">${esc(topic)}</span>` : ''}
       </div>
     </button>`;
   }).join('');
@@ -5597,6 +5769,11 @@ function renderAlbumPagesStrip(strip, p) {
     try {
       if (iframe.contentDocument?.readyState === 'complete') onReady();
     } catch { /* ignore */ }
+  });
+  requestAnimationFrame(() => {
+    strip.querySelectorAll('iframe[data-album-thumb]').forEach((iframe) => {
+      fitAlbumThumbIframe(iframe);
+    });
   });
   updateAlbumPageEditControls();
 }
@@ -5685,7 +5862,7 @@ async function refreshTextFields() {
   // Electronic album: until user clicks「编辑本页」, don't dump every page's fields.
   if (isAlbum && !state.albumPageTextEditActive) {
     const nextCount = albumPages.length;
-    const nextSummaries = albumPages.map((page, i) => summarizeAlbumPageElement(page) || `第${i + 1}页`);
+    const nextSummaries = albumPages.map((page) => summarizeAlbumPageElement(page));
     const countChanged = (Number(state.albumPageCount) || 0) !== nextCount;
     const summariesChanged = JSON.stringify(nextSummaries) !== JSON.stringify(state.albumPageSummaries || []);
     if (countChanged) {
@@ -5714,7 +5891,7 @@ async function refreshTextFields() {
 
   // Keep rail topics fresh even while editing a page.
   if (isAlbum && albumPages.length > 0) {
-    state.albumPageSummaries = albumPages.map((page, i) => summarizeAlbumPageElement(page) || `第${i + 1}页`);
+    state.albumPageSummaries = albumPages.map((page) => summarizeAlbumPageElement(page));
     if ((Number(state.albumPageCount) || 0) !== albumPages.length) {
       state.albumPageCount = albumPages.length;
     }
@@ -5744,6 +5921,13 @@ async function refreshTextFields() {
   state.ctaFields = scanEditableCtas(scanRoot);
   renderTextFields({ albumEmptyPage: isAlbum && fields.length === 0 && state.imageFields.length === 0 && state.ctaFields.length === 0 });
   updateAlbumPageEditControls();
+  if (state.imageFields.some((f) => f.current !== f.original && isProjectAssetProxyUrl(f.current))) {
+    setTimeout(() => {
+      if (state.selected) commitTextEdits().catch((error) => {
+        console.warn('[studio] asset URL repair failed:', error);
+      });
+    }, 0);
+  }
 }
 
 function scanEditableImages(root) {
@@ -5756,9 +5940,24 @@ function scanEditableImages(root) {
     const key = el.getAttribute('data-hv-image') || `image_${index + 1}`;
     if (seen.has(key)) return null;
     seen.add(key);
-    const current = readImageValue(el);
-    return { key, original: current, current, kind: imageFieldKind(el), fallbackIndex: explicitKey ? -1 : index };
+    const original = readImageValue(el);
+    const current = browserUrlForImageValue(original);
+    return { key, original, current, kind: imageFieldKind(el), fallbackIndex: explicitKey ? -1 : index };
   }).filter(Boolean);
+}
+
+function browserUrlForImageValue(value) {
+  const raw = String(value || '').trim();
+  if (!raw) return '';
+  const asset = (state.projectAssets || []).find((item) => {
+    const candidates = [item.url, item.path, item.oss_key].filter(Boolean).map(String);
+    return candidates.some((candidate) => raw === candidate || raw.includes(candidate));
+  });
+  return asset ? browserUrlForProjectAsset(asset) : raw;
+}
+
+function isProjectAssetProxyUrl(value) {
+  return /^\/api\/projects\/[^/]+\/assets\/[^/]+\/content(?:[?#].*)?$/i.test(String(value || ''));
 }
 
 function scanEditableCtas(root) {
@@ -6738,15 +6937,15 @@ function writeImageValue(el, value) {
   }
 }
 
-/** Same contract as agent prompt: https URL, or /asset?path=… for local files. */
+/** Browser-safe image URL. Prefer the authenticated proxy because OSS buckets may be private. */
 function browserUrlForProjectAsset(asset) {
   if (!asset) return '';
-  if (asset.url && /^https?:\/\//i.test(asset.url)) return asset.url;
-  if (asset.path && /^https?:\/\//i.test(asset.path)) return asset.path;
-  if (asset.path) return `/asset?path=${encodeURIComponent(asset.path)}`;
   if (state.selectedId && asset.id) {
     return `/api/projects/${encodeURIComponent(state.selectedId)}/assets/${encodeURIComponent(asset.id)}/content`;
   }
+  if (asset.url && /^https?:\/\//i.test(asset.url)) return asset.url;
+  if (asset.path && /^https?:\/\//i.test(asset.path)) return asset.path;
+  if (asset.path) return `/asset?path=${encodeURIComponent(asset.path)}`;
   return '';
 }
 

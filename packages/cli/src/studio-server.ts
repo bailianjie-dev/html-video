@@ -2844,6 +2844,7 @@ function injectAlbumPageThumbMode(html: string, pageIndex: number): string {
     document.body?.classList.add('hv-album-thumb');
     list.forEach((page, index) => {
       page.setAttribute('data-hv-thumb-page', String(index));
+      page.classList.toggle('active', index === safe);
       if (index === safe) {
         const display = getComputedStyle(page).display;
         page.style.setProperty('display', display && display !== 'none' ? display : 'block', 'important');
@@ -2859,6 +2860,9 @@ function injectAlbumPageThumbMode(html: string, pageIndex: number): string {
         page.querySelectorAll('*').forEach((child) => {
           child.style.setProperty('animation', 'none', 'important');
           child.style.setProperty('transition', 'none', 'important');
+          child.style.setProperty('opacity', '1', 'important');
+          child.style.setProperty('visibility', 'visible', 'important');
+          child.style.setProperty('filter', 'none', 'important');
         });
       } else {
         page.style.setProperty('display', 'none', 'important');
