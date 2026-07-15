@@ -1737,8 +1737,7 @@
   #btn-generation-pages,
   #btn-generation-image,
   #btn-generation-cta,
-  #btn-generation-regenerate,
-  .generation-side-composer {
+  #btn-generation-regenerate {
     display: none !important;
   }
   .generation-btn {
@@ -1846,6 +1845,54 @@
     font-size: 10px;
     letter-spacing: .04em;
   }
+  .generation-page-rail .album-rail-head {
+    display: flex;
+    align-items: center;
+    margin: 0 0 2px;
+  }
+  .generation-page-rail .album-rail-head .label {
+    margin: 0;
+  }
+  .generation-page-rail .album-page-item {
+    position: relative;
+    flex: 0 0 auto;
+    cursor: grab;
+  }
+  .generation-page-rail .album-page-item:active {
+    cursor: grabbing;
+  }
+  .generation-page-rail .album-page-item.dragging {
+    opacity: .55;
+  }
+  .generation-page-rail .album-page-item.drop-before::before,
+  .generation-page-rail .album-page-item.drop-after::after {
+    content: '';
+    position: absolute;
+    left: 4px;
+    right: 4px;
+    height: 3px;
+    border-radius: 2px;
+    background: #3b82f6;
+    box-shadow: 0 0 0 1px rgba(59, 130, 246, .25);
+    z-index: 6;
+    pointer-events: none;
+  }
+  .generation-page-rail .album-page-item.drop-before::before {
+    top: -3px;
+  }
+  .generation-page-rail .album-page-item.drop-after::after {
+    bottom: -3px;
+  }
+  .generation-page-rail .album-page-item.drag-over button.frame-tab {
+    border-color: #8fb1e8;
+  }
+  .generation-page-rail .album-drag-active {
+    user-select: none;
+  }
+  .generation-page-rail .album-drag-active .album-page-item:not(.dragging) {
+    /* Avoid transform transitions while dragging — they fight pointer hit-tests. */
+    transition: none;
+  }
   .generation-page-rail .frames-strip button.frame-tab {
     width: 100%;
     border-radius: 8px;
@@ -1853,14 +1900,22 @@
   }
   .generation-page-rail .frames-strip .frame-thumb {
     width: 100%;
-    height: 88px;
-    max-height: 88px;
+    /* Height is set inline from project resolution — do not fight with max-height. */
     overflow: hidden;
     flex: 0 0 auto;
+    background: #0b1220;
   }
   .generation-page-rail .frames-strip .frame-thumb iframe {
     --thumb-scale: calc(96 / 1920);
     transform-origin: top left;
+    opacity: 0;
+  }
+  .generation-page-rail .frames-strip .frame-thumb iframe.is-ready {
+    opacity: 1;
+    transition: opacity .12s ease;
+  }
+  .generation-page-rail .frames-strip button.album-page-tab .frame-thumb iframe {
+    pointer-events: none;
   }
   .generation-page-rail .frames-strip button.frame-tab .frame-tab-label {
     padding: 3px 6px;
@@ -1895,6 +1950,52 @@
   .generation-page-rail .frames-strip button.album-page-tab {
     position: relative;
     flex: 0 0 auto;
+  }
+  .generation-page-rail .album-page-actions {
+    position: absolute;
+    top: 4px;
+    right: 4px;
+    z-index: 4;
+    display: grid;
+    grid-template-columns: repeat(2, 22px);
+    gap: 3px;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity .12s ease;
+  }
+  .generation-page-rail .album-page-item:hover .album-page-actions,
+  .generation-page-rail .album-page-item.active .album-page-actions {
+    opacity: 1;
+    pointer-events: auto;
+  }
+  .generation-page-rail .album-page-actions button {
+    width: 22px;
+    height: 22px;
+    display: grid;
+    place-items: center;
+    border: 1px solid rgba(203, 213, 225, .95);
+    border-radius: 6px;
+    background: rgba(255,255,255,.92);
+    color: #334155;
+    box-shadow: 0 2px 8px rgba(15, 23, 42, .12);
+    font-size: 12px;
+    line-height: 1;
+    font-weight: 750;
+    cursor: pointer;
+  }
+  .generation-page-rail .album-page-actions button:hover {
+    border-color: #93b2df;
+    background: #eef4ff;
+    color: #1d4ed8;
+  }
+  .generation-page-rail .album-page-actions button[data-album-page-action="delete"]:hover {
+    border-color: #fecaca;
+    background: #fff1f2;
+    color: #be123c;
+  }
+  .generation-page-rail .album-page-actions button:disabled {
+    opacity: .4;
+    cursor: not-allowed;
   }
   .generation-main {
     min-width: 0;
@@ -2121,6 +2222,17 @@
     box-shadow: none !important;
     border-radius: 0 !important;
     margin: 0;
+    position: relative;
+    overflow: hidden;
+  }
+  .device-screen .preview-frame iframe,
+  .device-screen .preview-frame video {
+    position: absolute;
+    top: 0;
+    left: 0;
+    border: 0;
+    transform: scale(var(--preview-scale, 1));
+    transform-origin: top left;
   }
   .device-caption {
     margin-top: 10px;

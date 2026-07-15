@@ -279,17 +279,21 @@ export async function render(input: RenderInput, ctx: RenderContext): Promise<Re
     // window is fixed, drive playback from frame zero so capture and animation
     // start together — otherwise the auto-play fallback would have already run
     // part of the timeline before we begin recording.
-    const drove = await page
-      .evaluate(() => {
-        const w = window as unknown as { __hvPlayAll?: () => void; __hvPlayed?: boolean };
-        if (typeof w.__hvPlayAll === 'function') {
-          w.__hvPlayed = true;
-          w.__hvPlayAll();
-          return true;
-        }
-        return false;
-      })
-      .catch(() => false);
+    // Album slideshow: never call __hvPlayAll — album autoplay / scroll-snap
+    // timelines fight the hard-cut page show/hide and leave a static first page.
+    const drove = input.config.albumSlideshow
+      ? false
+      : await page
+        .evaluate(() => {
+          const w = window as unknown as { __hvPlayAll?: () => void; __hvPlayed?: boolean };
+          if (typeof w.__hvPlayAll === 'function') {
+            w.__hvPlayed = true;
+            w.__hvPlayAll();
+            return true;
+          }
+          return false;
+        })
+        .catch(() => false);
 
     // Release the animation freeze now that fonts are ready. Every template —
     // single-file CSS keyframes and multi-composition GSAP alike — has been
@@ -307,17 +311,23 @@ export async function render(input: RenderInput, ctx: RenderContext): Promise<Re
     leadInMs = Date.now() - tWebmStart;
     void drove; // playback already driven above for multi-composition timelines
 
-    ctx.onProgress?.(40, `recording ${totalDuration}s`);
-    // Stream a single coarse progress tick per second so the user sees
-    // "recording 1/5s …" type signal in the studio progress bar.
-    const totalMs = Math.round(totalDuration * 1000);
-    const tick = 250;
-    const start = Date.now();
-    while (Date.now() - start < totalMs) {
-      if (ctx.signal?.aborted) throw new HtmlVideoError('cancelled', 'Aborted');
-      await page.waitForTimeout(Math.min(tick, totalMs - (Date.now() - start)));
-      const pct = 40 + Math.floor(((Date.now() - start) / totalMs) * 45);
-      ctx.onProgress?.(pct, 'recording');
+    if (input.config.albumSlideshow) {
+      totalDuration = await recordAlbumSlideshow(page, ctx, {
+        signal: ctx.signal,
+      });
+    } else {
+      ctx.onProgress?.(40, `recording ${totalDuration}s`);
+      // Stream a single coarse progress tick per second so the user sees
+      // "recording 1/5s …" type signal in the studio progress bar.
+      const totalMs = Math.round(totalDuration * 1000);
+      const tick = 250;
+      const start = Date.now();
+      while (Date.now() - start < totalMs) {
+        if (ctx.signal?.aborted) throw new HtmlVideoError('cancelled', 'Aborted');
+        await page.waitForTimeout(Math.min(tick, totalMs - (Date.now() - start)));
+        const pct = 40 + Math.floor(((Date.now() - start) / totalMs) * 45);
+        ctx.onProgress?.(pct, 'recording');
+      }
     }
 
     ctx.onProgress?.(85, 'finalising recording');
@@ -347,7 +357,8 @@ export async function render(input: RenderInput, ctx: RenderContext): Promise<Re
   // pad the tail by holding the last frame (`tpad stop_mode=clone`) up to the
   // target. -t then trims to the precise length. For 'auto' we keep the old
   // behavior (just -t, no padding) — there the duration is a soft fallback.
-  const explicit = input.config.durationMode === 'explicit';
+  // Album slideshow always pins exact sum-of-dwells as well.
+  const explicit = input.config.durationMode === 'explicit' || !!input.config.albumSlideshow;
   await runFfmpeg([
     '-y',
     // -ss before -i = fast input seek, drops the frozen lead-in entirely.
@@ -385,8 +396,462 @@ export async function render(input: RenderInput, ctx: RenderContext): Promise<Re
       renderWallClockSec: (Date.now() - t0) / 1000,
       engineVersion: `hyperframes-playwright@${ADAPTER_VERSION}`,
     },
-    diagnostics: [`recorded via playwright/chromium then encoded with ffmpeg (libx264 crf20)`],
+    diagnostics: [
+      input.config.albumSlideshow
+        ? 'album slideshow: fade between pages, dwell by body copy; playwright → ffmpeg'
+        : `recorded via playwright/chromium then encoded with ffmpeg (libx264 crf20)`,
+    ],
   };
+}
+
+/** Soft linger from body copy length; clamped for ~12–18s multi-page films. */
+export function albumPageDwellSec(charCount: number): number {
+  const chars = Math.max(0, Number(charCount) || 0);
+  // ~22 chars/sec + 1.2s image linger; cap 4.0s so 5 pages stay in the target band.
+  return Math.min(4.0, Math.max(1.6, 1.2 + chars / 22));
+}
+
+/** Crossfade length between pages (seconds). */
+export const ALBUM_SLIDE_FADE_SEC = 0.4;
+/** Preferred total timeline ceiling (holds + fades). */
+export const ALBUM_TOTAL_TARGET_MAX_SEC = 18;
+/** Hard ceiling after scaling. */
+export const ALBUM_TOTAL_HARD_CAP_SEC = 20;
+
+/**
+ * Scale per-page holds so holds + (n-1)*fade land near 12–18s (hard ≤20s).
+ */
+export function normalizeAlbumDwells(
+  dwells: number[],
+  pageCount: number,
+  fadeSec: number = ALBUM_SLIDE_FADE_SEC,
+): number[] {
+  if (!dwells.length) return dwells;
+  const fadeTotal = Math.max(0, pageCount - 1) * fadeSec;
+  let next = dwells.map((d) => Math.max(1.2, Number(d) || 1.6));
+  const holdSum = () => next.reduce((s, d) => s + d, 0);
+  let total = holdSum() + fadeTotal;
+  if (total > ALBUM_TOTAL_TARGET_MAX_SEC) {
+    const holdBudget = Math.max(pageCount * 1.4, ALBUM_TOTAL_TARGET_MAX_SEC - fadeTotal);
+    const scale = holdBudget / Math.max(0.01, holdSum());
+    next = next.map((d) => Math.max(1.4, Math.round(d * scale * 100) / 100));
+    total = holdSum() + fadeTotal;
+  }
+  if (total > ALBUM_TOTAL_HARD_CAP_SEC) {
+    const holdBudget = Math.max(pageCount * 1.2, ALBUM_TOTAL_HARD_CAP_SEC - fadeTotal);
+    const scale = holdBudget / Math.max(0.01, holdSum());
+    next = next.map((d) => Math.max(1.2, Math.round(d * scale * 100) / 100));
+  }
+  return next;
+}
+
+type AlbumRecordPage = {
+  // Playwright Page — keep loose so we don't import playwright types here.
+  evaluate: (pageFunction: any, arg?: any) => Promise<any>;
+  waitForTimeout: (ms: number) => Promise<void>;
+  addStyleTag: (opts: { content: string }) => Promise<unknown>;
+};
+
+/**
+ * Album storyboard for MP4 export: short crossfade between pages, hard-cut
+ * fallback. Total ≈ sum(holds) + (n-1)*fade, normalized toward 12–18s.
+ * Page discovery mirrors Studio left-rail findAlbumPageElements.
+ */
+async function recordAlbumSlideshow(
+  page: AlbumRecordPage,
+  ctx: RenderContext,
+  opts: { signal?: AbortSignal },
+): Promise<number> {
+  const fadeSec = ALBUM_SLIDE_FADE_SEC;
+  const fadeMs = Math.round(fadeSec * 1000);
+
+  await page.addStyleTag({
+    content: `
+html.hv-album-slideshow, html.hv-album-slideshow body {
+  margin: 0 !important;
+  overflow: hidden !important;
+  height: 100% !important;
+  min-height: 100% !important;
+}
+html.hv-album-slideshow, html.hv-album-slideshow * {
+  scroll-behavior: auto !important;
+}
+html.hv-album-slideshow #album,
+html.hv-album-slideshow .album,
+html.hv-album-slideshow [data-album],
+html.hv-album-slideshow .scroll-container,
+html.hv-album-slideshow .story-container,
+html.hv-album-slideshow .album-container,
+html.hv-album-slideshow .pages,
+html.hv-album-slideshow .pages-wrap,
+html.hv-album-slideshow #pagesWrap,
+html.hv-album-slideshow .pages-wrapper,
+html.hv-album-slideshow .slides,
+html.hv-album-slideshow .slides-wrap {
+  overflow: hidden !important;
+  height: 100% !important;
+  min-height: 100% !important;
+  max-height: 100% !important;
+  scroll-snap-type: none !important;
+  transform: none !important;
+  translate: none !important;
+  position: relative !important;
+}
+html.hv-album-slideshow .album-controls,
+html.hv-album-slideshow nav.album-controls,
+html.hv-album-slideshow .desktop-nav,
+html.hv-album-slideshow #desktopNav,
+html.hv-album-slideshow .mobile-nav,
+html.hv-album-slideshow #mobileNav,
+html.hv-album-slideshow .dots,
+html.hv-album-slideshow .mobile-dots,
+html.hv-album-slideshow #mobileDots,
+html.hv-album-slideshow #dotsWrap,
+html.hv-album-slideshow .page-counter,
+html.hv-album-slideshow .nav-btn,
+html.hv-album-slideshow #prevPage,
+html.hv-album-slideshow #nextPage,
+html.hv-album-slideshow #prevBtn,
+html.hv-album-slideshow #nextBtn,
+html.hv-album-slideshow .prev-btn,
+html.hv-album-slideshow .next-btn {
+  display: none !important;
+  pointer-events: none !important;
+}
+
+/* ---- Hard-cut mode (fallback) ---- */
+html.hv-album-slideshow.hv-hardcut-mode [data-hv-slideshow-page] {
+  display: none !important;
+  animation: none !important;
+  transition: none !important;
+}
+html.hv-album-slideshow.hv-hardcut-mode [data-hv-slideshow-page].hv-slideshow-active {
+  display: block !important;
+  visibility: visible !important;
+  opacity: 1 !important;
+  position: relative !important;
+  inset: auto !important;
+  transform: none !important;
+  width: 100% !important;
+  min-height: 100vh !important;
+  height: 100vh !important;
+  max-height: 100vh !important;
+  overflow: hidden !important;
+}
+html.hv-album-slideshow.hv-hardcut-mode [data-hv-slideshow-page].hv-slideshow-active,
+html.hv-album-slideshow.hv-hardcut-mode [data-hv-slideshow-page].hv-slideshow-active * {
+  animation: none !important;
+  transition: none !important;
+  opacity: 1 !important;
+  visibility: visible !important;
+  filter: none !important;
+}
+
+/* ---- Crossfade mode ---- */
+html.hv-album-slideshow.hv-fade-mode [data-hv-slideshow-page] {
+  display: block !important;
+  position: absolute !important;
+  inset: 0 !important;
+  width: 100% !important;
+  height: 100% !important;
+  min-height: 100% !important;
+  max-height: 100% !important;
+  overflow: hidden !important;
+  transform: none !important;
+  margin: 0 !important;
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+  z-index: 0;
+  transition: opacity ${fadeSec}s ease;
+  animation: none !important;
+}
+html.hv-album-slideshow.hv-fade-mode [data-hv-slideshow-page].hv-slideshow-active {
+  opacity: 1;
+  visibility: visible;
+  z-index: 2;
+  pointer-events: auto;
+}
+html.hv-album-slideshow.hv-fade-mode [data-hv-slideshow-page].hv-slideshow-leaving {
+  opacity: 0;
+  visibility: visible;
+  z-index: 1;
+  pointer-events: none;
+}
+html.hv-album-slideshow.hv-fade-mode [data-hv-slideshow-page].hv-slideshow-active *,
+html.hv-album-slideshow.hv-fade-mode [data-hv-slideshow-page].hv-slideshow-leaving * {
+  animation: none !important;
+  /* Keep entrance-reveal layers visible; page-level opacity handles the fade. */
+  opacity: 1 !important;
+  visibility: visible !important;
+  filter: none !important;
+  transition: none !important;
+}
+`,
+  }).catch(() => {});
+
+  const schedule = await page.evaluate(() => {
+    try {
+      const highest = window.setInterval(() => {}, 999_999);
+      for (let i = 0; i <= highest; i++) {
+        window.clearInterval(i);
+        window.clearTimeout(i);
+      }
+    } catch { /* ignore */ }
+    try {
+      const w = window as unknown as {
+        albumAutoplay?: unknown;
+        autoplay?: unknown;
+        stopAutoplay?: () => void;
+        pause?: () => void;
+      };
+      w.stopAutoplay?.();
+      w.pause?.();
+      w.albumAutoplay = false;
+      w.autoplay = false;
+    } catch { /* ignore */ }
+
+    const countBodyChars = (el: Element): number => {
+      const tagged = Array.from(el.querySelectorAll('[data-hv-text], [data-hv-cta]'));
+      if (tagged.length > 0) {
+        return tagged
+          .map((n) => String(n.textContent || '').replace(/\s+/g, ''))
+          .join('').length;
+      }
+      const clone = el.cloneNode(true) as HTMLElement;
+      clone
+        .querySelectorAll(
+          'nav, .nav, .nav-crumb, .dots, .album-controls, .page-counter, .sec-no, footer, .footer, script, style',
+        )
+        .forEach((n) => n.remove());
+      return String(clone.innerText || '').replace(/\s+/g, '').length;
+    };
+
+    const selectors = [
+      '[data-page]',
+      '[data-album-page]',
+      '.album-page',
+      'section.page',
+      'article.page',
+      'main.page',
+      '#album > .page',
+      '.album > .page',
+      '.pages > .page',
+      '.album-container > .page',
+      '.scroll-container > .page',
+      '.story-container > .page',
+      '#album > section',
+      '#album > article',
+      '.album > section',
+      '.album > article',
+    ];
+    const seen = new Set<Element>();
+    const pages: Element[] = [];
+    for (const selector of selectors) {
+      document.querySelectorAll(selector).forEach((el) => {
+        if (seen.has(el)) return;
+        seen.add(el);
+        pages.push(el);
+      });
+    }
+    let filtered = pages
+      .filter((p) => p.querySelector('[data-hv-text], [data-hv-image], [data-hv-cta], img, h1, h2, h3, p, button, a'))
+      .filter((p) => !pages.some((other) => other !== p && other.contains(p)));
+    if (filtered.length <= 1) {
+      const album = document.querySelector(
+        '#album, .album, [data-album], .pages, .scroll-container, .story-container, .album-container',
+      );
+      if (album) {
+        const kids = Array.from(album.children).filter((el) => {
+          if (!(el instanceof HTMLElement)) return false;
+          if (/^(SCRIPT|STYLE|LINK|NOSCRIPT|NAV)$/i.test(el.tagName)) return false;
+          if (/controls|dots|nav/i.test(`${el.className || ''} ${el.id || ''}`)) return false;
+          return !!(
+            el.querySelector('h1, h2, h3, p, img, [data-hv-text], [data-hv-image]')
+            || (el.textContent || '').trim().length > 8
+          );
+        });
+        if (kids.length > filtered.length) {
+          filtered = kids.filter((pageEl) => !kids.some((other) => other !== pageEl && other.contains(pageEl)));
+        }
+      }
+    }
+    if (filtered.length === 0 && document.body) filtered = [document.body];
+
+    const useFade = filtered.length > 1;
+    document.documentElement.classList.add('hv-album-slideshow');
+    document.documentElement.classList.toggle('hv-fade-mode', useFade);
+    document.documentElement.classList.toggle('hv-hardcut-mode', !useFade);
+    document.body?.classList.add('hv-album-slideshow');
+
+    const containers = Array.from(document.querySelectorAll(
+      '#album, .album, [data-album], .pages, .pages-wrap, #pagesWrap, .pages-wrapper, .slides, .slides-wrap, .scroll-container, .story-container, .album-container',
+    ));
+    containers.forEach((el) => {
+      if (!(el instanceof HTMLElement)) return;
+      el.style.setProperty('overflow', 'hidden', 'important');
+      el.style.setProperty('height', '100%', 'important');
+      el.style.setProperty('min-height', '100%', 'important');
+      el.style.setProperty('max-height', '100%', 'important');
+      el.style.setProperty('scroll-snap-type', 'none', 'important');
+      el.style.setProperty('transform', 'none', 'important');
+      el.style.setProperty('translate', 'none', 'important');
+      el.scrollTop = 0;
+      el.scrollLeft = 0;
+    });
+    document.documentElement.scrollTop = 0;
+    if (document.body) document.body.scrollTop = 0;
+
+    return filtered.map((el, index) => {
+      el.setAttribute('data-hv-slideshow-page', String(index));
+      el.classList.toggle('hv-slideshow-active', index === 0);
+      el.classList.remove('hv-slideshow-leaving');
+      return { index, chars: countBodyChars(el), useFade };
+    });
+  });
+
+  if (!Array.isArray(schedule) || schedule.length === 0) {
+    const fallback = 3;
+    ctx.onProgress?.(40, `recording album fallback ${fallback}s`);
+    await page.waitForTimeout(fallback * 1000);
+    return fallback;
+  }
+
+  const useFade = schedule.length > 1 && schedule.every((s) => s.useFade !== false);
+  const rawDwells = schedule.map((step) => albumPageDwellSec(step.chars));
+  const scaled = normalizeAlbumDwells(rawDwells, schedule.length, useFade ? fadeSec : 0);
+  const dwells = schedule.map((step, i) => ({
+    index: step.index,
+    dwellSec: scaled[i] ?? albumPageDwellSec(step.chars),
+    chars: step.chars,
+  }));
+  const fadeTotal = useFade ? Math.max(0, dwells.length - 1) * fadeSec : 0;
+  const holdTotal = dwells.reduce((sum, s) => sum + s.dwellSec, 0);
+  const totalDuration = holdTotal + fadeTotal;
+  ctx.onProgress?.(
+    40,
+    `album slideshow ${dwells.length} pages · ${totalDuration.toFixed(1)}s`
+      + (useFade ? ' · fade' : ' · hard-cut'),
+  );
+  process.stderr.write(
+    `[hyperframes:album-slideshow] pages=${dwells.length} duration=${totalDuration.toFixed(1)}s`
+    + ` mode=${useFade ? 'fade' : 'hard-cut'} fade=${fadeTotal.toFixed(1)}s`
+    + ` dwells=${dwells.map((d) => d.dwellSec.toFixed(1)).join(',')}\n`,
+  );
+
+  const hardCutTo = async (pageIndex: number) => {
+    await page.evaluate((idx: number) => {
+      document.documentElement.classList.remove('hv-fade-mode');
+      document.documentElement.classList.add('hv-hardcut-mode');
+      document.querySelectorAll('[data-hv-slideshow-page]').forEach((el) => {
+        const i = Number(el.getAttribute('data-hv-slideshow-page'));
+        el.classList.toggle('hv-slideshow-active', i === idx);
+        el.classList.toggle('active', i === idx);
+        el.classList.remove('hv-slideshow-leaving');
+      });
+      document.querySelectorAll(
+        '#album, .album, [data-album], .pages, .pages-wrap, #pagesWrap, .pages-wrapper, .slides, .slides-wrap, .scroll-container, .story-container, .album-container',
+      ).forEach((el) => {
+        if (!(el instanceof HTMLElement)) return;
+        el.style.setProperty('transform', 'none', 'important');
+        el.style.setProperty('translate', 'none', 'important');
+        el.scrollTop = 0;
+        el.scrollLeft = 0;
+      });
+      document.documentElement.scrollTop = 0;
+      if (document.body) document.body.scrollTop = 0;
+      void document.documentElement.offsetHeight;
+    }, pageIndex);
+    await page.waitForTimeout(60);
+  };
+
+  const fadeTo = async (fromIndex: number, toIndex: number): Promise<boolean> => {
+    const ok = await page.evaluate(({ from, to }: { from: number; to: number }) => {
+      const nodes = Array.from(document.querySelectorAll('[data-hv-slideshow-page]'));
+      const prev = nodes.find((el) => Number(el.getAttribute('data-hv-slideshow-page')) === from);
+      const next = nodes.find((el) => Number(el.getAttribute('data-hv-slideshow-page')) === to);
+      if (!prev || !next) return false;
+      if (!document.documentElement.classList.contains('hv-fade-mode')) return false;
+      prev.classList.add('hv-slideshow-leaving');
+      prev.classList.remove('hv-slideshow-active');
+      prev.classList.remove('active');
+      next.classList.add('hv-slideshow-active');
+      next.classList.add('active');
+      next.classList.remove('hv-slideshow-leaving');
+      document.querySelectorAll(
+        '#album, .album, [data-album], .pages, .pages-wrap, #pagesWrap, .pages-wrapper, .slides, .slides-wrap, .scroll-container, .story-container, .album-container',
+      ).forEach((el) => {
+        if (!(el instanceof HTMLElement)) return;
+        el.style.setProperty('transform', 'none', 'important');
+        el.style.setProperty('translate', 'none', 'important');
+        el.scrollTop = 0;
+        el.scrollLeft = 0;
+      });
+      void document.documentElement.offsetHeight;
+      return true;
+    }, { from: fromIndex, to: toIndex });
+    if (!ok) return false;
+    await page.waitForTimeout(fadeMs);
+    await page.evaluate((from: number) => {
+      document.querySelectorAll('[data-hv-slideshow-page]').forEach((el) => {
+        if (Number(el.getAttribute('data-hv-slideshow-page')) === from) {
+          el.classList.remove('hv-slideshow-leaving', 'hv-slideshow-active');
+        }
+      });
+    }, fromIndex);
+    return true;
+  };
+
+  let elapsed = 0;
+  let fadeModeLive = useFade;
+  for (let i = 0; i < dwells.length; i++) {
+    if (opts.signal?.aborted) throw new HtmlVideoError('cancelled', 'Aborted');
+    const step = dwells[i]!;
+    if (i === 0) {
+      await hardCutTo(step.index);
+      // Restore fade mode for subsequent transitions after first paint.
+      if (useFade) {
+        await page.evaluate(() => {
+          document.documentElement.classList.add('hv-fade-mode');
+          document.documentElement.classList.remove('hv-hardcut-mode');
+          document.querySelectorAll('[data-hv-slideshow-page]').forEach((el) => {
+            const idx = Number(el.getAttribute('data-hv-slideshow-page'));
+            el.classList.toggle('hv-slideshow-active', idx === 0);
+            el.classList.toggle('active', idx === 0);
+            el.classList.remove('hv-slideshow-leaving');
+          });
+          void document.documentElement.offsetHeight;
+        });
+      }
+    } else if (fadeModeLive) {
+      const faded = await fadeTo(dwells[i - 1]!.index, step.index);
+      if (!faded) {
+        fadeModeLive = false;
+        process.stderr.write('[hyperframes:album-slideshow] fade failed → hard-cut fallback\n');
+        await hardCutTo(step.index);
+      } else {
+        elapsed += fadeSec;
+      }
+    } else {
+      await hardCutTo(step.index);
+    }
+
+    const dwellMs = Math.round(step.dwellSec * 1000);
+    const tick = 250;
+    const start = Date.now();
+    while (Date.now() - start < dwellMs) {
+      if (opts.signal?.aborted) throw new HtmlVideoError('cancelled', 'Aborted');
+      await page.waitForTimeout(Math.min(tick, dwellMs - (Date.now() - start)));
+      const localElapsed = elapsed + (Date.now() - start) / 1000;
+      const pct = 40 + Math.floor((localElapsed / Math.max(0.1, totalDuration)) * 45);
+      ctx.onProgress?.(
+        Math.min(84, pct),
+        `album page ${i + 1}/${dwells.length}`,
+      );
+    }
+    elapsed += step.dwellSec;
+  }
+  return totalDuration;
 }
 
 function runFfmpeg(args: string[], sourcePath?: string): Promise<void> {

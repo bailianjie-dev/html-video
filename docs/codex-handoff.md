@@ -264,7 +264,7 @@ pnpm --filter @html-video/cli typecheck
 剩余 `local-dev` 仅位于未认证状态的兼容默认身份；正式 API 和 Dev 检查接口均使用请求级用户。
 
 PostgreSQL 模式本地工作目录已改为
-`.html-video/projects/<safe-user-id>/<safe-project-id>/`，旧数据库路径继续兼容读取。
+`.html-video/tmp/work/<safe-user-id>/<safe-project-id>/`。PostgreSQL 模式下读取以数据库里的 `raw_html`、`content.graph_node` 等结构化字段为准，不再从旧 `.html-video/projects` 本地路径 fallback。
 
 ### P1：素材读取尚未完全以 `ai_album_assets` 为唯一来源
 

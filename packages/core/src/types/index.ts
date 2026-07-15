@@ -72,6 +72,12 @@ export interface RenderConfig {
    * real per-frame value); single-frame fast preview leaves it 'auto'.
    */
   durationMode?: 'explicit' | 'auto';
+  /**
+   * Electronic album export: hard-cut through each album page and dwell
+   * according to on-page copy length. Total duration = sum of per-page dwells.
+   * Used by Studio "导出视频" for interactive albums (not frame storyboards).
+   */
+  albumSlideshow?: boolean;
   outputPath: string;
   alpha?: boolean;
   quality?: number | 'low' | 'medium' | 'high' | 'lossless';

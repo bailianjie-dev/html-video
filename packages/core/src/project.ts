@@ -405,6 +405,12 @@ export class ProjectOrchestrator {
     outputPath?: string;
     onProgress?: (pct: number, stage: string) => void;
     signal?: AbortSignal;
+    /** Pre-baked HTML path (Studio may inline album assets before export). */
+    htmlSourcePath?: string;
+    /** Hard-cut electronic album slideshow (dwell by copy length). */
+    albumSlideshow?: boolean;
+    /** Skip music/narration mux (album slideshow export). */
+    skipSoundtrack?: boolean;
   }): Promise<{ project: Project; outputPath: string }> {
     const project = await this.deps.projects.load(args.projectId);
     const projectDir = await this.deps.projects.ensureDir(project.id);
@@ -466,7 +472,51 @@ export class ProjectOrchestrator {
         fps: project.preferences.fps ?? 60,
       });
       const totalDur = ordered.reduce((s, f) => s + (f.durationSec || 0), 0);
-      await this.applySoundtrack(project, outputPath, totalDur, args.onProgress);
+      if (!args.skipSoundtrack) {
+        await this.applySoundtrack(project, outputPath, totalDur, args.onProgress);
+      }
+      project.lastOutputMp4Path = outputPath;
+      recordExport(project, outputPath);
+      project.status = 'rendered';
+      await this.deps.projects.save(project);
+      return { project, outputPath };
+    }
+
+    // Electronic album: record preview HTML as a hard-cut page slideshow.
+    const previewPath = args.htmlSourcePath || project.lastPreviewHtmlPath;
+    const albumSlideshow = args.albumSlideshow === true
+      || (args.albumSlideshow !== false && !!previewPath && await fileLooksLikeAlbumHtml(previewPath));
+    if (albumSlideshow && previewPath) {
+      const { existsSync } = await import('node:fs');
+      if (!existsSync(previewPath)) {
+        throw new HtmlVideoError('invalid-input', `Album preview HTML not found: ${previewPath}`);
+      }
+      const adapter = this.deps.engines.get('hyperframes');
+      await adapter.render(
+        {
+          template: {
+            id: 'album-slideshow',
+            engine: 'hyperframes',
+            sourcePath: previewPath,
+          },
+          variables: project.variables,
+          config: {
+            format: 'mp4',
+            resolution: project.preferences.resolution ?? { width: 1080, height: 1920 },
+            fps: project.preferences.fps ?? 30,
+            duration: 'auto',
+            durationMode: 'explicit',
+            albumSlideshow: true,
+            outputPath,
+          },
+        },
+        {
+          workDir: projectDir,
+          ...(args.onProgress !== undefined && { onProgress: args.onProgress }),
+          ...(args.signal !== undefined && { signal: args.signal }),
+        },
+      );
+      // Album slideshow export intentionally has no voiceover / BGM.
       project.lastOutputMp4Path = outputPath;
       recordExport(project, outputPath);
       project.status = 'rendered';
@@ -499,7 +549,9 @@ export class ProjectOrchestrator {
         ...(args.signal !== undefined && { signal: args.signal }),
       },
     );
-    await this.applySoundtrack(project, outputPath, undefined, args.onProgress);
+    if (!args.skipSoundtrack) {
+      await this.applySoundtrack(project, outputPath, undefined, args.onProgress);
+    }
     project.lastOutputMp4Path = outputPath;
     recordExport(project, outputPath);
     project.status = 'rendered';
@@ -981,6 +1033,18 @@ function templateRefFromMeta(meta: TemplateMetadata) {
     engine: meta.engine,
     sourcePath: join(meta.__dir, meta.source_entry),
   };
+}
+
+async function fileLooksLikeAlbumHtml(htmlPath: string): Promise<boolean> {
+  try {
+    const { existsSync } = await import('node:fs');
+    const { readFile } = await import('node:fs/promises');
+    if (!existsSync(htmlPath)) return false;
+    const html = await readFile(htmlPath, 'utf8');
+    return /data-album-page|data-page=|scroll-snap-type|class=["'][^"']*\balbum\b|id=["']album["']/i.test(html);
+  } catch {
+    return false;
+  }
 }
 
 function downgradeStatus(current: ProjectStatus, target: ProjectStatus): ProjectStatus {

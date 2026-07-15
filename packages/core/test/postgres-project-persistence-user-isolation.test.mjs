@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, relative, resolve } from 'node:path';
 import test from 'node:test';
@@ -335,37 +335,50 @@ test('isolates work directories and local assets for users sharing a project id'
   ]);
 
   assert.notEqual(aliceDir, bobDir);
-  assert.match(aliceDir.replaceAll('\\', '/'), /\/projects\/alice\/proj_shared$/);
-  assert.match(bobDir.replaceAll('\\', '/'), /\/projects\/bob\/proj_shared$/);
+  assert.match(aliceDir.replaceAll('\\', '/'), /\/tmp\/work\/alice\/proj_shared$/);
+  assert.match(bobDir.replaceAll('\\', '/'), /\/tmp\/work\/bob\/proj_shared$/);
   assert.ok(aliceAsset.path.startsWith(aliceDir));
   assert.ok(bobAsset.path.startsWith(bobDir));
 });
 
-test('sanitizes unsafe user and project ids without escaping the projects root', async (t) => {
+test('sanitizes unsafe user and project ids without escaping the temp work root', async (t) => {
   const { persistence, projectRoot, runAs } = await fixture(t);
-  const projectsRoot = resolve(projectRoot, '.html-video', 'projects');
+  const workRoot = resolve(projectRoot, '.html-video', 'tmp', 'work');
   const dir = await runAs('../Alice', () => persistence.ensureDir('../../outside'));
-  const relativeDir = relative(projectsRoot, resolve(dir));
+  const relativeDir = relative(workRoot, resolve(dir));
 
   assert.ok(relativeDir);
   assert.equal(relativeDir.startsWith('..'), false);
   assert.equal(relativeDir.includes('..'), false);
-  assert.match(dir.replaceAll('\\', '/'), /\/projects\/alice--[a-f0-9]{12}\/outside--[a-f0-9]{12}$/);
+  assert.match(dir.replaceAll('\\', '/'), /\/tmp\/work\/alice--[a-f0-9]{12}\/outside--[a-f0-9]{12}$/);
 });
 
-test('keeps legacy local preview paths readable while new writes use user directories', async (t) => {
+test('does not read legacy local preview paths while new writes use user directories', async (t) => {
   const { persistence, projectRoot, runAs } = await fixture(t);
   const legacyDir = join(projectRoot, '.html-video', 'projects', 'proj_legacy');
   const legacyPreview = join(legacyDir, 'preview.html');
-  await mkdir(legacyDir, { recursive: true });
-  await writeFile(legacyPreview, '<html>Legacy preview</html>', 'utf8');
   const legacyProject = project('proj_legacy', 'Legacy album');
   legacyProject.lastPreviewHtmlPath = legacyPreview;
+  legacyProject.contentGraphPath = join(legacyDir, 'content-graph.json');
+  legacyProject.frames = [{
+    graphNodeId: 'intro',
+    htmlPath: join(legacyDir, 'frames', '01-intro.html'),
+    durationSec: 3,
+    order: 0,
+  }];
   await runAs('alice', () => persistence.save(legacyProject));
 
   assert.equal(
     await runAs('alice', () => persistence.readRawHtml('proj_legacy')),
-    '<html>Legacy preview</html>',
+    null,
+  );
+  assert.equal(
+    await runAs('alice', () => persistence.readFrameHtml('proj_legacy', 'intro')),
+    null,
+  );
+  assert.equal(
+    await runAs('alice', () => persistence.readContentGraph('proj_legacy')),
+    null,
   );
   const written = await runAs(
     'alice',
@@ -373,6 +386,6 @@ test('keeps legacy local preview paths readable while new writes use user direct
   );
   assert.match(
     written.htmlPath.replaceAll('\\', '/'),
-    /\/projects\/alice\/proj_legacy\/preview\.html$/,
+    /\/tmp\/work\/alice\/proj_legacy\/preview\.html$/,
   );
 });

@@ -1,6 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { existsSync } from 'node:fs';
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { mkdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { ContentGraph } from '@html-video/content-graph';
 import type { DbClient } from '../db/client.js';
@@ -45,7 +44,8 @@ export class PostgresProjectPersistence implements ProjectPersistence {
     const dir = join(
       this.opts.projectRoot,
       '.html-video',
-      'projects',
+      'tmp',
+      'work',
       safeWorkDirectorySegment(user.userId, 'user'),
       safeWorkDirectorySegment(id, 'project'),
     );
@@ -124,8 +124,7 @@ export class PostgresProjectPersistence implements ProjectPersistence {
     const album = await this.requireAlbum(projectId, user);
     const page = await this.pages.findByNodeId(user.userId, album.id, 'preview')
       ?? await this.pages.findByPageNo(user.userId, album.id, 1);
-    if (page?.raw_html) return page.raw_html;
-    return readLocalFile(asString(album.settings.local_last_preview_html_path));
+    return page?.raw_html ?? null;
   }
 
   async writeRawHtml(projectId: string, html: string): Promise<{
@@ -185,10 +184,7 @@ export class PostgresProjectPersistence implements ProjectPersistence {
     const user = this.opts.getUserContext();
     const album = await this.requireAlbum(projectId, user);
     const page = await this.pages.findByNodeId(user.userId, album.id, nodeId);
-    if (page?.raw_html) return page.raw_html;
-    const project = albumRowToProject(album);
-    const frame = (project.frames ?? []).find((item) => item.graphNodeId === nodeId);
-    return readLocalFile(frame?.htmlPath);
+    return page?.raw_html ?? null;
   }
 
   async writeFrameHtml(
@@ -284,22 +280,18 @@ export class PostgresProjectPersistence implements ProjectPersistence {
     const user = this.opts.getUserContext();
     const album = await this.requireAlbum(projectId, user);
     const graphMeta = asObject(album.settings.content_graph);
-    if (graphMeta) {
-      const pages = await this.pages.listByAlbum(user.userId, album.id);
-      const nodes = pages
-        .map((page) => asObject(page.content.graph_node))
-        .filter((node): node is JsonObject => node !== null);
-      if (nodes.length > 0) {
-        return {
-          schemaVersion: Number(graphMeta.schemaVersion ?? 1),
-          intent: typeof graphMeta.intent === 'string' ? graphMeta.intent : 'other',
-          ...(typeof graphMeta.synopsis === 'string' && { synopsis: graphMeta.synopsis }),
-          nodes: nodes as unknown as ContentGraph['nodes'],
-          edges: Array.isArray(graphMeta.edges) ? graphMeta.edges as unknown as ContentGraph['edges'] : [],
-        } as ContentGraph;
-      }
-    }
-    return readJsonFile<ContentGraph>(asString(album.settings.content_graph_path));
+    const pages = await this.pages.listByAlbum(user.userId, album.id);
+    const nodes = pages
+      .map((page) => asObject(page.content.graph_node))
+      .filter((node): node is JsonObject => node !== null);
+    if (nodes.length === 0) return null;
+    return {
+      schemaVersion: Number(graphMeta?.schemaVersion ?? 1),
+      intent: typeof graphMeta?.intent === 'string' ? graphMeta.intent : 'other',
+      ...(typeof graphMeta?.synopsis === 'string' && { synopsis: graphMeta.synopsis }),
+      nodes: nodes as unknown as ContentGraph['nodes'],
+      edges: Array.isArray(graphMeta?.edges) ? graphMeta.edges as unknown as ContentGraph['edges'] : [],
+    } as ContentGraph;
   }
 
   async writeContentGraph(
@@ -408,16 +400,6 @@ function isFormalProjectAlbum(album: AlbumRow): boolean {
   return album.source_project_id === null || album.source_project_id.startsWith('proj_');
 }
 
-async function readLocalFile(path: string | undefined): Promise<string | null> {
-  if (!path || !existsSync(path)) return null;
-  return readFile(path, 'utf8');
-}
-
-async function readJsonFile<T>(path: string | undefined): Promise<T | null> {
-  const raw = await readLocalFile(path);
-  return raw ? JSON.parse(raw) as T : null;
-}
-
 function publicationFields(publication: HtmlPublication | null) {
   return publication
     ? {
@@ -427,10 +409,6 @@ function publicationFields(publication: HtmlPublication | null) {
         html_checksum_sha256: publication.checksumSha256,
       }
     : {};
-}
-
-function asString(value: unknown): string | undefined {
-  return typeof value === 'string' ? value : undefined;
 }
 
 function asObject(value: unknown): JsonObject | null {

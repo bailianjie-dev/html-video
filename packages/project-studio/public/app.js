@@ -90,11 +90,15 @@ const state = {
   exportProgress: null,    // { pct, stage } during a streamed export
   lastGraph: null,         // last fetched ContentGraph (for download)
   generationMeta: null,    // create-page selections shown on the generation page
-  generationComposerOpen: false,
+  generationComposerOpen: true,
   generationSideTab: 'assistant', // 'assistant' | 'edit' — 生成页右侧页签
   generationProgressText: '',
   generationProgressStartedAt: 0,
   generationProgressTimer: null,
+  // Create→studio handoff: keep the preview shell in "generating" until sendMessage runs.
+  expectingInitialGeneration: false,
+  // Backend still generating after refresh/switch (no live SSE on this tab).
+  backendGenerating: false,
   previewDevice: 'phone', // 'phone' | 'desktop' — 生成页预览设备版面
   previewZoom: 1, // 1 = 刚好适合预览壳；>1 放大可滚动
   previewRevision: 0, // local cache-bust token for preview iframes/thumbs
@@ -103,6 +107,7 @@ const state = {
   albumPageSummaries: [], // short per-page titles for the left rail
   albumPageTextEditActive: false, // 电子相册：点「编辑本页」后右侧只显示当前页字段
   // Phase C: per-frame native Remotion enhancement
+  albumPageActionBusy: false,
   frameKinds: {},          // { [graphNodeId]: 'entity'|'data'|'text' } for the selected project
   frameLabels: {},         // { [graphNodeId]: short topic } from content-graph
   enhancing: null,         // { nodeId, pct, stage } while a single-frame enhance render is in flight
@@ -349,12 +354,15 @@ function clearSessionState() {
   state.generationMeta = null;
   stopGenerationProgressTicker();
   state.generationProgressText = '';
-  state.generationComposerOpen = false;
+  state.expectingInitialGeneration = false;
+  state.backendGenerating = false;
+  state.generationComposerOpen = true;
   state.albumPageCount = 0;
   state.albumPageSummaries = [];
   state.activeAlbumPage = 0;
   state.activeAlbumPage = 0;
   state.albumPageTextEditActive = false;
+  state.albumPageActionBusy = false;
   state.activeFrameId = null;
   state.iterateFocusFrameId = null;
   state.frameKinds = {};
@@ -418,6 +426,13 @@ async function applyRouteFromLocation(options = {}) {
       } catch (error) {
         console.warn('pending generation job load failed:', error);
       }
+    }
+    // Paint loading (not "生成失败") while the create-page job is about to send.
+    if (generationJob) {
+      state.expectingInitialGeneration = true;
+      state.composing = true;
+      state.generationProgressText = GENERATION_PROGRESS_STEPS[0]?.text
+        || '已提交需求，正在连接 AI 助手…';
     }
     await selectProject(routedProjectId, { page: 'workspace', updateUrl: false });
     if (options.replace) updateProjectStudioRoute(routedProjectId, { replace: true });
@@ -537,6 +552,34 @@ async function createDefaultProject() {
 }
 
 // ============== Export MP4 (streamed) ==============
+function triggerMp4Download(projectId) {
+  if (!projectId) return;
+  // Same pattern as export-html: navigate so Content-Disposition triggers a save.
+  window.location.href = `/api/projects/${encodeURIComponent(projectId)}/export-mp4`;
+}
+
+function formatExportProgressLabel(pct, stage) {
+  const p = formatPct(pct);
+  const s = String(stage || '').trim();
+  const albumPage = /^album page (\d+)\/(\d+)/i.exec(s);
+  if (albumPage) return `导出视频 ${p}% · 第 ${albumPage[1]}/${albumPage[2]} 页`;
+  if (/album slideshow/i.test(s)) return `导出视频 ${p}% · 准备翻页录制`;
+  const stageZh = ({
+    starting: '准备中',
+    preparing: '准备中',
+    'launching browser': '启动浏览器',
+    'loading frame': '加载页面',
+    'loading fonts': '加载字体',
+    recording: '录制中',
+    'finalising recording': '收尾录制',
+    'encoding mp4': '编码中',
+    'uploading to OSS': '上传中',
+  })[s];
+  if (stageZh) return `导出视频 ${p}% · ${stageZh}`;
+  if (!s) return `导出视频 ${p}%`;
+  return `导出视频 ${p}%`;
+}
+
 async function startExportStream() {
   if (!state.selected) return;
   const projectId = state.selected.id;
@@ -544,8 +587,8 @@ async function startExportStream() {
   state.exportProgress = { pct: 0, stage: 'starting' };
   renderToolbar();
   updateGenerationControls();
-  state.messages.push({ role: 'preview-event', content: t('export.starting'), ts: Date.now() });
-  renderChatLog();
+  // Button-triggered export stays out of the AI chat — progress is on the
+  // toolbar / generation controls; success uses toast + automatic download.
 
   let res;
   try {
@@ -586,7 +629,14 @@ async function startExportStream() {
         if (!line.startsWith('data: ')) continue;
         let ev;
         try { ev = JSON.parse(line.slice(6)); } catch { continue; }
-        if (ev.type === 'export_progress') {
+        if (ev.type === 'export_started') {
+          state.exportProgress = {
+            pct: 1,
+            stage: ev.mode === 'album_slideshow' ? 'album slideshow' : 'starting',
+          };
+          renderToolbar();
+          updateGenerationControls();
+        } else if (ev.type === 'export_progress') {
           state.exportProgress = { pct: ev.pct, stage: ev.stage };
           renderToolbar();
           updateGenerationControls();
@@ -595,29 +645,16 @@ async function startExportStream() {
           state.exportProgress = null;
           if (ev.project) state.selected = ev.project;
           const seconds = ev.elapsed_ms ? `${(ev.elapsed_ms / 1000).toFixed(1)}s` : '';
-          state.messages.push({
-            role: 'preview-event',
-            content: seconds ? t('export.done_seconds', { seconds }) : t('export.done_no_seconds'),
-            ts: Date.now(),
-          });
-          state.messages.push({
-            role: 'export-done',
-            content: ev.output_path,
-            ts: Date.now(),
-          });
-          renderChatLog();
+          toast(seconds ? `视频已导出（${seconds}），开始下载…` : '视频已导出，开始下载…', 'success');
           renderToolbar();
           updateGenerationControls();
           refreshProjects();
+          // Prefer fresh project id; download endpoint serves lastOutputMp4Path.
+          triggerMp4Download(state.selected?.id || projectId);
         } else if (ev.type === 'export_failed') {
           state.exporting = false;
           state.exportProgress = null;
-          state.messages.push({
-            role: 'system',
-            content: t('export.failed', { message: ev.message }),
-            ts: Date.now(),
-          });
-          renderChatLog();
+          toast(t('export.failed', { message: ev.message }), 'error');
           renderToolbar();
           updateGenerationControls();
         }
@@ -785,20 +822,24 @@ async function selectProject(id, options = {}) {
   // A generation running for the PREVIOUS project keeps going on the backend
   // (its result persists); just release the composer so this project is usable.
   // The in-flight SSE loop self-stops once it sees selectedId changed.
-  state.composing = false;
-  stopGenerationProgressTicker();
-  state.generationProgressText = '';
+  // Keep composing if we just arrived from create-page with a pending job.
+  if (state.expectingInitialGeneration && id === state.selectedId) {
+    state.composing = true;
+    if (!state.generationProgressText) {
+      state.generationProgressText = '已提交需求，正在连接 AI 助手…';
+    }
+  } else {
+    state.composing = false;
+    stopGenerationProgressTicker();
+    state.generationProgressText = '';
+    state.expectingInitialGeneration = false;
+  }
+  state.backendGenerating = false;
+  state.generationComposerOpen = true;
   try { state.messages = (await API.getMessages(id)).messages ?? []; }
   catch { state.messages = []; }
-  // Export history is persisted on the project — surface the latest export so
-  // its "MP4 ready" card survives a session/project switch (it was previously
-  // only an in-memory chat message and vanished on switch).
-  const exports = state.selected?.exports ?? [];
-  if (exports.length && exports[exports.length - 1]?.path) {
-    state.messages.push({ role: 'export-done', content: exports[exports.length - 1].path, ts: Date.now() });
-  } else if (state.selected?.lastOutputMp4Path) {
-    state.messages.push({ role: 'export-done', content: state.selected.lastOutputMp4Path, ts: Date.now() });
-  }
+  // Do not inject export-done into the AI chat — MP4 export uses toast +
+  // automatic download from the export button, not a dialogue card.
   // If a generation is still running on the backend for this project, surface a
   // live "still generating" line (the in-memory progress lines were lost on the
   // switch; the result will appear in messages once it finishes — reload to see).
@@ -806,6 +847,7 @@ async function selectProject(id, options = {}) {
     const g = await fetch(`/api/projects/${id}/generating`).then((r) => r.json());
     if (g?.generating && id === state.selectedId) {
       state.messages.push({ role: 'preview-event', content: t('chat.still_generating'), ts: Date.now() });
+      if (!hasProjectPreview(state.selected)) state.backendGenerating = true;
     }
   } catch { /* non-fatal */ }
   renderSidebar();
@@ -1088,7 +1130,7 @@ function makeAlbumProjectName(raw) {
 function projectUserStatus(project) {
   if (!project) return '';
   if (state.selectedId === project.id && state.exporting) return '正在导出';
-  if (state.selectedId === project.id && state.composing) return '正在生成';
+  if (state.selectedId === project.id && shouldShowGenerationLoading(project)) return '正在生成';
   if (hasProjectPreview(project)) return '已生成，可预览和调整';
   if (project.status === 'rendered' || project.status === 'previewed') return '生成中断，可重新生成';
   if (project.status === 'draft') return '准备生成';
@@ -1101,6 +1143,85 @@ function hasProjectPreview(project) {
     || project?.last_preview_html_path
     || (project?.frames?.length ?? 0) > 0
   );
+}
+
+/** Preview shell should show loading — not the regenerate recover card. */
+function shouldShowGenerationLoading(project = state.selected) {
+  if (!project || hasProjectPreview(project)) return false;
+  return !!(
+    state.composing
+    || state.expectingInitialGeneration
+    || state.backendGenerating
+    || state.generationProgressTimer
+  );
+}
+
+function generationLoadingEmptyHtml(meta = state.generationMeta || {}) {
+  const title = meta.title || state.selected?.name || '电子相册';
+  const pages = meta.pages || '5 页';
+  const templateHint = meta.template && !/未选择/.test(String(meta.template))
+    ? String(meta.template)
+    : '未选模板，AI 按提示自由发挥';
+  return `
+            <div class="generation-loading" data-generation-empty="loading">
+              <div class="generation-spinner"></div>
+              <h2>正在为你生成「${esc(title)}」</h2>
+              <p>${esc(pages)} · ${esc(templateHint)}</p>
+              <span>实时进度请查看右侧 AI助手，完成后会自动刷新预览</span>
+              <div class="generation-skeletons" aria-hidden="true">
+                <div class="generation-skeleton-card"></div>
+                <div class="generation-skeleton-card active"></div>
+                <div class="generation-skeleton-card"></div>
+              </div>
+              <div class="generation-tip">
+                <b>宣传相册生成中</b>
+                <span>未选模板时也会正常生成；请保持页面打开，不要刷新。</span>
+              </div>
+            </div>`;
+}
+
+function generationRecoverEmptyHtml() {
+  return `
+            <div class="generation-loading generation-recover" data-generation-empty="recover">
+              <h2>预览还没准备好</h2>
+              <p>可能是生成尚未开始、中途刷新，或服务重启导致 HTML 还没写入。</p>
+              <span>可以点击“重新生成”，系统会沿用当前页数、场景、展示设备等配置再生成相册。</span>
+              <div class="generation-tip">
+                <b>建议操作</b>
+                <span>直接点下方或右上角“重新生成”；若右侧进度仍在更新，请稍等或点“刷新预览”。</span>
+              </div>
+              <button type="button" class="generation-btn primary" id="btn-recover-regenerate">重新生成</button>
+            </div>`;
+}
+
+/** Keep the centre empty-state in sync when composing starts/ends without full remount. */
+function syncGenerationEmptyPreview() {
+  const stage = document.getElementById('preview-stage');
+  if (!stage?.classList?.contains('generation-preview-shell')) return;
+  if (hasProjectPreview(state.selected)) {
+    state.backendGenerating = false;
+    state.expectingInitialGeneration = false;
+    return;
+  }
+  // Don't clobber a live device preview / iframe if something already mounted.
+  if (stage.querySelector('#preview-iframe, .device-shell, .preview-frame')) return;
+
+  const wantLoading = shouldShowGenerationLoading();
+  const current = stage.getAttribute('data-generation-empty')
+    || stage.querySelector('[data-generation-empty]')?.getAttribute('data-generation-empty');
+  const next = wantLoading ? 'loading' : 'recover';
+  if (current === next && stage.querySelector('[data-generation-empty]')) {
+    // Update title/progress copy lightly via controls only.
+    return;
+  }
+  stage.setAttribute('data-generation-empty', next);
+  stage.innerHTML = wantLoading
+    ? generationLoadingEmptyHtml(state.generationMeta || {})
+    : generationRecoverEmptyHtml();
+  const recoverBtn = document.getElementById('btn-recover-regenerate');
+  if (recoverBtn) {
+    recoverBtn.onclick = () => sendGenerationQuickAdjust('请基于当前需求重新生成这本电子相册，保留用户已选择的页数、受众、场景、语气、展示设备、风格、素材使用方式和行动引导。');
+  }
 }
 
 function selectedOptionText(id) {
@@ -1124,23 +1245,43 @@ function selectedCreateTemplateText() {
   return tpl ? `从模板库选择：${tpl.name}` : '未选择，让 AI 根据提示自由发挥';
 }
 
+/** Album create/preview only offers phone (9:16) vs desktop (16:9). */
+const DISPLAY_DEVICE_ASPECTS = ['9:16', '16:9'];
+const DISPLAY_DEVICE_LABELS = { '9:16': '手机', '16:9': '电脑' };
+
 function createSupportedAspects() {
   const tpl = selectedCreateTemplate();
   const supported = tpl?.output?.resolution?.supported_aspects;
-  return Array.isArray(supported) && supported.length > 0 ? supported : ['9:16', '16:9', '1:1'];
+  if (Array.isArray(supported) && supported.length > 0) {
+    const filtered = DISPLAY_DEVICE_ASPECTS.filter((a) => supported.includes(a));
+    return filtered.length > 0 ? filtered : [...DISPLAY_DEVICE_ASPECTS];
+  }
+  return [...DISPLAY_DEVICE_ASPECTS];
+}
+
+/** Map stored ratio / label → 手机 | 电脑 (legacy 9:16 竖屏 etc. still work). */
+function displayDeviceLabelFromRatio(value) {
+  const aspect = normalizeRatioLabel(value);
+  if (aspect === '16:9') return '电脑';
+  if (aspect === '9:16') return '手机';
+  const raw = String(value || '').trim();
+  if (/电脑|desktop|\bpc\b|横屏/i.test(raw)) return '电脑';
+  if (/手机|mobile|phone|竖屏/i.test(raw)) return '手机';
+  return '手机';
 }
 
 function createRatioOptionsHtml(selected = '') {
-  const labels = {
-    '9:16': '9:16 竖屏',
-    '16:9': '16:9 横屏',
-    '1:1': '1:1 方形',
-    '4:5': '4:5 小红书',
-  };
   const aspects = createSupportedAspects();
+  const preferred = aspects.includes('9:16') ? '9:16' : aspects[0];
+  let selectedAspect = normalizeRatioLabel(selected);
+  if (!selectedAspect || !aspects.includes(selectedAspect)) {
+    selectedAspect = displayDeviceLabelFromRatio(selected) === '电脑' && aspects.includes('16:9')
+      ? '16:9'
+      : preferred;
+  }
   return aspects.map((aspect) => {
-    const label = labels[aspect] || aspect;
-    const isSelected = selected ? label === selected || aspect === selected : aspect === aspects[0];
+    const label = DISPLAY_DEVICE_LABELS[aspect] || aspect;
+    const isSelected = aspect === selectedAspect;
     return `<option value="${esc(label)}"${isSelected ? ' selected' : ''}>${esc(label)}</option>`;
   }).join('');
 }
@@ -1160,7 +1301,7 @@ function buildCreateGenerationMeta(raw) {
     kind: '电子相册',
     pages: selectedOptionText('create-pages') || '5 页',
     scene: selectedOptionText('create-scene') || '公司介绍',
-    ratio: selectedOptionText('create-ratio') || '9:16 竖屏',
+    ratio: selectedOptionText('create-ratio') || '手机',
     templateId: state.createTemplateId || null,
     template: selectedCreateTemplateText(),
   };
@@ -1176,11 +1317,27 @@ function buildImageAlbumGenerationMeta() {
     audience: '潜在客户',
     scene: '图片宣传相册',
     tone: '温柔',
-    ratio: selectedOptionText('image-album-ratio') || '9:16 竖屏',
+    ratio: selectedOptionText('image-album-ratio') || '手机',
     style: selectedOptionText('image-album-style') || '温暖纪实',
     materialUse: '图片为主文字为辅',
     cta: '联系咨询',
   };
+}
+
+function albumLayoutPromptLines(ratioLabel) {
+  const device = displayDeviceLabelFromRatio(ratioLabel);
+  if (device === '电脑') {
+    return [
+      '5. 展示设备：电脑（画幅 16:9 横屏）。',
+      '6. 这些页数、场景、模板、展示设备都已由用户在输入前确认，不要再追问“想做哪种内容”或重复确认配置。',
+      '7. 本相册只面向电脑浏览：固定 16:9 横屏画布；显示上一页/下一页、页面计数与圆点；支持键盘方向键/PageUp/PageDown 翻页；可用舒展分栏。不要再做手机竖屏双端自适应。',
+    ];
+  }
+  return [
+    '5. 展示设备：手机（画幅 9:16 竖屏）。',
+    '6. 这些页数、场景、模板、展示设备都已由用户在输入前确认，不要再追问“想做哪种内容”或重复确认配置。',
+    '7. 本相册只面向手机浏览：固定 9:16 竖屏画布；一页一屏，下滑 / scroll-snap 翻页；保留底部圆点；隐藏桌面「上一页/下一页」大按钮。不要再做 PC 宽屏双端自适应。',
+  ];
 }
 
 function buildAlbumPromptFromCreatePage() {
@@ -1189,9 +1346,11 @@ function buildAlbumPromptFromCreatePage() {
   const wantsThinking = document.getElementById('btn-create-thinking')?.classList.contains('active');
   const template = selectedCreateTemplate();
   const templateText = selectedCreateTemplateText();
+  const ratio = pick('create-ratio') || '手机';
   const attachmentNote = state.pendingAttachments.length
     ? `\n已上传 ${state.pendingAttachments.length} 个素材，请优先围绕这些素材组织页面；不足的部分再用文字、图形或合理占位补足。`
     : '';
+  const layoutLines = albumLayoutPromptLines(ratio);
   return `帮我生成一个电子相册。
 
 主题和素材说明：
@@ -1202,15 +1361,10 @@ ${raw}
 2. 页数：${pick('create-pages')}。
 3. 场景：${pick('create-scene')}。
 4. 模板：${templateText}。
-5. 比例：${pick('create-ratio')}。
-6. 这些页数、场景、模板、比例都已由用户在输入前确认，不要再追问“想做哪种内容”或重复确认配置。
-7. 必须是可响应双端的交互式 HTML 电子相册：同一份 HTML 同时支持手机版面和 PC 版面。
-8. 手机版面（窄屏）：竖屏一页一屏，下滑 / scroll-snap 翻页；隐藏桌面「上一页/下一页」大按钮，保留底部圆点。
-9. PC 版面（宽屏）：左右或图文分栏更舒展；显示上一页/下一页按钮、页面计数、圆点，并支持键盘方向键/PageUp/PageDown 翻页。
-10. 不要只做手机版或只做 PC 版；用 CSS media query 切换两种版面，手机与 PC 打开同一文件都要能正常浏览。
-11. 上传了素材就优先使用真实素材；未上传素材也要基于主题生成完整相册，可使用排版、色块、图标、数据卡片和合理占位，不要要求用户补充素材。
-12. 页面文案要服务于当前场景，适合直接对外展示：表达可信、重点清晰、避免夸张空话；如果场景适合转化，最后一页自动生成明确 CTA。
-13. ${template ? `已选择模板：${template.name}（${template.description || template.id}）。请参考该模板的版式、配色、字体和动效生成，而不是简单照搬示例内容。\n` : ''}${wantsThinking ? '请先梳理内容结构，再生成最终 HTML。' : '直接生成最终 HTML。'}${attachmentNote}`;
+${layoutLines.join('\n')}
+8. 上传了素材就优先使用真实素材；未上传素材也要基于主题生成完整相册，可使用排版、色块、图标、数据卡片和合理占位，不要要求用户补充素材。
+9. 页面文案要服务于当前场景，适合直接对外展示：表达可信、重点清晰、避免夸张空话；如果场景适合转化，最后一页自动生成明确 CTA。
+10. ${template ? `已选择模板：${template.name}（${template.description || template.id}）。请参考该模板的版式、配色、字体和动效生成，而不是简单照搬示例内容。\n` : ''}${wantsThinking ? '请先梳理内容结构，再生成最终 HTML。' : '直接生成最终 HTML。'}${attachmentNote}`;
 }
 
 function renderLandingAttachments() {
@@ -1262,8 +1416,12 @@ function buildImageAlbumPrompt() {
   const note = document.getElementById('image-album-note')?.value.trim() || '请根据图片内容组织简洁文案。';
   const title = document.getElementById('image-album-title')?.value.trim() || '图片电子相册';
   const style = document.getElementById('image-album-style')?.value || '清爽留白';
-  const ratio = document.getElementById('image-album-ratio')?.value || '9:16 竖屏';
+  const ratio = document.getElementById('image-album-ratio')?.value || '手机';
   const names = state.pendingAttachments.map((a, i) => `${i + 1}. ${a.name}`).join('\n');
+  const device = displayDeviceLabelFromRatio(ratio);
+  const layoutNote = device === '电脑'
+    ? '7. 本相册只面向电脑浏览：固定 16:9 横屏；显示上一页/下一页与圆点，支持键盘翻页。不要再做手机竖屏双端自适应。'
+    : '7. 本相册只面向手机浏览：固定 9:16 竖屏，一页一屏下滑翻页，保留圆点。不要再做 PC 宽屏双端自适应。';
   return `请根据我上传的图片生成一个电子相册。
 
 相册标题：${title}
@@ -1278,10 +1436,9 @@ ${names}
 3. 必须严格按照上传图片顺序生成页面，第 1 张图片对应第 1 页，第 2 张图片对应第 2 页，以此类推。
 4. 每一页以对应图片为主体，搭配一句简短标题和一段不超过 40 字的说明。
 5. 风格：${style}。
-6. 比例：${ratio}。
-7. 生成可独立运行的交互式 HTML 电子相册，同一份 HTML 同时包含手机与 PC 两种版面。
-8. 手机端：窄屏竖屏一页一屏，下滑翻页；PC 端：宽屏显示上一页/下一页按钮与键盘翻页，用 CSS media query 切换，不要拆成两个文件。
-9. 不要编造图片中看不出的具体事实；不确定的内容用中性表达。`;
+6. 展示设备：${device}。
+${layoutNote}
+8. 不要编造图片中看不出的具体事实；不确定的内容用中性表达。`;
 }
 
 async function runPendingGenerationJob(job) {
@@ -1415,9 +1572,9 @@ function renderCreatePage() {
           <label><span>场景</span><select id="create-scene">${renderAlbumSceneOptions('公司介绍')}</select></label>
           <label class="template-control"><span>模板</span><div class="template-select-row"><button type="button" class="template-select-btn" id="btn-create-template">${esc(selectedCreateTemplateLabel())}</button><button type="button" class="template-clear-btn" id="btn-create-template-clear" title="移除已选择模板" ${state.createTemplateId ? '' : 'hidden'}>×</button></div></label>
           <label><span>页数</span><select id="create-pages"><option>5 页</option><option>3 页</option><option>8 页</option><option>10 页</option></select></label>
-          <label><span>比例</span><select id="create-ratio">${createRatioOptionsHtml('9:16 竖屏')}</select></label>
+          <label><span>展示设备</span><select id="create-ratio">${createRatioOptionsHtml('手机')}</select></label>
         </div>
-        <p class="generator-help">只需确定场景、模板、页数和比例；素材、语气、行动引导由 Agent 按主题与场景自动处理，生成后仍可继续调整。</p>
+        <p class="generator-help">只需确定场景、模板、页数和展示设备；素材、语气、行动引导由 Agent 按主题与场景自动处理，生成后仍可继续调整。</p>
 
         <p class="prompt-guide">可以写公司介绍、产品亮点、客户案例、联系方式；也可以直接粘贴公司简介。</p>
         <div class="prompt-field">
@@ -1595,11 +1752,10 @@ function renderAlbumPage() {
 
               <div class="side-grid">
                 <label class="stack-field">
-                  <span>比例</span>
+                  <span>展示设备</span>
                   <select id="image-album-ratio">
-                  <option>9:16 竖屏</option>
-                  <option>16:9 横屏</option>
-                  <option>1:1 方形</option>
+                  <option value="手机" selected>手机</option>
+                  <option value="电脑">电脑</option>
                   </select>
                 </label>
                 <label class="stack-field">
@@ -1674,63 +1830,38 @@ function renderGenerationPage() {
     kind: '电子相册',
     pages: '5 页',
     scene: '公司介绍',
-    ratio: '9:16 竖屏',
+    ratio: '手机',
     template: '默认相册模板',
   };
-  const ratioText = (() => {
-    const label = projectRatioLabel(state.selected);
-    if (label === '16:9') return '16:9 横屏';
-    if (label === '9:16') return '9:16 竖屏';
-    if (label === '1:1') return '1:1 方形';
-    if (label === '4:5') return '4:5 小红书';
-    return meta.ratio || label || '9:16 竖屏';
-  })();
+  const ratioText = displayDeviceLabelFromRatio(
+    projectRatioLabel(state.selected) || meta.ratio || '手机',
+  );
   const summaryRows = [
     ['场景', meta.scene || '公司介绍'],
     ['模板', meta.template || '默认相册模板'],
     ['页数', meta.pages || '5 页'],
-    ['比例', ratioText],
+    ['展示设备', ratioText],
   ];
   const hasPreview = hasProjectPreview(state.selected);
-  const needsRegenerate = !!state.selected && !hasPreview && !state.composing;
-  const progressText = state.composing
+  const showGenerating = shouldShowGenerationLoading();
+  const needsRegenerate = !!state.selected && !hasPreview && !showGenerating;
+  const progressText = showGenerating
     ? (state.generationProgressText || '整理内容 → 规划页面 → 生成文案 → 生成预览')
     : hasPreview
       ? '已生成，可预览和调整'
       : '尚未生成预览，请重新生成';
-  const footerText = state.composing
+  const footerText = showGenerating
     ? `${meta.title || '电子相册'} · 正在生成`
     : hasPreview
       ? `${meta.title || '电子相册'} · 已生成，可预览和调整`
       : `${meta.title || '电子相册'} · 需要重新生成`;
   const canExportHtml = !!state.selected?.lastPreviewHtmlPath;
   const canExportMp4 = !!state.selected && hasPreview && !state.exporting;
-  const previewEmptyHtml = needsRegenerate ? `
-            <div class="generation-loading generation-recover">
-              <h2>这个项目还没有生成成功</h2>
-              <p>可能是在生成过程中刷新、关闭页面或重启服务，导致预览 HTML 没有写入。</p>
-              <span>可以点击“重新生成”，系统会沿用当前页数、受众、场景、比例和风格重新生成相册。</span>
-              <div class="generation-tip">
-                <b>建议操作</b>
-                <span>直接点右上角“重新生成”；如果想保留原需求，也可以在右侧输入补充要求后发送。</span>
-              </div>
-              <button type="button" class="generation-btn primary" id="btn-recover-regenerate">重新生成</button>
-            </div>` : hasPreview ? '' : `
-            <div class="generation-loading">
-              <div class="generation-spinner"></div>
-              <h2>正在为你生成「${esc(meta.title || '电子相册')}」</h2>
-              <p>${esc(meta.pages || '5 页')} · 完成后可调整内容并导出 HTML 或 MP4</p>
-              <span>实时进度请查看右侧 AI助手</span>
-              <div class="generation-skeletons" aria-hidden="true">
-                <div class="generation-skeleton-card"></div>
-                <div class="generation-skeleton-card active"></div>
-                <div class="generation-skeleton-card"></div>
-              </div>
-              <div class="generation-tip">
-                <b>宣传相册生成中</b>
-                <span>AI助手会根据你选择的受众、场景和风格自动组织页面结构。</span>
-              </div>
-            </div>`;
+  const previewEmptyHtml = needsRegenerate
+    ? generationRecoverEmptyHtml()
+    : hasPreview
+      ? ''
+      : generationLoadingEmptyHtml(meta);
   return `
     <main class="generation-page">
       <header class="generation-topbar">
@@ -1752,8 +1883,8 @@ function renderGenerationPage() {
           <button type="button" class="generation-btn" id="btn-generation-regenerate">重新生成</button>
           <div class="generation-export-actions">
             <button type="button" class="generation-btn secondary" id="btn-reload" title="重新加载中间预览与左侧页缩略图">↻ 刷新预览</button>
-            <button type="button" class="generation-btn primary" id="btn-generation-export-html" title="导出 HTML 网页，便于分享浏览"${canExportHtml ? '' : ' disabled'}>导出电子相册</button>
-            <button type="button" class="generation-btn primary" id="btn-generation-export-mp4" title="导出 MP4 短视频，便于投放"${canExportMp4 ? '' : ' disabled'}>${state.exporting ? '导出中...' : '导出视频'}</button>
+            <button type="button" class="generation-btn primary" id="btn-generation-export-html" title="导出 HTML 网页（图片内嵌，可离线打开）"${canExportHtml ? '' : ' disabled'}>导出电子相册</button>
+            <button type="button" class="generation-btn primary" id="btn-generation-export-mp4" title="导出 MP4：按页淡入淡出翻页，总时长约 12–18 秒"${canExportMp4 ? '' : ' disabled'}>${state.exporting ? '导出中...' : '导出视频'}</button>
           </div>
         </div>
       </header>
@@ -1767,10 +1898,6 @@ function renderGenerationPage() {
           <div class="preview-toolbar zoom-collapsed" id="preview-toolbar" aria-label="预览工具">
             <button type="button" class="preview-toolbar-drag" id="preview-toolbar-drag" title="拖动工具栏" aria-label="拖动工具栏">⠿</button>
             <button type="button" class="preview-edit-page-btn" id="btn-edit-album-page" hidden title="${t('text_pane.edit_page_title')}">${t('text_pane.edit_page')}</button>
-            <div class="preview-device-switch" id="preview-device-switch" role="group" aria-label="预览设备">
-              <button type="button" class="preview-device-btn${state.previewDevice === 'phone' ? ' active' : ''}" data-preview-device="phone" title="${escAttr(phonePreviewDeviceTitle())}">${esc(phonePreviewDeviceLabel())}</button>
-              <button type="button" class="preview-device-btn${state.previewDevice === 'desktop' ? ' active' : ''}" data-preview-device="desktop" title="PC 预览：保持导出比例，更大视口与桌面翻页">PC</button>
-            </div>
             <button type="button" class="preview-toolbar-chip" id="btn-preview-toolbar-toggle" title="展开/收起缩放" aria-expanded="false">缩放</button>
             <div class="preview-zoom-controls" id="preview-zoom-panel" aria-label="预览缩放">
               <button type="button" id="btn-preview-zoom-out" title="缩小预览">−</button>
@@ -1857,15 +1984,15 @@ function wireGenerationPage() {
   const ctaBtn = document.getElementById('btn-generation-cta');
   if (ctaBtn) ctaBtn.onclick = () => state.selected ? openGenerationAdjustModal('cta') : null;
   const regenerateBtn = document.getElementById('btn-generation-regenerate');
-  if (regenerateBtn) regenerateBtn.onclick = () => sendGenerationQuickAdjust('请基于当前需求重新生成一版电子相册，保留用户已选择的受众、场景、语气、比例、风格、素材使用方式和行动引导，但重新组织页面结构与表达。');
+  if (regenerateBtn) regenerateBtn.onclick = () => sendGenerationQuickAdjust('请基于当前需求重新生成一版电子相册，保留用户已选择的受众、场景、语气、展示设备、风格、素材使用方式和行动引导，但重新组织页面结构与表达。');
   const recoverRegenerateBtn = document.getElementById('btn-recover-regenerate');
-  if (recoverRegenerateBtn) recoverRegenerateBtn.onclick = () => sendGenerationQuickAdjust('请基于当前需求重新生成这本电子相册，保留用户已选择的页数、受众、场景、语气、比例、风格、素材使用方式和行动引导。');
+  if (recoverRegenerateBtn) recoverRegenerateBtn.onclick = () => sendGenerationQuickAdjust('请基于当前需求重新生成这本电子相册，保留用户已选择的页数、受众、场景、语气、展示设备、风格、素材使用方式和行动引导。');
   const editPageBtn = document.getElementById('btn-edit-album-page');
   if (editPageBtn) editPageBtn.onclick = () => startAlbumPageTextEdit();
   wirePreviewZoomControls();
   wirePreviewToolbarDrag();
-  // 默认：横屏项目先看 PC 版面，竖屏先看手机版面，完整 fit 展示
-  state.previewDevice = projectAspectRatioValue(state.selected) >= 1 ? 'desktop' : 'phone';
+  // Preview shell follows create-page display device (手机→竖屏 / 电脑→横屏)
+  syncPreviewDeviceFromProject(state.selected);
   // 右坞默认展开但宽度已收窄；若用户上次点过「收起」则记住折叠偏好
   document.body.classList.remove('assistant-collapsed', 'textfields-collapsed');
   state.generationSideTab = state.generationSideTab === 'edit' ? 'edit' : 'assistant';
@@ -2166,7 +2293,7 @@ function buildGenerationAdjustPrompt(type) {
       button ? `按钮文案：${button}` : '',
       link ? `按钮链接：${link}` : '',
       hasAttachments ? '如果本次上传了图片，请把上传图片作为新增页的主图或背景图使用。' : '',
-      '保持当前相册的比例、整体视觉风格和交互方式不变，只在必要处调整页码、导航点和页面计数。',
+      '保持当前相册的展示设备、整体视觉风格和交互方式不变，只在必要处调整页码、导航点和页面计数。',
     ].filter(Boolean).join('\n');
   }
   if (type === 'image') {
@@ -2245,9 +2372,6 @@ function wirePreviewZoomControls() {
   if (inBtn) inBtn.onclick = () => setPreviewZoom(getPreviewZoom() + 0.1);
   if (fitBtn) fitBtn.onclick = () => setPreviewZoom(1);
   if (range) range.oninput = (e) => setPreviewZoom(Number(e.target.value) / 100);
-  document.querySelectorAll('[data-preview-device]').forEach((btn) => {
-    btn.onclick = () => setPreviewDevice(btn.dataset.previewDevice);
-  });
   if (toggle && toolbar) {
     toggle.onclick = () => {
       toolbar.classList.toggle('zoom-collapsed');
@@ -2379,7 +2503,7 @@ function closeGenerationPagesModal() {
 }
 
 async function sendGenerationPageAdjust(pageLabel) {
-  await sendGenerationQuickAdjust(`请把这本电子相册调整为 ${pageLabel}。请重新规划页面结构，让每一页信息清晰、节奏适合企业宣传，并保留当前受众、场景、语气、比例、风格、素材使用方式和行动引导。`);
+  await sendGenerationQuickAdjust(`请把这本电子相册调整为 ${pageLabel}。请重新规划页面结构，让每一页信息清晰、节奏适合企业宣传，并保留当前受众、场景、语气、展示设备、风格、素材使用方式和行动引导。`);
 }
 
 function updateGenerationControls() {
@@ -2395,16 +2519,50 @@ function updateGenerationControls() {
   if (mp4Btn) {
     const canExport = !!(state.selected && hasProjectPreview(state.selected));
     mp4Btn.disabled = !canExport || !!state.exporting;
+    // Button stays short — progress lives only on the top bar.
     mp4Btn.textContent = state.exporting ? '导出中...' : '导出视频';
+    mp4Btn.title = state.exporting
+      ? '正在导出视频'
+      : '导出 MP4：按页淡入淡出翻页，总时长约 12–18 秒';
+  }
+  // Top-bar status only (not the AI「执行进度」pane).
+  const topStatus = document.getElementById('footer-status');
+  if (topStatus && document.querySelector('.generation-page')) {
+    if (state.exporting && state.exportProgress) {
+      const line = formatExportProgressLabel(
+        state.exportProgress.pct,
+        state.exportProgress.stage,
+      );
+      topStatus.textContent = line;
+      topStatus.title = line;
+    } else if (state.exporting) {
+      topStatus.textContent = '正在导出视频…';
+      topStatus.title = '正在导出视频…';
+    } else if (state.selected) {
+      const meta = projectGenerationMeta(state.selected) || {};
+      const hasPreview = hasProjectPreview(state.selected);
+      const showGenerating = shouldShowGenerationLoading();
+      const line = showGenerating
+        ? `${meta.title || state.selected.name || '电子相册'} · 正在生成`
+        : hasPreview
+          ? `${meta.title || state.selected.name || '电子相册'} · 已生成，可预览和调整`
+          : `${meta.title || state.selected.name || '电子相册'} · 需要重新生成`;
+      topStatus.textContent = line;
+      topStatus.title = line;
+    }
   }
   const progress = document.querySelector('.generation-progress b');
   if (progress) {
-    progress.textContent = state.composing
-      ? (state.generationProgressText || '整理内容 → 规划页面 → 生成文案 → 生成预览')
-      : hasProjectPreview(state.selected)
-        ? '已生成，可预览和调整'
-        : '尚未生成预览，请重新生成';
+    // Keep assistant「执行进度」for generation — do not hijack it for export %.
+    if (shouldShowGenerationLoading()) {
+      progress.textContent = state.generationProgressText || '整理内容 → 规划页面 → 生成文案 → 生成预览';
+    } else if (hasProjectPreview(state.selected)) {
+      progress.textContent = '已生成，可预览和调整';
+    } else {
+      progress.textContent = '尚未生成预览，请重新生成';
+    }
   }
+  syncGenerationEmptyPreview();
 }
 
 const GENERATION_PROGRESS_STEPS = [
@@ -2507,6 +2665,9 @@ function normalizeRatioLabel(value) {
   const raw = String(value || '').trim();
   const ratio = raw.match(/(\d+)\s*:\s*(\d+)/);
   if (ratio) return `${ratio[1]}:${ratio[2]}`;
+  // Display-device labels from create page (手机 / 电脑)
+  if (/电脑|desktop|\bpc\b/i.test(raw)) return '16:9';
+  if (/^手机$|mobile|phone/i.test(raw)) return '9:16';
   if (/方形|square/i.test(raw)) return '1:1';
   if (/竖屏|portrait/i.test(raw)) return '9:16';
   if (/横屏|landscape/i.test(raw)) return '16:9';
@@ -2558,14 +2719,14 @@ function projectPreviewResolution(project) {
 }
 
 function preferencesWithGenerationMeta(generationMeta) {
-  const ratio = generationMeta?.ratio || '9:16 竖屏';
+  const ratio = generationMeta?.ratio || '手机';
   return {
     generationMeta,
     resolution: resolutionForRatioLabel(ratio),
   };
 }
 
-/** Studio device preview sizes derived from the project's chosen aspect. */
+/** Studio device preview shell follows the project's chosen display device (aspect). */
 function shouldUsePreviewDeviceModes(project = state.selected) {
   if (!project) return false;
   if (Array.isArray(project.frames) && project.frames.length > 0) return false;
@@ -2581,18 +2742,20 @@ function projectAspectRatioValue(project = state.selected) {
   return w / Math.max(1, h);
 }
 
+/** Lock preview shell to the project's display device — no manual PC/phone toggle. */
+function syncPreviewDeviceFromProject(project = state.selected) {
+  state.previewDevice = projectAspectRatioValue(project) >= 1 ? 'desktop' : 'phone';
+}
+
 function phonePreviewDeviceLabel(project = state.selected) {
-  const ratio = projectAspectRatioValue(project);
-  if (Math.abs(ratio - 1) < 0.06) return '手机方屏';
-  return ratio >= 1 ? '手机横屏' : '手机竖屏';
+  return displayDeviceLabelFromRatio(projectRatioLabel(project) || projectGenerationMeta(project).ratio);
 }
 
 function phonePreviewDeviceTitle(project = state.selected) {
-  const ratio = projectAspectRatioValue(project);
-  if (Math.abs(ratio - 1) < 0.06) return '手机方屏预览：保持 1:1 导出比例，更小视口';
-  return ratio >= 1
-    ? '手机横屏预览：保持 16:9 导出比例，模拟横屏手机观看'
-    : '手机竖屏预览：保持 9:16 导出比例，模拟竖屏手机观看';
+  const device = phonePreviewDeviceLabel(project);
+  return device === '电脑'
+    ? '电脑预览：16:9 横屏'
+    : '手机预览：9:16 竖屏';
 }
 
 /**
@@ -2608,7 +2771,15 @@ function projectPreviewViewport(project = state.selected) {
   const portrait = ratio < 0.92;
   const square = Math.abs(ratio - 1) < 0.06;
   if (state.previewDevice === 'desktop') {
-    const width = portrait ? 900 : (square ? 960 : 1280);
+    // Prefer full export canvas for landscape PC (1920×1080) so layouts match
+    // generation; only downscale when the stage is too small via --preview-scale.
+    if (portrait) {
+      const width = 900;
+      return { width, height: Math.max(1, Math.round(width / ratio)) };
+    }
+    if (square) return { width: 1080, height: 1080 };
+    const base = projectPreviewResolution(project);
+    const width = Math.max(1280, Number(base.width) || 1920);
     return { width, height: Math.max(1, Math.round(width / ratio)) };
   }
   // Phone: preserve aspect. Landscape → landscape handset (not tall portrait).
@@ -2658,11 +2829,32 @@ function applyStudioDevicePreview(iframe) {
     (doc.head || doc.documentElement).appendChild(style);
   }
   // Landscape phone must NOT force single-column crush; content already matches aspect.
+  // Phone preview: hide classic OS scrollbar track (white strip on dark albums).
+  // Scroll/snap still works; real handsets use overlay scrollbars that don't reserve a gutter.
   style.textContent = phone ? `
 html.hv-studio-phone {
   writing-mode: horizontal-tb !important;
   word-break: keep-all;
   overflow-wrap: break-word;
+}
+html.hv-studio-phone,
+html.hv-studio-phone body,
+html.hv-studio-phone #album,
+html.hv-studio-phone .album,
+html.hv-studio-phone [data-album],
+html.hv-studio-phone .scroll-container,
+html.hv-studio-phone .story-container,
+html.hv-studio-phone .album-container,
+html.hv-studio-phone .pages {
+  scrollbar-width: none !important;
+  -ms-overflow-style: none !important;
+}
+html.hv-studio-phone::-webkit-scrollbar,
+html.hv-studio-phone *::-webkit-scrollbar {
+  width: 0 !important;
+  height: 0 !important;
+  display: none !important;
+  background: transparent !important;
 }
 html.hv-studio-phone body,
 html.hv-studio-phone h1,
@@ -2731,25 +2923,12 @@ html.hv-studio-desktop #nextPage {
 
 function setPreviewDevice(device, { render = true } = {}) {
   state.previewDevice = device === 'desktop' ? 'desktop' : 'phone';
-  document.querySelectorAll('[data-preview-device]').forEach((btn) => {
-    btn.classList.toggle('active', btn.dataset.previewDevice === state.previewDevice);
-  });
-  // Device shell only wraps the centre iframe — left-rail thumbs stay on export
-  // canvas size and must not remount (that caused a full-rail flash).
   if (render) renderPreview({ refreshFramesStrip: false });
 }
 
+/** Preview shell always follows project display device; toggle UI removed. */
 function syncPreviewDeviceSwitchUi() {
-  const switchEl = document.getElementById('preview-device-switch');
-  if (!switchEl) return;
-  switchEl.hidden = !shouldUsePreviewDeviceModes();
-  document.querySelectorAll('[data-preview-device]').forEach((btn) => {
-    btn.classList.toggle('active', btn.dataset.previewDevice === state.previewDevice);
-    if (btn.dataset.previewDevice === 'phone') {
-      btn.textContent = phonePreviewDeviceLabel();
-      btn.title = phonePreviewDeviceTitle();
-    }
-  });
+  syncPreviewDeviceFromProject();
 }
 
 function markPreviewRevision() {
@@ -4327,7 +4506,7 @@ function parseCreatePromptSummary(content) {
     pickLine('受众'),
     pickLine('场景'),
     pickLine('语气'),
-    pickLine('(?:比例|画面尺寸|尺寸)'),
+    pickLine('(?:展示设备|比例|画面尺寸|尺寸)'),
     pickLine('风格'),
     pickLine('素材使用方式'),
     pickLine('行动引导'),
@@ -4792,6 +4971,8 @@ function renderPreview({ refreshFramesStrip = true } = {}) {
     : (p.templateId || '');
   // Prefer project resolution, but on album generation page use phone/PC
   // device shells with real device CSS viewports (so layouts can diverge).
+  // Shell always follows create-page display device — no manual toggle.
+  syncPreviewDeviceFromProject(p);
   const res = projectPreviewViewport(p);
   const vw = res.width || 1920, vh = res.height || 1080;
   const isGenShell = stage.classList.contains('generation-preview-shell');
@@ -4806,7 +4987,17 @@ function renderPreview({ refreshFramesStrip = true } = {}) {
     if (useDeviceShell && shell) {
       const fittedShell = fitPreviewIntoStage(stage, shell.width, shell.height, getPreviewZoom());
       shellStyle = `width:${fittedShell.displayW}px;height:${fittedShell.displayH}px`;
-      frameStyle += ';width:auto;height:auto;max-width:100%;max-height:100%;--preview-scale:1';
+      // Estimate usable screen inside chrome so --preview-scale is correct on first paint
+      // (scale:1 left the 1280×720 iframe unscaled and cropped the right half).
+      const insetX = phoneMode ? 24 : 2;
+      const insetY = phoneMode ? 42 : 36; // notch/home or desktop titlebar
+      const screenW = Math.max(48, fittedShell.displayW - insetX);
+      const screenH = Math.max(48, fittedShell.displayH - insetY);
+      const fit = Math.min(screenW / vw, screenH / vh);
+      const displayW = Math.max(1, Math.floor(vw * fit));
+      const displayH = Math.max(1, Math.floor(vh * fit));
+      const scale = displayW / vw;
+      frameStyle += `;width:${displayW}px;height:${displayH}px;max-width:100%;max-height:100%;--preview-scale:${scale.toFixed(4)}`;
     } else {
       const fitted = fitPreviewIntoStage(stage, vw, vh, getPreviewZoom());
       frameStyle += `;width:${fitted.displayW}px;height:${fitted.displayH}px;max-width:none;max-height:none;--preview-scale:${fitted.scale.toFixed(4)}`;
@@ -4831,17 +5022,15 @@ function renderPreview({ refreshFramesStrip = true } = {}) {
       ${stampHtml}
     </div>`;
   const shellHtml = (tag) => {
-    const landscapePhone = phoneMode && projectAspectRatioValue(p) >= 1;
-    const ratioLabel = projectRatioLabel(p) || '导出';
     if (phoneMode) {
       return `
     <div class="device-preview-wrap">
-      <div class="device-shell phone${landscapePhone ? ' landscape' : ''}" style="${shellStyle}">
+      <div class="device-shell phone" style="${shellStyle}">
         <div class="device-notch" aria-hidden="true"></div>
         <div class="device-screen">${frameHtml(tag)}</div>
         <div class="device-home" aria-hidden="true"></div>
       </div>
-      <div class="device-caption">手机 · 保持 ${esc(ratioLabel)} · ${landscapePhone ? '横屏机框' : '竖屏机框'}</div>
+      <div class="device-caption">手机 · 9:16 竖屏</div>
     </div>`;
     }
     return `
@@ -4849,11 +5038,11 @@ function renderPreview({ refreshFramesStrip = true } = {}) {
       <div class="device-shell desktop" style="${shellStyle}">
         <div class="device-titlebar" aria-hidden="true">
           <span class="device-dots"><i></i><i></i><i></i></span>
-          <span class="device-url">电子相册 · PC 预览</span>
+          <span class="device-url">电子相册 · 电脑预览</span>
         </div>
         <div class="device-screen">${frameHtml(tag)}</div>
       </div>
-      <div class="device-caption">PC · 保持 ${esc(ratioLabel)} · 宽屏浏览</div>
+      <div class="device-caption">电脑 · 16:9 横屏</div>
     </div>`;
   };
 
@@ -5195,7 +5384,7 @@ async function startAlbumPageTextEdit(pageIndex) {
   if (typeof pageIndex === 'number' && !Number.isNaN(pageIndex)) {
     state.activeAlbumPage = Math.max(0, Math.min((state.albumPageCount || 1) - 1, pageIndex));
     updateAlbumPageTabActive();
-    scrollPreviewToAlbumPage(state.activeAlbumPage);
+    scrollPreviewToAlbumPage(state.activeAlbumPage, 'auto');
   }
   await flushTextEditsIfNeeded();
   state.albumPageTextEditActive = true;
@@ -5218,7 +5407,8 @@ async function selectAlbumPage(pageIndex, { startEdit = false } = {}) {
   if (pageChanged) await flushTextEditsIfNeeded();
   state.activeAlbumPage = safeIndex;
   updateAlbumPageTabActive();
-  scrollPreviewToAlbumPage(safeIndex);
+  // Rail navigation must be instant + reliable (smooth scrollIntoView often no-ops).
+  scrollPreviewToAlbumPage(safeIndex, 'auto');
   if (startEdit) {
     state.albumPageTextEditActive = true;
     if (document.querySelector('.generation-side-dock')) {
@@ -5258,35 +5448,72 @@ function syncAlbumPagesFromPreview(iframe, { refreshStrip = true } = {}) {
   const strip = document.getElementById('frames-strip');
   const stripEmpty = !strip?.classList.contains('has-frames')
     || !strip.querySelector('button.album-page-tab');
-  // Phone/PC only remounts the centre preview: refreshStrip=false keeps thumbs still.
-  // Full content refreshes keep refreshStrip=true so thumbs pick up new HTML.
-  if (stripEmpty || countChanged || summariesChanged) {
+  // Remount only when structure is missing/changed. Label-only updates patch
+  // tab titles — never recreate thumb iframes (that flashes on every text save).
+  // Full HTML remounts already call renderFramesStrip() from renderPreview.
+  if (stripEmpty || countChanged) {
     renderFramesStrip();
-  } else if (refreshStrip && nextCount > 0) {
-    renderFramesStrip();
+  } else if (summariesChanged) {
+    updateAlbumPageTabLabels(nextSummaries);
+    updateAlbumPageTabActive();
   } else {
     updateAlbumPageTabActive();
   }
+  // refreshStrip reserved for callers that used to force a remount; ignored now
+  // so device-shell switches (refreshStrip=false) and text edits stay quiet.
+  void refreshStrip;
   updateAlbumPageEditControls();
   scrollPreviewToAlbumPage(state.activeAlbumPage, 'auto');
   wireAlbumPageScrollSync(iframe);
 }
 
+/** Update left-rail page titles without remounting thumb iframes. */
+function updateAlbumPageTabLabels(summaries = state.albumPageSummaries) {
+  const list = Array.isArray(summaries) ? summaries : [];
+  document.querySelectorAll('button.album-page-tab').forEach((btn) => {
+    const index = Number(btn.dataset.albumPage) || 0;
+    const topic = String(list[index] || '').trim();
+    btn.title = topic ? `第 ${index + 1} 页 · ${topic}` : `第 ${index + 1} 页`;
+    const label = btn.querySelector('.frame-tab-label');
+    if (!label) return;
+    let topicEl = label.querySelector('.page-topic');
+    if (topic) {
+      if (!topicEl) {
+        topicEl = document.createElement('span');
+        topicEl.className = 'page-topic';
+        label.appendChild(topicEl);
+      }
+      topicEl.textContent = topic;
+    } else if (topicEl) {
+      topicEl.remove();
+    }
+  });
+}
+
 function wireAlbumPageScrollSync(iframe) {
   try {
     const doc = iframe?.contentDocument;
-    const album = doc?.getElementById('album') || doc?.scrollingElement;
+    if (!doc) return;
+    const album = doc.getElementById('album')
+      || doc.querySelector('.album, [data-album], .scroll-container, .story-container, .album-container, .pages')
+      || doc.scrollingElement;
     const pages = getAlbumPagesFromIframe(iframe);
     if (!album || pages.length === 0 || album.dataset.hvStudioPageSync === '1') return;
     album.dataset.hvStudioPageSync = '1';
     let ticking = false;
     const update = () => {
       ticking = false;
+      // Hard-cut focus mode: rail owns the page — don't fight it via scroll sync.
+      if (doc.documentElement.classList.contains('hv-album-preview-focus')) return;
       const albumRect = album.getBoundingClientRect();
       let bestIndex = 0;
       let bestDistance = Infinity;
       pages.forEach((page, index) => {
-        const distance = Math.abs(page.getBoundingClientRect().top - albumRect.top);
+        const rect = page.getBoundingClientRect();
+        const distance = Math.min(
+          Math.abs(rect.top - albumRect.top),
+          Math.abs(rect.left - albumRect.left),
+        );
         if (distance < bestDistance) {
           bestDistance = distance;
           bestIndex = index;
@@ -5309,14 +5536,183 @@ function wireAlbumPageScrollSync(iframe) {
   } catch {}
 }
 
-function scrollPreviewToAlbumPage(index, behavior = 'smooth') {
+/**
+ * Show album page N in the centre preview.
+ * Prefer scrolling the album scroller; fall back to hard-cut (display:none)
+ * because many LLM albums break scrollIntoView (overflow/snap/transform).
+ * opts.mode === 'browse' keeps scroll/wheel working (no hard-cut lock).
+ */
+function scrollPreviewToAlbumPage(index, behavior = 'smooth', opts = {}) {
   const iframe = document.getElementById('preview-iframe');
-  const pages = getAlbumPagesFromIframe(iframe);
+  let doc;
+  try { doc = iframe?.contentDocument; } catch { return; }
+  if (!doc?.documentElement) return;
+  const pages = findAlbumPageElements(doc);
   if (!pages.length) return;
   const safeIndex = Math.max(0, Math.min(pages.length - 1, Number(index) || 0));
   state.activeAlbumPage = safeIndex;
   updateAlbumPageTabActive();
-  pages[safeIndex].scrollIntoView({ behavior, block: 'start' });
+
+  const browse = opts.mode === 'browse';
+  if (browse) clearAlbumPreviewPageFocus(doc);
+
+  const page = pages[safeIndex];
+  const scroller = doc.getElementById('album')
+    || doc.querySelector('.album, [data-album], .scroll-container, .story-container, .album-container, .pages')
+    || doc.scrollingElement
+    || doc.documentElement;
+
+  let scrolled = false;
+  try {
+    const pageRect = page.getBoundingClientRect();
+    const hostRect = scroller.getBoundingClientRect?.() || pageRect;
+    const style = doc.defaultView?.getComputedStyle?.(scroller);
+    const snap = String(style?.scrollSnapType || '');
+    const horizontal = /(?:^|[,\s])x(?:\s|$)|inline/i.test(snap)
+      || (scroller.scrollWidth > scroller.clientWidth * 1.25
+        && scroller.scrollHeight <= scroller.clientHeight * 1.15);
+    if (horizontal) {
+      const nextLeft = (scroller.scrollLeft || 0) + (pageRect.left - hostRect.left);
+      if (typeof scroller.scrollTo === 'function') {
+        scroller.scrollTo({ left: Math.max(0, nextLeft), top: 0, behavior });
+      } else {
+        scroller.scrollLeft = Math.max(0, nextLeft);
+      }
+      scrolled = true;
+    } else {
+      const nextTop = (scroller.scrollTop || 0) + (pageRect.top - hostRect.top);
+      if (typeof scroller.scrollTo === 'function') {
+        scroller.scrollTo({ top: Math.max(0, nextTop), left: 0, behavior });
+      } else {
+        scroller.scrollTop = Math.max(0, nextTop);
+      }
+      scrolled = true;
+    }
+  } catch {
+    try {
+      page.scrollIntoView({ behavior, block: 'start', inline: 'nearest' });
+      scrolled = true;
+    } catch { /* ignore */ }
+  }
+
+  if (browse) {
+    rewireAlbumPageScrollSync(iframe);
+    return;
+  }
+
+  const verifyAndMaybeHardCut = () => {
+    const host = scroller.getBoundingClientRect?.();
+    const rect = page.getBoundingClientRect();
+    if (!host) {
+      focusAlbumPreviewPage(doc, safeIndex);
+      return;
+    }
+    const aligned = Math.abs(rect.top - host.top) < 48 && Math.abs(rect.left - host.left) < 48;
+    if (!aligned || !scrolled) focusAlbumPreviewPage(doc, safeIndex);
+  };
+  requestAnimationFrame(() => requestAnimationFrame(verifyAndMaybeHardCut));
+  // Instant path for auto/rail clicks — don't wait for smooth scroll failures.
+  if (behavior === 'auto') focusAlbumPreviewPage(doc, safeIndex);
+}
+
+/** Reset scroll-sync after DOM page order changes (reorder / duplicate / delete). */
+function rewireAlbumPageScrollSync(iframe) {
+  const frame = iframe || document.getElementById('preview-iframe');
+  try {
+    const doc = frame?.contentDocument;
+    if (!doc) return;
+    const album = doc.getElementById('album')
+      || doc.querySelector('.album, [data-album], .scroll-container, .story-container, .album-container, .pages')
+      || doc.scrollingElement;
+    if (album?.dataset) delete album.dataset.hvStudioPageSync;
+  } catch { /* ignore */ }
+  wireAlbumPageScrollSync(frame);
+}
+
+/** Hard-cut centre preview to one album page (reliable when scroll snap fails). */
+function focusAlbumPreviewPage(doc, pageIndex) {
+  if (!doc?.documentElement) return;
+  const pages = findAlbumPageElements(doc);
+  if (!pages.length) return;
+  const safe = Math.max(0, Math.min(pages.length - 1, Number(pageIndex) || 0));
+  pages.forEach((page, i) => {
+    page.setAttribute('data-hv-preview-page', String(i));
+    page.classList.toggle('hv-preview-page-active', i === safe);
+  });
+
+  let style = doc.getElementById('hv-studio-preview-page-focus');
+  if (!style) {
+    style = doc.createElement('style');
+    style.id = 'hv-studio-preview-page-focus';
+    (doc.head || doc.documentElement).appendChild(style);
+  }
+  style.textContent = `
+html.hv-album-preview-focus, html.hv-album-preview-focus body {
+  margin: 0 !important;
+  overflow: hidden !important;
+  height: 100% !important;
+  min-height: 100% !important;
+}
+html.hv-album-preview-focus #album,
+html.hv-album-preview-focus .album,
+html.hv-album-preview-focus [data-album],
+html.hv-album-preview-focus .scroll-container,
+html.hv-album-preview-focus .story-container,
+html.hv-album-preview-focus .album-container,
+html.hv-album-preview-focus .pages {
+  overflow: hidden !important;
+  height: 100% !important;
+  min-height: 100% !important;
+  max-height: 100% !important;
+  scroll-snap-type: none !important;
+  transform: none !important;
+}
+html.hv-album-preview-focus [data-hv-preview-page] {
+  display: none !important;
+}
+html.hv-album-preview-focus [data-hv-preview-page].hv-preview-page-active {
+  display: block !important;
+  visibility: visible !important;
+  opacity: 1 !important;
+  position: relative !important;
+  inset: auto !important;
+  transform: none !important;
+  width: 100% !important;
+  min-height: 100vh !important;
+  height: 100vh !important;
+  max-height: 100vh !important;
+  overflow: hidden !important;
+}
+html.hv-album-preview-focus [data-hv-preview-page].hv-preview-page-active,
+html.hv-album-preview-focus [data-hv-preview-page].hv-preview-page-active * {
+  animation: none !important;
+  transition: none !important;
+  opacity: 1 !important;
+  visibility: visible !important;
+}
+`;
+  doc.documentElement.classList.add('hv-album-preview-focus');
+  doc.body?.classList.add('hv-album-preview-focus');
+
+  try {
+    const scroller = doc.getElementById('album')
+      || doc.querySelector('.album, [data-album], .scroll-container, .story-container')
+      || doc.scrollingElement;
+    if (scroller) scroller.scrollTop = 0;
+    doc.documentElement.scrollTop = 0;
+    if (doc.body) doc.body.scrollTop = 0;
+  } catch { /* ignore */ }
+}
+
+function clearAlbumPreviewPageFocus(doc) {
+  if (!doc) return;
+  doc.getElementById('hv-studio-preview-page-focus')?.remove();
+  doc.documentElement.classList.remove('hv-album-preview-focus');
+  doc.body?.classList.remove('hv-album-preview-focus');
+  doc.querySelectorAll('[data-hv-preview-page]').forEach((el) => {
+    el.removeAttribute('data-hv-preview-page');
+    el.classList.remove('hv-preview-page-active');
+  });
 }
 
 /** Make a left-rail thumb show only page N (full album HTML scrolls unreliably). */
@@ -5441,35 +5837,70 @@ function fitAlbumThumbIframe(iframe) {
   const res = projectPreviewResolution(p);
   const nativeW = Number(res.width) || 1920;
   const nativeH = Number(res.height) || 1080;
-  const boxW = Math.max(1, Math.floor(thumb.clientWidth || thumb.getBoundingClientRect?.().width || 0));
-  if (!boxW) return;
+  // Prefer the stable width from layout; fall back to rail card width (~96).
+  const boxW = Math.max(
+    1,
+    Math.floor(thumb.clientWidth || thumb.getBoundingClientRect?.().width || 96),
+  );
   const scale = boxW / Math.max(1, nativeW);
   const boxH = Math.max(54, Math.ceil(nativeH * scale));
-  thumb.style.height = `${boxH}px`;
+  // Set height only once — rewriting it across delayed prepare() ticks is what
+  // makes the left rail "jitter" on open.
+  const painted = Number.parseFloat(thumb.style.height);
+  if (!(painted > 0)) {
+    thumb.style.height = `${boxH}px`;
+  }
   thumb.style.maxHeight = 'none';
   iframe.style.setProperty('--thumb-native-w', `${nativeW}px`);
   iframe.style.setProperty('--thumb-native-h', `${nativeH}px`);
-  iframe.style.setProperty('--thumb-scale', String(scale));
+  iframe.style.setProperty('--thumb-scale', String(
+    Number.parseFloat(iframe.style.getPropertyValue('--thumb-scale')) || scale,
+  ));
   iframe.style.setProperty('--thumb-offset-y', '0px');
 }
 
+/**
+ * Prepare a rail thumbnail once. Server already injects thumb-isolation CSS for
+ * ?thumb=1&albumPage=N; we only fit scale + ensure isolate if bootstrap missed.
+ * Multiple delayed retries used to rewrite height/CSS and caused visible jitter.
+ */
 function prepareAlbumThumbIframe(iframe, pageIndex) {
-  if (!iframe) return;
+  if (!iframe || iframe.dataset.hvThumbReady === '1') return;
   const run = () => {
     fitAlbumThumbIframe(iframe);
-    isolateAlbumThumbPage(iframe, pageIndex);
+    let isolated = false;
+    try {
+      const doc = iframe.contentDocument;
+      if (doc?.documentElement) {
+        // Idempotent — needed when inject bootstrap ran before pages existed.
+        isolated = isolateAlbumThumbPage(iframe, pageIndex);
+      }
+    } catch { /* ignore */ }
+    if (isolated || iframe.dataset.hvThumbTried === '1') {
+      iframe.dataset.hvThumbReady = '1';
+      iframe.classList.add('is-ready');
+      return true;
+    }
+    iframe.dataset.hvThumbTried = '1';
+    return false;
   };
-  run();
+  if (run()) return;
+  // Single short retry for late-parsed album markup — not a 1s pulse train.
   requestAnimationFrame(() => {
-    run();
-    setTimeout(run, 60);
-    setTimeout(run, 200);
-    setTimeout(run, 500);
-    setTimeout(run, 1000);
+    setTimeout(() => {
+      if (iframe.dataset.hvThumbReady === '1') return;
+      run();
+      iframe.dataset.hvThumbReady = '1';
+      iframe.classList.add('is-ready');
+    }, 80);
   });
 }
 
 function scrollAlbumThumbToPage(iframe, index) {
+  if (!iframe) return;
+  delete iframe.dataset.hvThumbReady;
+  delete iframe.dataset.hvThumbTried;
+  iframe.classList.remove('is-ready');
   prepareAlbumThumbIframe(iframe, index);
 }
 
@@ -5479,6 +5910,7 @@ function updateAlbumPageTabActive() {
     const isActive = pageIndex === state.activeAlbumPage;
     btn.classList.toggle('active', isActive);
     btn.classList.toggle('editing', !!state.albumPageTextEditActive && isActive);
+    btn.closest('.album-page-item')?.classList.toggle('active', isActive);
   });
   updateAlbumPageEditControls();
 }
@@ -5536,17 +5968,22 @@ function layoutGenerationPreview(frameOrShell) {
     shell.style.width = `${fitted.displayW}px`;
     shell.style.height = `${fitted.displayH}px`;
     const screen = shell.querySelector('.device-screen');
-    const sw = Math.max(1, screen?.clientWidth || fitted.displayW);
-    const sh = Math.max(1, screen?.clientHeight || fitted.displayH);
+    // Measure after shell size is applied; fall back to chrome-aware estimate.
+    const phone = state.previewDevice === 'phone';
+    const estInsetX = phone ? 24 : 2;
+    const estInsetY = phone ? 42 : 36;
+    const sw = Math.max(1, screen?.clientWidth || (fitted.displayW - estInsetX));
+    const sh = Math.max(1, screen?.clientHeight || (fitted.displayH - estInsetY));
     const fit = Math.min(sw / vw, sh / vh);
     const displayW = Math.max(1, Math.floor(vw * fit));
     const displayH = Math.max(1, Math.floor(vh * fit));
+    const scale = displayW / vw;
     frame.style.width = `${displayW}px`;
     frame.style.height = `${displayH}px`;
     frame.style.maxWidth = '100%';
     frame.style.maxHeight = '100%';
     frame.style.aspectRatio = `${vw} / ${vh}`;
-    frame.style.setProperty('--preview-scale', (displayW / vw).toFixed(4));
+    frame.style.setProperty('--preview-scale', scale.toFixed(4));
     frame.style.setProperty('--preview-user-zoom', String(zoom));
   } else {
     const { displayW, displayH, scale } = fitPreviewIntoStage(stage, vw, vh, zoom);
@@ -5562,6 +5999,9 @@ function layoutGenerationPreview(frameOrShell) {
   if (media) {
     media.style.width = `${vw}px`;
     media.style.height = `${vh}px`;
+    const scale = Number.parseFloat(frame.style.getPropertyValue('--preview-scale')) || (frame.clientWidth / vw) || 1;
+    media.style.transform = `scale(${scale})`;
+    media.style.transformOrigin = 'top left';
   }
   requestAnimationFrame(() => {
     const maxScrollX = Math.max(0, stage.scrollWidth - stage.clientWidth);
@@ -5615,6 +6055,47 @@ function reloadPreview() {
   if (!state.selected) return;
   markPreviewRevision();
   renderPreview();
+}
+
+async function refreshAfterPreviewReady({ frameCount = 0, focusedFrame = '' } = {}) {
+  if (!state.selected) return;
+  const projectId = state.selected.id;
+  const keepAlbumPage = Math.max(0, Number(state.activeAlbumPage) || 0);
+  const keepAlbumEditing = !!state.albumPageTextEditActive;
+
+  if (frameCount > 0) state.activeFrameId = null;
+  if (focusedFrame) state.activeFrameId = focusedFrame;
+  const pr = await API.getProject(projectId);
+  state.selected = pr.project;
+
+  if (frameCount > 0) {
+    try {
+      const cg = await API.contentGraph(state.selected.id);
+      ingestContentGraphNodes(cg?.graph?.nodes);
+    } catch { /* no graph - single-frame/album, fine */ }
+    await enrichFrameLabelsFromHtml(state.selected.id);
+  }
+
+  markPreviewRevision();
+  renderPreview();
+  await refreshTextFields();
+
+  if (isElectronicAlbumProject()) {
+    const maxPage = Math.max(0, (Number(state.albumPageCount) || 1) - 1);
+    state.activeAlbumPage = Math.min(keepAlbumPage, maxPage);
+    state.albumPageTextEditActive = keepAlbumEditing && state.albumPageCount > 0;
+    updateAlbumPageTabActive();
+    updateAlbumPageEditControls();
+    if (typeof renderFramesStrip === 'function') renderFramesStrip();
+    scrollPreviewToAlbumPage(state.activeAlbumPage, 'auto');
+    if (state.albumPageTextEditActive) await refreshTextFields();
+  } else if (typeof renderFramesStrip === 'function') {
+    renderFramesStrip();
+  }
+
+  renderToolbar();
+  renderFooter();
+  updateGenerationControls();
 }
 
 // ============== v0.8: frames timeline + graph modal ==============
@@ -5725,7 +6206,7 @@ function renderAlbumPagesStrip(strip, p) {
   }
   strip.classList.add('has-frames');
   const ver = previewVersion(p);
-  // Use export canvas size for scaling — never phone/PC device viewport
+  // Use export canvas size for scaling - never phone/PC device viewport
   // (that makes 9:16 thumbs extremely tall).
   const res = projectPreviewResolution(p);
   const nativeW = res.width || 1920;
@@ -5743,39 +6224,631 @@ function renderAlbumPagesStrip(strip, p) {
     const topic = String(summaries[index] || '').trim();
     const title = topic ? `第 ${index + 1} 页 · ${topic}` : `第 ${index + 1} 页`;
     const cls = ['frame-tab', 'album-page-tab', isActive && 'active', isEditing && 'editing'].filter(Boolean).join(' ');
-    return `<button class="${cls}" data-album-page="${index}" title="${esc(title)}">
-      <div class="frame-thumb" style="height:${thumbH}px;max-height:none">
-        <iframe sandbox="allow-scripts allow-same-origin"
-          src="/preview/${p.id}?thumb=1&albumPage=${index + 1}&v=${ver}"
-          data-album-thumb="${index}" tabindex="-1" loading="lazy" style="${thumbStyle}"></iframe>
+    return `<div class="album-page-item ${isActive ? 'active' : ''}" data-album-page-item="${index}" draggable="${state.albumPageActionBusy ? 'false' : 'true'}">
+      <button class="${cls}" data-album-page="${index}" title="${esc(title)}">
+        <div class="frame-thumb" style="height:${thumbH}px;max-height:none">
+          <iframe sandbox="allow-scripts allow-same-origin"
+            src="/preview/${p.id}?thumb=1&albumPage=${index + 1}&v=${ver}"
+            data-album-thumb="${index}" tabindex="-1" loading="lazy" style="${thumbStyle}"></iframe>
+        </div>
+        <div class="frame-tab-label">
+          <span class="order">${index + 1}</span>
+          ${topic ? `<span class="page-topic">${esc(topic)}</span>` : ''}
+        </div>
+      </button>
+      <div class="album-page-actions" aria-label="页面操作">
+        <button type="button" data-album-page-action="duplicate" data-album-page="${index}" title="复制">⧉</button>
+        <button type="button" data-album-page-action="delete" data-album-page="${index}" title="删除" ${count <= 1 ? 'disabled' : ''}>×</button>
       </div>
-      <div class="frame-tab-label">
-        <span class="order">${index + 1}</span>
-        ${topic ? `<span class="page-topic">${esc(topic)}</span>` : ''}
-      </div>
-    </button>`;
+    </div>`;
   }).join('');
-  strip.innerHTML = `<span class="label">页面</span>${tabs}`;
-  strip.querySelectorAll('button.album-page-tab').forEach((btn) => {
-    btn.addEventListener('click', () => {
-      selectAlbumPage(Number(btn.dataset.albumPage) || 0);
-    });
-  });
+  strip.innerHTML = `<div class="album-rail-head"><span class="label">页面</span></div>${tabs}`;
+  wireAlbumPageDragSorting(strip);
   strip.querySelectorAll('iframe[data-album-thumb]').forEach((iframe) => {
     const pageIndex = Number(iframe.dataset.albumThumb) || 0;
-    const onReady = () => prepareAlbumThumbIframe(iframe, pageIndex);
-    iframe.addEventListener('load', onReady);
-    // Cached iframe may already be complete when we attach the listener.
-    try {
-      if (iframe.contentDocument?.readyState === 'complete') onReady();
-    } catch { /* ignore */ }
-  });
-  requestAnimationFrame(() => {
-    strip.querySelectorAll('iframe[data-album-thumb]').forEach((iframe) => {
-      fitAlbumThumbIframe(iframe);
-    });
+    // Only wait for the real preview document — calling prepare on about:blank
+    // + again on load used to double-isolate and flicker.
+    iframe.addEventListener('load', () => prepareAlbumThumbIframe(iframe, pageIndex), { once: true });
   });
   updateAlbumPageEditControls();
+}
+
+function albumRailOrder(strip) {
+  return Array.from(strip?.querySelectorAll?.('.album-page-item') || [])
+    .map((item) => Number(item.dataset.albumPageItem))
+    .filter((index) => Number.isInteger(index) && index >= 0);
+}
+
+function wireAlbumPageDragSorting(strip) {
+  if (!strip) return;
+  if (strip.dataset.hvAlbumDragWired === '1') return;
+  strip.dataset.hvAlbumDragWired = '1';
+
+  // Never move .album-page-item DOM (and its iframe) during dragover — that
+  // thrashing causes constant thumb flicker. Track indices + a CSS marker only.
+  let dragFrom = -1;
+  let insertAt = -1;
+
+  const clearDragUi = () => {
+    strip.classList.remove('album-drag-active');
+    strip.querySelectorAll('.album-page-item').forEach((item) => {
+      item.classList.remove('dragging', 'drag-over', 'drop-before', 'drop-after');
+    });
+    dragFrom = -1;
+    insertAt = -1;
+    strip.__hvDraggedAlbumPage = null;
+  };
+
+  const paintInsertMarker = (overItem, after) => {
+    strip.querySelectorAll('.album-page-item').forEach((item) => {
+      item.classList.remove('drop-before', 'drop-after', 'drag-over');
+    });
+    if (!overItem) return;
+    overItem.classList.add(after ? 'drop-after' : 'drop-before');
+  };
+
+  strip.addEventListener('click', (e) => {
+    const actionBtn = e.target?.closest?.('[data-album-page-action]');
+    if (actionBtn && strip.contains(actionBtn)) {
+      e.stopPropagation();
+      if (!actionBtn.disabled) {
+        performAlbumPageAction(actionBtn.dataset.albumPageAction, Number(actionBtn.dataset.albumPage) || 0);
+      }
+      return;
+    }
+    if (strip.classList.contains('album-drag-active')) return;
+    const btn = e.target?.closest?.('button.album-page-tab');
+    if (!btn || !strip.contains(btn)) return;
+    selectAlbumPage(Number(btn.dataset.albumPage) || 0);
+  });
+
+  strip.addEventListener('dragstart', (e) => {
+    const item = e.target?.closest?.('.album-page-item');
+    if (!item || !strip.contains(item)) return;
+    if (state.albumPageActionBusy || e.target?.closest?.('.album-page-actions')) {
+      e.preventDefault();
+      return;
+    }
+    dragFrom = Number(item.dataset.albumPageItem);
+    if (!Number.isInteger(dragFrom) || dragFrom < 0) {
+      e.preventDefault();
+      return;
+    }
+    insertAt = dragFrom;
+    strip.__hvDraggedAlbumPage = item;
+    item.classList.add('dragging');
+    strip.classList.add('album-drag-active');
+    e.dataTransfer.effectAllowed = 'move';
+    e.dataTransfer.setData('text/plain', String(dragFrom));
+    // Tiny drag image so the heavy iframe thumb isn't painted as the ghost.
+    try {
+      const ghost = document.createElement('div');
+      ghost.style.cssText = 'position:fixed;left:-9999px;top:0;width:72px;height:40px;border-radius:6px;background:rgba(59,130,246,.35);border:1px solid #3b82f6;';
+      document.body.appendChild(ghost);
+      e.dataTransfer.setDragImage(ghost, 36, 20);
+      setTimeout(() => ghost.remove(), 0);
+    } catch { /* ignore */ }
+  });
+
+  strip.addEventListener('dragover', (e) => {
+    if (dragFrom < 0) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'move';
+    const over = e.target?.closest?.('.album-page-item');
+    if (!over || !strip.contains(over)) return;
+    const items = Array.from(strip.querySelectorAll('.album-page-item'));
+    const overIndex = items.indexOf(over);
+    if (overIndex < 0) return;
+    const rect = over.getBoundingClientRect();
+    const after = e.clientY > rect.top + rect.height / 2;
+    insertAt = after ? overIndex + 1 : overIndex;
+    paintInsertMarker(over, after);
+  });
+
+  strip.addEventListener('dragleave', (e) => {
+    const related = e.relatedTarget;
+    if (related && strip.contains(related)) return;
+    strip.querySelectorAll('.album-page-item').forEach((item) => {
+      item.classList.remove('drop-before', 'drop-after', 'drag-over');
+    });
+  });
+
+  strip.addEventListener('drop', (e) => {
+    if (dragFrom < 0) return;
+    e.preventDefault();
+    const from = dragFrom;
+    let to = insertAt;
+    const count = Number(state.albumPageCount) || 0;
+    clearDragUi();
+    if (!count || from < 0 || from >= count) return;
+    const order = Array.from({ length: count }, (_, i) => i);
+    const [moved] = order.splice(from, 1);
+    if (to > from) to -= 1;
+    to = Math.max(0, Math.min(order.length, to));
+    order.splice(to, 0, moved);
+    performAlbumPageReorder(order);
+  });
+
+  strip.addEventListener('dragend', () => {
+    clearDragUi();
+  });
+}
+
+function albumHtmlDoctype(doc) {
+  const dt = doc?.doctype;
+  if (!dt?.name) return '<!doctype html>';
+  let out = `<!doctype ${dt.name}`;
+  if (dt.publicId) out += ` PUBLIC "${dt.publicId}"`;
+  if (dt.systemId) out += dt.publicId ? ` "${dt.systemId}"` : ` SYSTEM "${dt.systemId}"`;
+  return `${out}>`;
+}
+
+function serializeAlbumDoc(doc) {
+  return `${albumHtmlDoctype(doc)}\n${doc.documentElement.outerHTML}`;
+}
+
+function albumPageKeySuffix(key, fallback) {
+  const raw = String(key || '').trim();
+  if (!raw) return fallback;
+  const stripped = raw
+    .replace(/^page[_-]?\d+[._:-]?/i, '')
+    .replace(/^p\d+[._:-]?/i, '')
+    .replace(/^(cover|intro|about|contact|cta|ending|home)[._:-]?/i, '');
+  return (stripped || raw.split(/[.:_-]/).filter(Boolean).pop() || fallback)
+    .replace(/[^\w.-]+/g, '_')
+    .replace(/^_+|_+$/g, '')
+    || fallback;
+}
+
+function rewriteAlbumPageEditableKeys(page, pageIndex) {
+  if (!page) return;
+  const used = new Set();
+  const attrs = [
+    ['data-hv-text', 'text'],
+    ['data-hv-image', 'image'],
+    ['data-hv-cta', 'cta'],
+  ];
+  for (const [attr, fallbackBase] of attrs) {
+    page.querySelectorAll(`[${attr}]`).forEach((el, i) => {
+      const suffixBase = albumPageKeySuffix(el.getAttribute(attr), `${fallbackBase}_${i + 1}`);
+      let suffix = suffixBase;
+      let n = 2;
+      while (used.has(`${attr}:${suffix}`)) {
+        suffix = `${suffixBase}_${n}`;
+        n += 1;
+      }
+      used.add(`${attr}:${suffix}`);
+      el.setAttribute(attr, `page_${pageIndex + 1}.${suffix}`);
+    });
+  }
+}
+
+function uniquifyClonedAlbumPageIds(page) {
+  if (!page) return;
+  const all = [page, ...Array.from(page.querySelectorAll('[id]'))].filter((el) => el?.id);
+  if (!all.length) return;
+  const suffix = `copy-${Date.now().toString(36)}`;
+  const map = new Map();
+  all.forEach((el, i) => {
+    const old = el.id;
+    const next = `${old}-${suffix}-${i + 1}`;
+    map.set(old, next);
+    el.id = next;
+  });
+  const refAttrs = ['for', 'aria-controls', 'aria-labelledby', 'aria-describedby'];
+  page.querySelectorAll(refAttrs.map((attr) => `[${attr}]`).join(',')).forEach((el) => {
+    refAttrs.forEach((attr) => {
+      const value = el.getAttribute(attr);
+      if (!value) return;
+      const next = value.split(/\s+/).map((part) => map.get(part) || part).join(' ');
+      el.setAttribute(attr, next);
+    });
+  });
+  page.querySelectorAll('[href^="#"]').forEach((el) => {
+    const old = el.getAttribute('href')?.slice(1);
+    if (old && map.has(old)) el.setAttribute('href', `#${map.get(old)}`);
+  });
+}
+
+function clearAlbumPageCloneContent(page) {
+  if (!page) return;
+  let wroteTitle = false;
+  page.querySelectorAll('[data-hv-text]').forEach((el) => {
+    const key = el.getAttribute('data-hv-text') || '';
+    if (typeof hvTextKeyLooksLikeChrome === 'function' && hvTextKeyLooksLikeChrome(key)) return;
+    const tag = el.tagName || '';
+    const isTitle = /^H[1-3]$/i.test(tag) || /(title|headline|heading|brand|name)$/i.test(key);
+    if (!wroteTitle && isTitle) {
+      el.textContent = '新页面';
+      wroteTitle = true;
+      return;
+    }
+    if (/^(A|BUTTON)$/i.test(tag) || el.hasAttribute('data-hv-cta')) {
+      el.textContent = '了解更多';
+      return;
+    }
+    if ((el.textContent || '').trim()) el.textContent = '点击编辑内容';
+  });
+  if (!wroteTitle) {
+    const heading = page.querySelector('h1, h2, h3');
+    if (heading) heading.textContent = '新页面';
+  }
+  page.querySelectorAll('[data-hv-cta]').forEach((el) => {
+    if (/^A$/i.test(el.tagName) && !el.getAttribute('href')) el.setAttribute('href', '#');
+  });
+}
+
+function normalizeAlbumPageOrder(doc, pages) {
+  pages.forEach((page, index) => {
+    page.setAttribute('data-hv-studio-page-index', String(index));
+    if (page.hasAttribute('data-page-index')) page.setAttribute('data-page-index', String(index));
+    if (page.hasAttribute('data-index')) page.setAttribute('data-index', String(index));
+    for (const attr of ['data-page', 'data-album-page', 'data-slide']) {
+      const value = page.getAttribute(attr);
+      if (value == null || /^\d+$/.test(value) || /^page[_-]?\d+$/i.test(value)) {
+        page.setAttribute(attr, `page_${index + 1}`);
+      }
+    }
+    if (page.hasAttribute('aria-label')) page.setAttribute('aria-label', `第 ${index + 1} 页`);
+    page.classList.toggle('active', index === 0 && page.classList.contains('active'));
+    page.classList.toggle('is-active', index === 0 && page.classList.contains('is-active'));
+    page.classList.toggle('current', index === 0 && page.classList.contains('current'));
+  });
+  void doc;
+}
+
+function updateAlbumPageCounterText(root, pageIndex, total) {
+  if (!root) return;
+  const walker = (root.ownerDocument || document).createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+    acceptNode(node) {
+      const parent = node.parentElement;
+      if (!parent || /^(SCRIPT|STYLE|TEXTAREA)$/i.test(parent.tagName)) return NodeFilter.FILTER_REJECT;
+      const text = node.nodeValue || '';
+      if (!/\d{1,3}\s*[\/／]\s*\d{1,3}/.test(text)) return NodeFilter.FILTER_REJECT;
+      if (text.length > 28 && !/[页頁]/.test(text)) return NodeFilter.FILTER_REJECT;
+      return NodeFilter.FILTER_ACCEPT;
+    },
+  });
+  const nodes = [];
+  while (walker.nextNode()) nodes.push(walker.currentNode);
+  nodes.forEach((node) => {
+    node.nodeValue = (node.nodeValue || '').replace(/\d{1,3}\s*([\/／])\s*\d{1,3}/g, (_m, sep) => {
+      const current = String(pageIndex + 1).padStart(total >= 10 ? 2 : 1, '0');
+      const max = String(total).padStart(total >= 10 ? 2 : 1, '0');
+      return `${current}${sep}${max}`;
+    });
+  });
+}
+
+function syncAlbumDots(doc, total) {
+  const containers = Array.from(doc.querySelectorAll(
+    '[id*="dots" i], [id*="pageDots" i], .dots, .page-dots, .pagination-dots, .carousel-dots',
+  ));
+  containers.forEach((container) => {
+    const dots = Array.from(container.querySelectorAll('.dot, [data-dot], [data-page-dot], [data-album-dot]'));
+    if (!dots.length || dots.length > 80) return;
+    while (dots.length < total) {
+      const clone = dots[dots.length - 1].cloneNode(true);
+      container.appendChild(clone);
+      dots.push(clone);
+    }
+    while (dots.length > total) dots.pop().remove();
+    dots.forEach((dot, index) => {
+      dot.classList.toggle('active', index === 0 && dot.classList.contains('active'));
+      dot.classList.toggle('current', index === 0 && dot.classList.contains('current'));
+      dot.classList.toggle('is-active', index === 0 && dot.classList.contains('is-active'));
+      for (const attr of ['data-index', 'data-page-index', 'data-slide-index']) {
+        if (dot.hasAttribute(attr)) dot.setAttribute(attr, String(index));
+      }
+      for (const attr of ['data-page', 'data-slide']) {
+        if (dot.hasAttribute(attr)) dot.setAttribute(attr, String(index + 1));
+      }
+      if (dot.hasAttribute('aria-label')) dot.setAttribute('aria-label', `跳转到第 ${index + 1} 页`);
+      if (/^\s*\d+\s*$/.test(dot.textContent || '')) dot.textContent = String(index + 1);
+    });
+  });
+}
+
+function updateAlbumPageCountInScripts(doc, oldCount, newCount) {
+  if (oldCount === newCount) return;
+  const names = '(?:totalPages|pageCount|totalPageCount|totalSlides|slideCount|slidesCount|pagesCount)';
+  const assignment = new RegExp(`(\\b${names}\\b\\s*=\\s*)(["']?)${oldCount}\\2(?=\\s*[;,\\n])`, 'g');
+  const property = new RegExp(`(\\b${names}\\b\\s*:\\s*)(["']?)${oldCount}\\2(?=\\s*[,}\\n])`, 'g');
+  doc.querySelectorAll('script').forEach((script) => {
+    script.textContent = (script.textContent || '')
+      .replace(assignment, (_m, prefix, quote) => `${prefix}${quote}${newCount}${quote}`)
+      .replace(property, (_m, prefix, quote) => `${prefix}${quote}${newCount}${quote}`);
+  });
+  doc.querySelectorAll('[data-total-pages], [data-page-count], [data-total-count]').forEach((el) => {
+    for (const attr of ['data-total-pages', 'data-page-count', 'data-total-count']) {
+      if (Number(el.getAttribute(attr)) === oldCount) el.setAttribute(attr, String(newCount));
+    }
+  });
+}
+
+function syncAlbumPageChrome(doc, oldCount, newCount) {
+  const pages = findAlbumPageElements(doc);
+  normalizeAlbumPageOrder(doc, pages);
+  pages.forEach((page, index) => updateAlbumPageCounterText(page, index, pages.length));
+  updateAlbumPageCountInScripts(doc, oldCount, newCount);
+  syncAlbumDots(doc, pages.length);
+  return pages;
+}
+
+function setAlbumPageBusyUi(busy) {
+  state.albumPageActionBusy = !!busy;
+  document.querySelectorAll('.album-page-item').forEach((item) => {
+    item.setAttribute('draggable', busy ? 'false' : 'true');
+    item.classList.toggle('saving', !!busy);
+  });
+  document.querySelectorAll('[data-album-page-action]').forEach((btn) => {
+    if (btn.dataset.albumPageAction === 'delete' && (Number(state.albumPageCount) || 0) <= 1) {
+      btn.disabled = true;
+    } else {
+      btn.disabled = !!busy;
+    }
+  });
+}
+
+function updateAlbumRailIndicesFromDom(summaries = state.albumPageSummaries) {
+  const items = Array.from(document.querySelectorAll('#frames-strip .album-page-item'));
+  const count = items.length;
+  const list = Array.isArray(summaries) ? summaries : [];
+  items.forEach((item, index) => {
+    const topic = String(list[index] || '').trim();
+    const title = topic ? `第 ${index + 1} 页 · ${topic}` : `第 ${index + 1} 页`;
+    item.dataset.albumPageItem = String(index);
+    item.classList.toggle('active', index === state.activeAlbumPage);
+    item.setAttribute('draggable', state.albumPageActionBusy ? 'false' : 'true');
+
+    const tab = item.querySelector('button.album-page-tab');
+    if (tab) {
+      tab.dataset.albumPage = String(index);
+      tab.title = title;
+      tab.classList.toggle('active', index === state.activeAlbumPage);
+      tab.classList.toggle('editing', !!state.albumPageTextEditActive && index === state.activeAlbumPage);
+    }
+    const order = item.querySelector('.order');
+    if (order) order.textContent = String(index + 1);
+    let topicEl = item.querySelector('.page-topic');
+    if (topic) {
+      if (!topicEl) {
+        topicEl = document.createElement('span');
+        topicEl.className = 'page-topic';
+        item.querySelector('.frame-tab-label')?.appendChild(topicEl);
+      }
+      topicEl.textContent = topic;
+    } else {
+      topicEl?.remove();
+    }
+
+    item.querySelectorAll('[data-album-page-action]').forEach((btn) => {
+      btn.dataset.albumPage = String(index);
+      btn.disabled = state.albumPageActionBusy || (btn.dataset.albumPageAction === 'delete' && count <= 1);
+    });
+    const thumb = item.querySelector('iframe[data-album-thumb]');
+    if (thumb) thumb.dataset.albumThumb = String(index);
+  });
+}
+
+function applyLiveAlbumPageReorder(order) {
+  const doc = getPreviewDocument();
+  if (!doc) return null;
+  const pages = findAlbumPageElements(doc);
+  if (pages.length !== order.length) return null;
+  const parent = pages[0]?.parentNode;
+  if (!parent || pages.some((page) => page.parentNode !== parent)) return null;
+  const anchor = doc.createComment('hv-page-order-anchor');
+  parent.insertBefore(anchor, pages[0]);
+  order.forEach((sourceIndex) => {
+    const page = pages[sourceIndex];
+    if (page) parent.insertBefore(page, anchor);
+  });
+  anchor.remove();
+  syncAlbumPageChrome(doc, pages.length, pages.length);
+  return doc;
+}
+
+function applyLiveAlbumPageDuplicate(pageIndex) {
+  const doc = getPreviewDocument();
+  if (!doc) return null;
+  const pages = findAlbumPageElements(doc);
+  const source = pages[pageIndex];
+  if (!source) return null;
+  const clone = source.cloneNode(true);
+  uniquifyClonedAlbumPageIds(clone);
+  source.parentNode.insertBefore(clone, source.nextSibling);
+  const nextIndex = Math.min(pageIndex + 1, pages.length);
+  clone.setAttribute('data-page', `page_${nextIndex + 1}`);
+  clone.setAttribute('data-album-page', `page_${nextIndex + 1}`);
+  rewriteAlbumPageEditableKeys(clone, nextIndex);
+  syncAlbumPageChrome(doc, pages.length, pages.length + 1);
+  return { doc, activeIndex: nextIndex };
+}
+
+function applyLiveAlbumPageDelete(pageIndex) {
+  const doc = getPreviewDocument();
+  if (!doc) return null;
+  const pages = findAlbumPageElements(doc);
+  if (pages.length <= 1 || !pages[pageIndex]) return null;
+  pages[pageIndex].remove();
+  const activeIndex = Math.max(0, Math.min(pageIndex, pages.length - 2));
+  syncAlbumPageChrome(doc, pages.length, pages.length - 1);
+  return { doc, activeIndex };
+}
+
+function cloneAlbumRailItemAfter(pageIndex) {
+  const items = Array.from(document.querySelectorAll('#frames-strip .album-page-item'));
+  const source = items[pageIndex];
+  if (!source) return;
+  const clone = source.cloneNode(true);
+  clone.classList.remove('dragging', 'drag-over');
+  source.after(clone);
+}
+
+function removeAlbumRailItem(pageIndex) {
+  const item = document.querySelector(`#frames-strip .album-page-item[data-album-page-item="${pageIndex}"]`);
+  item?.remove();
+}
+
+async function saveAlbumPageOperation(doc, activeIndex, message, { refreshText = true } = {}) {
+  const html = serializeAlbumDoc(doc);
+  const res = await API.putRawHtml(state.selected.id, html);
+  if (res?.error) throw new Error(res.error);
+  if (res?.project) state.selected = res.project;
+  const pages = findAlbumPageElements(doc);
+  state.albumPageCount = pages.length;
+  state.albumPageSummaries = pages.map((page) => summarizeAlbumPageElement(page));
+  state.activeAlbumPage = Math.max(0, Math.min(pages.length - 1, activeIndex));
+  state.albumPageTextEditActive = false;
+  markPreviewRevision();
+  updateAlbumRailIndicesFromDom(state.albumPageSummaries);
+  updateAlbumPageTabLabels(state.albumPageSummaries);
+  updateAlbumPageTabActive();
+  if (refreshText) await refreshTextFields();
+  updateAlbumPageEditControls();
+  updateGenerationControls();
+  toast(message, 'success');
+}
+
+function reorderAlbumRailDom(order) {
+  const strip = document.getElementById('frames-strip');
+  if (!strip) return;
+  const items = Array.from(strip.querySelectorAll('.album-page-item'));
+  if (!items.length || items.length !== order.length) return;
+  const head = strip.querySelector('.album-rail-head');
+  const frag = document.createDocumentFragment();
+  order.forEach((sourceIndex) => {
+    const item = items[sourceIndex];
+    if (item) frag.appendChild(item);
+  });
+  if (head?.nextSibling) strip.insertBefore(frag, head.nextSibling);
+  else if (head) head.after(frag);
+  else strip.appendChild(frag);
+}
+
+async function performAlbumPageReorder(order) {
+  if (!state.selected?.id || state.albumPageActionBusy) return;
+  const normalized = Array.isArray(order) ? order.map(Number) : [];
+  const count = Number(state.albumPageCount) || 0;
+  if (normalized.length !== count) {
+    renderFramesStrip();
+    return;
+  }
+  const unchanged = normalized.every((index, position) => index === position);
+  if (unchanged) return;
+
+  setAlbumPageBusyUi(true);
+  try {
+    const previousActive = Math.max(0, Math.min(normalized.length - 1, Number(state.activeAlbumPage) || 0));
+    const activeIndex = Math.max(0, normalized.indexOf(previousActive));
+    const liveDoc = applyLiveAlbumPageReorder(normalized);
+    if (!liveDoc) throw new Error('Cannot reorder pages in the live preview');
+    const previousSummaries = Array.isArray(state.albumPageSummaries) ? state.albumPageSummaries : [];
+    state.albumPageSummaries = normalized.map((sourceIndex) => previousSummaries[sourceIndex] || '');
+    state.activeAlbumPage = activeIndex;
+    // One-shot rail reorder keeps each thumb iframe with its content (no remount flash).
+    reorderAlbumRailDom(normalized);
+    updateAlbumRailIndicesFromDom(state.albumPageSummaries);
+    updateAlbumPageTabActive();
+    // Keep wheel/scroll browse — do not lock centre preview into hard-cut focus.
+    scrollPreviewToAlbumPage(activeIndex, 'auto', { mode: 'browse' });
+
+    await flushTextEditsIfNeeded();
+    const html = await API.rawHtml(state.selected.id);
+    if (!html) throw new Error('No preview HTML');
+    const doc = new DOMParser().parseFromString(html, 'text/html');
+    const pages = findAlbumPageElements(doc);
+    if (pages.length !== normalized.length) throw new Error('Album page count changed');
+    const parent = pages[0]?.parentNode;
+    if (!parent || pages.some((page) => page.parentNode !== parent)) {
+      throw new Error('Album pages must share one parent to reorder');
+    }
+
+    const anchor = doc.createComment('hv-page-order-anchor');
+    parent.insertBefore(anchor, pages[0]);
+    normalized.forEach((sourceIndex) => {
+      const page = pages[sourceIndex];
+      if (page) parent.insertBefore(page, anchor);
+    });
+    anchor.remove();
+
+    const synced = syncAlbumPageChrome(doc, pages.length, pages.length);
+    await saveAlbumPageOperation(doc, Math.min(activeIndex, synced.length - 1), '已调整页面顺序', { refreshText: false });
+    // Do NOT remount the rail here — renderFramesStrip() reload iframes and
+    // causes a second jitter wave. Dom order + labels already match.
+    scrollPreviewToAlbumPage(state.activeAlbumPage, 'auto', { mode: 'browse' });
+  } catch (error) {
+    console.warn('[studio] album page reorder failed:', error);
+    toast(`页面排序保存失败：${error?.message ?? error}。请刷新后重试。`, 'error');
+    renderFramesStrip();
+  } finally {
+    setAlbumPageBusyUi(false);
+  }
+}
+
+async function performAlbumPageAction(action, pageIndex) {
+  if (!state.selected?.id || state.albumPageActionBusy) return;
+  const actionName = String(action || '');
+  if (actionName === 'delete') {
+    const count = Number(state.albumPageCount) || 0;
+    const index = Math.max(0, Math.min(count - 1, Number(pageIndex) || 0));
+    if (count <= 1) return;
+    if (!confirm(`确定删除第 ${index + 1} 页吗？`)) return;
+  }
+  setAlbumPageBusyUi(true);
+  try {
+    await flushTextEditsIfNeeded();
+    const html = await API.rawHtml(state.selected.id);
+    if (!html) throw new Error('No preview HTML');
+    const doc = new DOMParser().parseFromString(html, 'text/html');
+    let pages = findAlbumPageElements(doc);
+    if (!pages.length) throw new Error('No album pages found');
+    const oldCount = pages.length;
+    const index = Math.max(0, Math.min(oldCount - 1, Number(pageIndex) || 0));
+    let activeIndex = index;
+    let message = '页面已更新';
+
+    if (actionName === 'duplicate') {
+      const live = applyLiveAlbumPageDuplicate(index);
+      cloneAlbumRailItemAfter(index);
+      const source = pages[index] || pages[pages.length - 1];
+      const clone = source.cloneNode(true);
+      uniquifyClonedAlbumPageIds(clone);
+      source.parentNode.insertBefore(clone, source.nextSibling);
+      pages = findAlbumPageElements(doc);
+      activeIndex = Math.min(index + 1, pages.length - 1);
+      const inserted = pages[activeIndex] || clone;
+      inserted.setAttribute('data-page', `page_${activeIndex + 1}`);
+      inserted.setAttribute('data-album-page', `page_${activeIndex + 1}`);
+      rewriteAlbumPageEditableKeys(inserted, activeIndex);
+      message = '已复制页面';
+      state.albumPageCount = oldCount + 1;
+      state.activeAlbumPage = live?.activeIndex ?? activeIndex;
+    } else if (actionName === 'delete') {
+      const live = applyLiveAlbumPageDelete(index);
+      removeAlbumRailItem(index);
+      pages[index].remove();
+      activeIndex = Math.max(0, Math.min(index, oldCount - 2));
+      message = '已删除页面';
+      state.albumPageCount = oldCount - 1;
+      state.activeAlbumPage = live?.activeIndex ?? activeIndex;
+    } else {
+      return;
+    }
+
+    pages = syncAlbumPageChrome(doc, oldCount, findAlbumPageElements(doc).length);
+    state.albumPageSummaries = pages.map((page) => summarizeAlbumPageElement(page));
+    updateAlbumRailIndicesFromDom(state.albumPageSummaries);
+    updateAlbumPageTabActive();
+    scrollPreviewToAlbumPage(state.activeAlbumPage, 'auto');
+    await saveAlbumPageOperation(doc, Math.min(activeIndex, pages.length - 1), message);
+  } catch (error) {
+    console.warn('[studio] album page operation failed:', error);
+    toast(`页面操作保存失败：${error?.message ?? error}。请刷新后重试。`, 'error');
+  } finally {
+    setAlbumPageBusyUi(false);
+  }
 }
 
 async function openGraphModal() {
@@ -5870,14 +6943,16 @@ async function refreshTextFields() {
       state.activeAlbumPage = Math.min(state.activeAlbumPage, Math.max(0, nextCount - 1));
     }
     if (summariesChanged) state.albumPageSummaries = nextSummaries;
-    // Only rebuild the left rail when structure/labels actually change.
-    // Switching pages while leaving「编辑本页」used to call refreshTextFields →
-    // renderFramesStrip every time, which recreated every thumb iframe (flash).
+    // Only remount the left rail when structure is missing/changed.
+    // Label-only updates patch tab titles — avoid recreating every thumb iframe.
     const strip = document.getElementById('frames-strip');
     const stripEmpty = !strip?.classList.contains('has-frames')
       || !strip.querySelector('button.album-page-tab');
-    if (countChanged || summariesChanged || stripEmpty) {
+    if (countChanged || stripEmpty) {
       renderFramesStrip();
+    } else if (summariesChanged) {
+      updateAlbumPageTabLabels(nextSummaries);
+      updateAlbumPageTabActive();
     } else {
       updateAlbumPageTabActive();
     }
@@ -6056,13 +7131,64 @@ function isCtaFieldDirty(f) {
 function applyCtaFieldToPreview(index) {
   const field = state.ctaFields[index];
   if (!field) return;
-  const doc = getPreviewDocument();
-  if (!doc) return;
-  let nodes = Array.from(doc.querySelectorAll(`[data-hv-cta="${cssEscape(field.key)}"]`));
-  if (nodes.length === 0) {
-    nodes = Array.from(doc.querySelectorAll(`[data-hv-text="${cssEscape(field.key)}"]`));
+  forEachLiveEditDocs((doc) => {
+    let nodes = Array.from(doc.querySelectorAll(`[data-hv-cta="${cssEscape(field.key)}"]`));
+    if (nodes.length === 0) {
+      nodes = Array.from(doc.querySelectorAll(`[data-hv-text="${cssEscape(field.key)}"]`));
+    }
+    nodes.forEach((n) => writeCtaValue(n, field.current, field.href));
+  });
+  refreshActiveAlbumPageTopicFromLive();
+}
+
+/** Centre preview + active left-rail thumb (album page or frame). */
+function forEachLiveEditDocs(fn) {
+  if (typeof fn !== 'function') return;
+  const seen = new Set();
+  const visit = (doc) => {
+    if (!doc || seen.has(doc)) return;
+    seen.add(doc);
+    try { fn(doc); } catch { /* cross-origin / detached */ }
+  };
+  visit(getPreviewDocument());
+  const p = state.selected;
+  const hasFrames = Array.isArray(p?.frames) && p.frames.length > 0;
+  if (!hasFrames) {
+    visit(getAlbumThumbDocument(state.activeAlbumPage || 0));
+    return;
   }
-  nodes.forEach((n) => writeCtaValue(n, field.current, field.href));
+  const active = document.querySelector('#frames-strip button.frame-tab.active iframe');
+  try { visit(active?.contentDocument || null); } catch { /* ignore */ }
+}
+
+function getAlbumThumbDocument(pageIndex) {
+  const iframe = document.querySelector(`#frames-strip iframe[data-album-thumb="${Number(pageIndex) || 0}"]`);
+  try { return iframe?.contentDocument || null; } catch { return null; }
+}
+
+/** Push typed text into live preview DOMs — no iframe remount. */
+function applyTextFieldToPreview(key, value) {
+  if (!key) return;
+  forEachLiveEditDocs((doc) => {
+    findPreviewTextNodes(doc, key).forEach((n) => { n.textContent = value ?? ''; });
+  });
+  refreshActiveAlbumPageTopicFromLive();
+}
+
+/** Recompute active page rail label from live centre preview (no remount). */
+function refreshActiveAlbumPageTopicFromLive() {
+  if (!isElectronicAlbumProject()) return;
+  const idx = Math.max(0, state.activeAlbumPage || 0);
+  const doc = getPreviewDocument();
+  const pages = getAlbumPagesFromDoc(doc);
+  const page = pages[idx];
+  if (!page) return;
+  const topic = summarizeAlbumPageElement(page);
+  if (!Array.isArray(state.albumPageSummaries)) state.albumPageSummaries = [];
+  while (state.albumPageSummaries.length <= idx) state.albumPageSummaries.push('');
+  if (state.albumPageSummaries[idx] === topic) return;
+  state.albumPageSummaries[idx] = topic;
+  updateAlbumPageTabLabels();
 }
 
 /** Old saves stored CTA URLs on <button data-href> — convert to real <a href>. */
@@ -6319,6 +7445,7 @@ function renderTextFields(opts = {}) {
       state.textFields[i].current = e.target.value;
       updateFieldSnippet(e.target.closest('.text-field'), e.target.value);
       autoResize(el);
+      applyTextFieldToPreview(e.target.dataset.key, e.target.value);
       scheduleTextSave();
     });
     el.addEventListener('focus', () => locateTextField(el.dataset.key, { fromPreview: false }));
@@ -6870,18 +7997,19 @@ async function commitTextEdits() {
     setSaveState(`${t('text_pane.save_state.error')}: ${r.error}`, 'error');
     return;
   }
-  // Refresh project so frames-strip thumbnails cache-bust.
+  // Keep project metadata in sync, but do NOT remount centre preview or left
+  // rail — live DOM was already patched on input (text/image/CTA). Remounting
+  // here caused a flash on every keystroke save.
   if (fid) {
     try {
       const pr = await API.getProject(state.selected.id);
-      state.selected = pr.project;
-      renderFramesStrip();
-    } catch {}
+      if (pr?.project) state.selected = pr.project;
+    } catch { /* ignore */ }
   } else if (r?.project) {
     state.selected = r.project;
   }
+  markPreviewRevision();
   setSaveState(t('text_pane.save_state.saved'), 'saved');
-  reloadPreview();
 }
 
 function writeImageValue(el, value) {
@@ -6967,10 +8095,9 @@ function applyImageFieldValue(index, url, { save = true, syncInput = true } = {}
       ? `<img src="${escAttr(field.current)}" alt="" />`
       : '<span>暂无</span>';
   }
-  const doc = getPreviewDocument();
-  if (doc) {
-    findImageNodesForField(doc, field).forEach((n) => writeImageValue(n, field.current));
-  }
+  forEachLiveEditDocs((liveDoc) => {
+    findImageNodesForField(liveDoc, field).forEach((n) => writeImageValue(n, field.current));
+  });
   if (save) scheduleTextSave();
 }
 
@@ -7034,6 +8161,20 @@ function cssEscape(s) {
   return String(s).replace(/["\\]/g, '\\$&');
 }
 
+function currentAlbumPageAiFocus() {
+  if (!isElectronicAlbumProject() || !Number(state.albumPageCount)) return null;
+  const pageCount = Math.max(1, Number(state.albumPageCount) || 1);
+  const pageIndex = Math.max(0, Math.min(pageCount - 1, Number(state.activeAlbumPage) || 0));
+  const summaries = Array.isArray(state.albumPageSummaries) ? state.albumPageSummaries : [];
+  const summary = String(summaries[pageIndex] || '').trim();
+  return {
+    index: pageIndex,
+    pageNumber: pageIndex + 1,
+    pageCount,
+    summary,
+  };
+}
+
 // ============== send message ==============
 async function sendMessage() {
   if (state.composing || !state.selected) return;
@@ -7041,6 +8182,10 @@ async function sendMessage() {
   const text = ta.value.trim();
   const hasAttachments = state.pendingAttachments.length > 0;
   if (!text && !hasAttachments) return;
+
+  if (document.querySelector('.generation-side-dock')) {
+    await flushTextEditsIfNeeded();
+  }
 
   // Intent shortcut: if the message is a clear "export to MP4" command
   // and there's something to export, run the export flow directly
@@ -7058,28 +8203,36 @@ async function sendMessage() {
 
   ta.value = '';
   state.composing = true;
+  state.expectingInitialGeneration = false;
+  if (!hasProjectPreview(state.selected)) state.backendGenerating = false;
   setGenerationSideTab('assistant', { expand: true });
   // The project this send belongs to — used to ignore late events / not clobber
   // a different project if the user switches away mid-generation.
   const genProjectId = state.selectedId;
   renderComposer();
   updateGenerationControls();
+  syncGenerationEmptyPreview();
 
   // Iterate scope: when the user has selected a specific frame in the
   // strip, the iterate-phase server route should only rewrite that frame.
   // We pass the focus along on every send (server uses it only for iterate).
   const focusFrame = state.iterateFocusFrameId || '';
+  const albumPageFocus = focusFrame ? null : currentAlbumPageAiFocus();
 
   // User message includes attachment summary + focus chip
   const attSummary = hasAttachments
     ? `\n\n📎 ${state.pendingAttachments.length} attachment(s): ${state.pendingAttachments.map(a => a.name).join(', ')}`
     : '';
   const focusSummary = focusFrame ? `\n\n🎯 focus: frame ${focusFrame}` : '';
+  const albumFocusSummary = albumPageFocus
+    ? `\n\n🎯 focus: album page ${albumPageFocus.pageNumber}/${albumPageFocus.pageCount}${albumPageFocus.summary ? ` · ${albumPageFocus.summary}` : ''}`
+    : '';
   state.messages.push({
     role: 'user',
-    content: text + attSummary + focusSummary,
+    content: text + attSummary + focusSummary + albumFocusSummary,
     ts: Date.now(),
     ...(focusFrame ? { focusFrameId: focusFrame } : {}),
+    ...(albumPageFocus ? { albumPageIndex: albumPageFocus.index } : {}),
   });
   state.messages.push({ role: 'thinking', content: t('chat.thinking'), ts: Date.now() });
   const thinkingIdx = state.messages.length - 1;
@@ -7094,6 +8247,11 @@ async function sendMessage() {
       const fd = new FormData();
       fd.append('content', text);
       if (focusFrame) fd.append('focus_frame_id', focusFrame);
+      if (albumPageFocus) {
+        fd.append('album_page_index', String(albumPageFocus.index));
+        fd.append('album_page_count', String(albumPageFocus.pageCount));
+        if (albumPageFocus.summary) fd.append('album_page_summary', albumPageFocus.summary);
+      }
       for (const a of state.pendingAttachments) fd.append('file', a.file, a.name);
       // Clear UI attachments before request so user sees them disappear
       state.pendingAttachments = [];
@@ -7110,6 +8268,11 @@ async function sendMessage() {
         body: JSON.stringify({
           content: text,
           ...(focusFrame ? { focus_frame_id: focusFrame } : {}),
+          ...(albumPageFocus ? {
+            album_page_index: albumPageFocus.index,
+            album_page_count: albumPageFocus.pageCount,
+            album_page_summary: albumPageFocus.summary,
+          } : {}),
         }),
       });
     }
@@ -7170,30 +8333,7 @@ async function sendMessage() {
             }
             state.messages.push({ role: 'preview-event', content: event, ts: Date.now() });
             renderChatLog();
-            // Multi-frame turn replaces frames[]; reset active frame so the
-            // first frame becomes the default again.
-            if (frameCount > 0) state.activeFrameId = null;
-            const pr = await API.getProject(state.selected.id);
-            state.selected = pr.project;
-            // Generating in-place writes a fresh content-graph, so the node→kind
-            // map must be rebuilt — otherwise data frames don't get their ⚡
-            // Remotion badge until the user switches projects and back.
-            if (frameCount > 0) {
-              try {
-                const cg = await API.contentGraph(state.selected.id);
-                ingestContentGraphNodes(cg?.graph?.nodes);
-              } catch { /* no graph — single-frame, fine */ }
-              await enrichFrameLabelsFromHtml(state.selected.id);
-            }
-            markPreviewRevision();
-            renderPreview(); // also re-syncs soundtrack buttons via __hvSyncNarration
-            await refreshTextFields();
-            // Album single-HTML path: refreshTextFields fills albumPageCount; force
-            // the left rail again in case iframe load hasn't fired / was skipped.
-            if (typeof renderFramesStrip === 'function') renderFramesStrip();
-            renderToolbar();
-            renderFooter();
-            updateGenerationControls();
+            await refreshAfterPreviewReady({ frameCount, focusedFrame });
           } else if (ev.type === 'progress') {
             setGenerationProgress(ev.message || ev.stage || '正在生成中…', thinkingIdx);
           } else if (ev.type === 'warning') {
@@ -7229,10 +8369,13 @@ async function sendMessage() {
   // (which may have its own generation running).
   if (state.selectedId === genProjectId) {
     state.composing = false;
+    state.expectingInitialGeneration = false;
+    state.backendGenerating = false;
     stopGenerationProgressTicker(hasProjectPreview(state.selected) ? '已生成，可预览和调整' : '');
     renderComposer();
     renderFooter();
     updateGenerationControls();
+    syncGenerationEmptyPreview();
   }
 }
 

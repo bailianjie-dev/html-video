@@ -21,7 +21,7 @@
 
 ## 当前 Project 模型映射
 
-当前代码里的持久化模型是 `Project`。文件模式仍使用 `.html-video/projects/<project_id>/`；PostgreSQL 模式的本地工作文件使用 `.html-video/projects/<safe_user_id>/<safe_project_id>/`。对外继续保持现有 `/api/projects...` 接口契约，对内把结构化数据映射到 `ai_album_*` 表。
+当前代码里的持久化模型是 `Project`。文件模式仍使用 `.html-video/projects/<project_id>/`；PostgreSQL 模式的本地工作文件使用可丢弃的 `.html-video/tmp/work/<safe_user_id>/<safe_project_id>/`，数据库表和 OSS 是业务数据的主存储。对外继续保持现有 `/api/projects...` 接口契约，对内把结构化数据映射到 `ai_album_*` 表。
 
 | 当前模型 | 数据库表 |
 | --- | --- |

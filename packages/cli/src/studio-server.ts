@@ -4,8 +4,8 @@
  */
 
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
-import { readFile, copyFile, mkdir } from 'node:fs/promises';
-import { existsSync, statSync } from 'node:fs';
+import { readFile, copyFile, mkdir, writeFile } from 'node:fs/promises';
+import { existsSync, statSync, createReadStream } from 'node:fs';
 import { dirname, extname, isAbsolute, join, relative, resolve, basename, sep } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
@@ -826,33 +826,14 @@ export async function startStudioServer(
       if (assetContentMatch && assetContentMatch[1] && assetContentMatch[2] && m === 'GET') {
         const projectId = assetContentMatch[1];
         const assetId = assetContentMatch[2];
-        if (ctx.database?.mode !== 'postgres' || !ctx.database.handle) {
-          const project = await ctx.orchestrator.load(projectId);
-          const asset = project.assets.find((item) => item.id === assetId);
-          if (!asset?.path) return json(res, 404, { error: 'Asset not found' });
-          const safe = resolve(asset.path);
-          const projectsRoot = resolve(ctx.projectRoot, '.html-video', 'projects');
-          if (!isPathInside(projectsRoot, safe)) return json(res, 403, { error: 'Forbidden' });
-          if (!existsSync(safe)) return json(res, 404, { error: 'Asset file not found' });
-          return serveFile(safe, res);
-        }
-        const assets = await projectAssetPersistence(ctx).listForProject(projectId);
-        const asset = assets.find((item) => item.id === assetId && item.status !== 'deleted');
-        if (!asset?.oss_key) return json(res, 404, { error: 'Asset not found' });
-        const ossConfig = loadOssConfig(ctx.projectRoot);
-        if (!ossConfig?.enabled) return json(res, 404, { error: 'OSS is not configured' });
-        try {
-          const downloaded = await downloadFromAliyunOss(ossConfig, { key: asset.oss_key });
-          res.writeHead(200, {
-            'Content-Type': asset.mime_type || downloaded.contentType,
-            'Content-Length': String(downloaded.contentLength),
-            'Cache-Control': 'private, max-age=300',
-          });
-          return res.end(downloaded.body);
-        } catch (error) {
-          console.warn('[studio] asset content proxy failed:', error);
-          return json(res, 502, { error: 'Asset content unavailable' });
-        }
+        const loaded = await loadProjectAssetBytes(ctx, projectId, assetId);
+        if (!loaded) return json(res, 404, { error: 'Asset not found' });
+        res.writeHead(200, {
+          'Content-Type': loaded.mime,
+          'Content-Length': String(loaded.body.length),
+          'Cache-Control': 'private, max-age=300',
+        });
+        return res.end(loaded.body);
       }
 
       // Remove asset
@@ -933,6 +914,8 @@ export async function startStudioServer(
       // Download the latest preview as a standalone HTML deliverable. This is
       // useful for interactive outputs such as electronic albums, where the
       // HTML itself is the thing to share rather than an MP4 recording.
+      // Studio-relative asset URLs (/api/projects/.../assets/.../content) are
+      // inlined as data URIs so the file works when opened outside Studio.
       const htmlExportMatch = url.pathname.match(/^\/api\/projects\/([^/]+)\/export-html$/);
       if (htmlExportMatch && htmlExportMatch[1] && m === 'GET') {
         const project = await ctx.orchestrator.load(htmlExportMatch[1]);
@@ -941,13 +924,39 @@ export async function startStudioServer(
           return json(res, 404, { error: 'No preview HTML yet - pick a template or send a chat first' });
         }
         const safeName = sanitizeDownloadName(project.name || project.id || 'album');
+        const standalone = await inlineAlbumAssetsForExport(
+          hardenAlbumHtml(html),
+          project.id,
+          ctx,
+        );
         res.writeHead(200, {
           'content-type': MIME['.html']!,
           'content-disposition': contentDispositionForHtml(safeName),
           'cache-control': 'no-store, no-cache, must-revalidate',
           pragma: 'no-cache',
         });
-        res.end(hardenAlbumHtml(html));
+        res.end(standalone);
+        return;
+      }
+
+      // Download the latest exported MP4 (attachment), mirroring export-html.
+      const mp4ExportMatch = url.pathname.match(/^\/api\/projects\/([^/]+)\/export-mp4$/);
+      if (mp4ExportMatch && mp4ExportMatch[1] && m === 'GET') {
+        const project = await ctx.orchestrator.load(mp4ExportMatch[1]);
+        const target = project.lastOutputMp4Path;
+        if (!target || !existsSync(target)) {
+          return json(res, 404, { error: 'No exported MP4 yet — click 导出视频 first' });
+        }
+        const safeName = sanitizeDownloadName(project.name || project.id || 'album');
+        const size = statSync(target).size;
+        res.writeHead(200, {
+          'content-type': 'video/mp4',
+          'content-disposition': contentDispositionForMp4(safeName),
+          'content-length': size,
+          'cache-control': 'no-store, no-cache, must-revalidate',
+          pragma: 'no-cache',
+        });
+        createReadStream(target).pipe(res);
         return;
       }
 
@@ -1081,12 +1090,14 @@ export async function startStudioServer(
         } catch {
           // The existing export path reports project lookup/render errors.
         }
+        const albumExport = await prepareAlbumSlideshowExport(ctx, projectId);
         if (!wantsStream) {
           let renderedOutputPath: string | undefined;
           try {
             const { project, outputPath } = await ctx.orchestrator.exportMp4({
               projectId,
               onProgress: (pct, stage) => exportTracker?.progress(exportJob, pct, stage),
+              ...(albumExport ?? {}),
             });
             renderedOutputPath = outputPath;
             exportTracker?.progress(exportJob, 99, 'uploading to OSS');
@@ -1122,6 +1133,7 @@ export async function startStudioServer(
           sse({
             type: 'export_started',
             ...(exportJob && { job_id: exportJob.id }),
+            ...(albumExport && { mode: 'album_slideshow' }),
           });
           const { project, outputPath } = await ctx.orchestrator.exportMp4({
             projectId,
@@ -1129,6 +1141,7 @@ export async function startStudioServer(
               exportTracker?.progress(exportJob, pct, stage);
               sse({ type: 'export_progress', pct, stage });
             },
+            ...(albumExport ?? {}),
           });
           renderedOutputPath = outputPath;
           exportTracker?.progress(exportJob, 99, 'uploading to OSS');
@@ -1538,6 +1551,9 @@ export async function startStudioServer(
         const ct = req.headers['content-type'] ?? '';
         let userText = '';
         let focusFrameId = '';
+        let albumPageIndex: number | undefined;
+        let albumPageCount: number | undefined;
+        let albumPageSummary = '';
         const attachments: Attachment[] = [];
 
         const project0 = await ctx.orchestrator.load(id);
@@ -1548,6 +1564,12 @@ export async function startStudioServer(
               userText = p.value;
             } else if (p.kind === 'field' && p.name === 'focus_frame_id') {
               focusFrameId = p.value;
+            } else if (p.kind === 'field' && p.name === 'album_page_index') {
+              albumPageIndex = parseOptionalNonNegativeInt(p.value);
+            } else if (p.kind === 'field' && p.name === 'album_page_count') {
+              albumPageCount = parseOptionalPositiveInt(p.value);
+            } else if (p.kind === 'field' && p.name === 'album_page_summary') {
+              albumPageSummary = p.value;
             } else if (p.kind === 'file') {
               const updatedProject = shouldPersistUploadedAssetsToOss(ctx)
                 ? await addFileAssetToOss(ctx, id, p.tmpPath, p.filename)
@@ -1559,6 +1581,9 @@ export async function startStudioServer(
                   kind: newAsset.type as Attachment['kind'],
                   filename: p.filename,
                   size: newAsset.metadata.sizeBytes ?? 0,
+                  ...((newAsset.type === 'image' || newAsset.type === 'video' || newAsset.type === 'audio') && newAsset.id
+                    ? { browserUrl: projectAssetBrowserUrl(id, newAsset.id) }
+                    : {}),
                 };
                 // Inline small text/data uploads so the agent (incl. HTTP ones)
                 // actually sees the content, not just a local path.
@@ -1576,6 +1601,9 @@ export async function startStudioServer(
           const body = await readBody(req);
           userText = (body.content as string) ?? '';
           focusFrameId = (body.focus_frame_id as string) ?? '';
+          albumPageIndex = parseOptionalNonNegativeInt(body.album_page_index);
+          albumPageCount = parseOptionalPositiveInt(body.album_page_count);
+          albumPageSummary = typeof body.album_page_summary === 'string' ? body.album_page_summary : '';
         }
 
         if (!userText && attachments.length === 0) {
@@ -1637,15 +1665,26 @@ export async function startStudioServer(
         }
         // Pi resolves the model from its global ~/.pi/agent/settings.json.
         const agentModel = undefined;
+        const albumPageFocus = !focusFrameId
+          ? resolveAlbumPageFocusFromRequest({
+              userText,
+              selectedIndex: albumPageIndex,
+              pageCount: albumPageCount,
+              selectedSummary: albumPageSummary,
+            })
+          : undefined;
 
         // Append user message to history (with attachment summary)
         const attachmentSummary = attachments.length > 0
           ? `\n\n📎 ${attachments.length} attachment(s): ${attachments.map((a) => a.filename).join(', ')}`
           : '';
+        const albumPageFocusSummary = albumPageFocus
+          ? `\n\n🎯 focus: album page ${albumPageFocus.index + 1}/${albumPageFocus.pageCount ?? '?'} · source=${albumPageFocus.source ?? 'selected_page'}${albumPageFocus.label ? ` · ${albumPageFocus.label}` : ''}${albumPageFocus.conflictWithSelected && albumPageFocus.selectedIndex !== undefined ? ` · overrides selected page ${albumPageFocus.selectedIndex + 1}` : ''}${albumPageFocus.summary ? ` · ${albumPageFocus.summary}` : ''}`
+          : '';
         const history = await loadMessages(ctx, id);
         const userMessage: ChatMessage = {
           role: 'user',
-          content: userText + attachmentSummary,
+          content: userText + attachmentSummary + albumPageFocusSummary,
           ts: Date.now(),
         };
         const selection = chatSelectionForMessage(history, userText, focusFrameId);
@@ -1711,6 +1750,7 @@ export async function startStudioServer(
           userText,
           attachments,
           focusFrameId: focusFrameId || undefined,
+          ...(albumPageFocus && { albumPageFocus }),
           hasGeneratedPreview,
           openingTopic,
         });
@@ -1801,6 +1841,46 @@ export async function startStudioServer(
           phaseInfo.phase === 'generate' &&
           !isAlbumGenerate &&
           Number(phaseInfo.inputs.collected?.frame_count ?? '1') > 1;
+        let handledStructuredAlbumPatch = false;
+        if (
+          !focusFrameId &&
+          isAlbumGenerate &&
+          hasGeneratedPreview &&
+          priorHtml
+        ) {
+          const patched = patchAlbumHtmlForSimpleRequest(priorHtml, {
+            userText,
+            targetPageIndex: albumPageFocus?.index,
+            imageUrl: firstImageAttachmentBrowserUrl(attachments),
+          });
+          if (patched) {
+            const validation = validateAlbumHtmlBeforePersist(priorHtml, patched.html);
+            if (validation.ok) {
+              sseWrite({
+                type: 'progress',
+                stage: 'structured_album_patch',
+                message: `已识别为相册小改动，正在直接更新第 ${patched.pageIndex + 1} 页...`,
+              });
+              await ctx.orchestrator.writePreviewHtmlRaw(id, hardenAlbumHtml(patched.html));
+              const refreshed = await ctx.projects.load(id);
+              refreshed.frames = [];
+              delete refreshed.contentGraphPath;
+              await ctx.projects.save(refreshed);
+              const msg = `✓ 已完成结构化修改：${patched.summary}。`;
+              assistantText += msg;
+              summaryLine = msg;
+              handledStructuredAlbumPatch = true;
+              sseWrite({ type: 'preview_ready', preview_url: `/preview/${id}` });
+              sseWrite({ type: 'text', chunk: `\n${msg}` });
+              sseWrite({ type: 'message_end', reason: 'ok' });
+            } else {
+              sseWrite({
+                type: 'warning',
+                message: `结构化相册修改未通过校验（${validation.reasons.join('; ')}），将回退到 AI 重写链路。`,
+              });
+            }
+          }
+        }
 
         // Post-generation iteration: the card-driven sub-flow resolved to a
         // concrete change. Re-use the existing storyboard rather than guessing.
@@ -1842,7 +1922,9 @@ export async function startStudioServer(
           };
         }
 
-        if (isMultiGenerate || rewriteInputs) {
+        if (handledStructuredAlbumPatch) {
+          // Handled by deterministic HTML patch above; skip the Pi rewrite path.
+        } else if (isMultiGenerate || rewriteInputs) {
           if (rewriteInputs) {
             const n = (project.frames ?? []).length || Number(phaseInfo.inputs.collected?.frame_count ?? '3');
             const notice = restyleOnly
@@ -1919,9 +2001,12 @@ export async function startStudioServer(
             },
             ...(htmlPhases.has(phaseInfo.phase) && {
               validateOutput: (output: string) => (
-                extractHtmlDocument(output) || extractContentGraphAndFrames(output)
-                  ? null
-                  : 'Agent response did not contain valid HTML'
+                (() => {
+                  const html = extractHtmlDocument(output);
+                  if (!html && !extractContentGraphAndFrames(output)) return 'Agent response did not contain valid HTML';
+                  if (isAlbumGenerate && html) return firstAlbumPersistValidationReason(hasGeneratedPreview ? priorHtml : '', html);
+                  return null;
+                })()
               ),
               invalidOutputCode: 'invalid_html',
             }),
@@ -1965,6 +2050,7 @@ export async function startStudioServer(
               sum.subheads.length ? `Subheads:\n${sum.subheads.slice(0, 4).map((s) => `  · ${s}`).join('\n')}` : '',
               sum.bgColors.length ? `Palette: ${sum.bgColors.join(' / ')}` : '',
               sum.fontFamilies.length ? `Fonts: ${sum.fontFamilies.join(', ')}` : '',
+              ...(isAlbumGenerate ? albumEditableImageSlotPromptInstructions(userText) : []),
               ``,
               `Begin reply with \`\`\`html. Tag visible text with data-hv-text. No prose outside the block.`,
             ].filter(Boolean).join('\n');
@@ -1981,9 +2067,12 @@ export async function startStudioServer(
                 retry_reason: 'empty_response',
                 focused_frame: focusFrameId || null,
               },
-              validateOutput: (output) => (
-                extractHtmlDocument(output) ? null : 'Agent retry did not contain valid HTML'
-              ),
+              validateOutput: (output) => {
+                const html = extractHtmlDocument(output);
+                if (!html) return 'Agent retry did not contain valid HTML';
+                if (isAlbumGenerate) return firstAlbumPersistValidationReason(hasGeneratedPreview ? priorHtml : '', html);
+                return null;
+              },
               invalidOutputCode: 'invalid_html',
               onSucceeded: (handle, output) => {
                 successfulMainLog = handle;
@@ -2046,6 +2135,7 @@ export async function startStudioServer(
                   'Output exactly ONE fenced ```html block containing a complete <!doctype html> document. No prose outside the block.',
                   'Keep the album as an interactive scroll-snap electronic album with page dots/counter/controls and data-hv-text attributes.',
                   'Apply the user request literally. If they asked to add a page, add it. If they provided a CTA URL, wire the button/link to it. If they uploaded images, use their Browser URL in <img src="...">.',
+                  ...albumEditableImageSlotPromptInstructions(userText),
                   'Keep visible text in the user language.',
                   '',
                   `User request: ${userText.slice(0, 1000)}`,
@@ -2070,9 +2160,11 @@ export async function startStudioServer(
                     retry_reason: 'missing_html',
                     attachment_count: attachments.length,
                   },
-                  validateOutput: (output) => (
-                    extractHtmlDocument(output) ? null : 'Album retry did not contain a complete HTML document'
-                  ),
+                  validateOutput: (output) => {
+                    const html = extractHtmlDocument(output);
+                    if (!html) return 'Album retry did not contain a complete HTML document';
+                    return firstAlbumPersistValidationReason(hasGeneratedPreview ? priorHtml : '', html);
+                  },
                   invalidOutputCode: 'invalid_html',
                   onSucceeded: (handle, output) => {
                     successfulMainLog = handle;
@@ -2091,6 +2183,69 @@ export async function startStudioServer(
                 extracted = extractHtmlDocument(assistantText);
                 process.stderr.write(`[studio:msg] proj=${id} album retry done text=${retryText.length}B extracted=${!!extracted}\n`);
               }
+              if (isAlbumGenerate && extracted) {
+                const persistValidation = validateAlbumHtmlBeforePersist(hasGeneratedPreview ? priorHtml : '', extracted);
+                if (!persistValidation.ok) {
+                  sseWrite({
+                    type: 'warning',
+                    message: `AI returned album HTML that failed Studio validation (${persistValidation.reasons.join('; ')}); retrying once.`,
+                  });
+                  const repairPrompt = buildAlbumPersistValidationRepairPrompt({
+                    userText,
+                    currentHtml: priorHtml || extracted,
+                    reasons: persistValidation.reasons,
+                    attachments,
+                  });
+                  const repairText = await callAgentSimple(agentDef, repairPrompt, projectDir, agentModel, {
+                    ctx,
+                    projectId: id,
+                    generationType: 'page_html',
+                    operationId,
+                    attempt: 3,
+                    requestPayload: {
+                      operation: 'album_persist_validation_repair',
+                      phase: phaseInfo.phase,
+                      retry_reason: 'album_persist_validation_failed',
+                      validation_reasons: persistValidation.reasons,
+                      attachment_count: attachments.length,
+                    },
+                    validateOutput: (output) => {
+                      const html = extractHtmlDocument(output);
+                      if (!html) return 'Album validation repair did not contain a complete HTML document';
+                      return firstAlbumPersistValidationReason(hasGeneratedPreview ? priorHtml : '', html);
+                    },
+                    invalidOutputCode: 'invalid_album_html',
+                    onSucceeded: (handle, output) => {
+                      successfulMainLog = handle;
+                      successfulMainOutput = output;
+                    },
+                    onEvent: (ev) => {
+                      if (ev.type === 'text') {
+                        textChunks += 1;
+                        sseWrite(ev);
+                      } else if (ev.type === 'error' || ev.type === 'message_end') {
+                        sseWrite(ev);
+                      }
+                    },
+                  });
+                  assistantText += repairText;
+                  const repaired = extractHtmlDocument(repairText);
+                  const repairViolation = repaired
+                    ? firstAlbumPersistValidationReason(hasGeneratedPreview ? priorHtml : '', repaired)
+                    : 'repair did not return a complete HTML document';
+                  if (repaired && !repairViolation) {
+                    extracted = repaired;
+                    process.stderr.write(`[studio:msg] proj=${id} album validation repair succeeded text=${repairText.length}B\n`);
+                  } else {
+                    const msg = `AI returned album HTML that failed Studio validation, so the preview was not changed. ${repairViolation ? `Last error: ${repairViolation}.` : ''}`;
+                    sseWrite({ type: 'warning', message: msg });
+                    assistantText += `\n\n⚠️ ${msg}`;
+                    summaryLine = msg;
+                    extracted = null;
+                    process.stderr.write(`[studio:msg] proj=${id} album validation repair failed: ${repairViolation}\n`);
+                  }
+                }
+              }
               if (extracted) {
                 sseWrite({ type: 'progress', stage: 'saving_preview', message: '模型已返回结果，正在保存预览…' });
                 await ctx.orchestrator.writePreviewHtmlRaw(id, isAlbumGenerate ? hardenAlbumHtml(extracted) : extracted);
@@ -2102,7 +2257,7 @@ export async function startStudioServer(
                 }
                 sseWrite({ type: 'preview_ready', preview_url: `/preview/${id}` });
                 summaryLine = '✓ updated the HTML preview';
-              } else if (isAlbumGenerate) {
+              } else if (isAlbumGenerate && !summaryLine) {
                 const msg = 'AI did not return a usable album HTML document, so the preview was not changed.';
                 sseWrite({ type: 'warning', message: msg });
                 assistantText += `\n\n⚠️ ${msg}`;
@@ -2339,7 +2494,8 @@ export async function startStudioServer(
       }
 
       // Asset direct serve (so iframe can load image_path etc)
-      // /asset?path=<absolute-path>  — must be inside .html-video/projects
+      // /asset?path=<absolute-path> — file mode serves .html-video/projects;
+      // PostgreSQL mode serves the disposable .html-video/tmp/work tree.
       if (url.pathname === '/asset' && m === 'GET') {
         const p = url.searchParams.get('path');
         if (!p) {
@@ -2347,11 +2503,11 @@ export async function startStudioServer(
           return res.end('missing ?path');
         }
         const safe = resolve(p);
-        const projectsRoot = resolve(ctx.projectRoot, '.html-video', 'projects');
+        const localWorkRoot = resolveLocalWorkRoot(ctx);
         const user = ctx.requestContexts.getRequiredUser();
         const allowedRoot = ctx.database?.mode === 'postgres'
-          ? resolve(projectsRoot, safeWorkDirectorySegment(user.userId, 'user'))
-          : projectsRoot;
+          ? resolve(localWorkRoot, safeWorkDirectorySegment(user.userId, 'user'))
+          : localWorkRoot;
         let allowed = isPathInside(allowedRoot, safe);
         if (!allowed && ctx.database?.mode === 'postgres') {
           const projects = await ctx.orchestrator.list();
@@ -2601,6 +2757,12 @@ function isPathInside(root: string, candidate: string): boolean {
   return rel === '' || (rel !== '..' && !rel.startsWith(`..${sep}`) && !isAbsolute(rel));
 }
 
+function resolveLocalWorkRoot(ctx: CliContext): string {
+  return ctx.database?.mode === 'postgres'
+    ? resolve(ctx.projectRoot, '.html-video', 'tmp', 'work')
+    : resolve(ctx.projectRoot, '.html-video', 'projects');
+}
+
 function headerValue(value: string | string[] | undefined): string {
   return Array.isArray(value) ? value[0] ?? '' : value ?? '';
 }
@@ -2657,6 +2819,17 @@ function contentDispositionForHtml(name: string): string {
     .replace(/[\\"]/g, '-')
     .trim();
   if (!asciiName || asciiName === '.html') asciiName = 'album.html';
+  return `attachment; filename="${asciiName}"; filename*=UTF-8''${encodeURIComponent(utf8Name)}`;
+}
+
+function contentDispositionForMp4(name: string): string {
+  const utf8Name = `${name}.mp4`;
+  let asciiName = utf8Name
+    .normalize('NFKD')
+    .replace(/[^\x20-\x7E]/g, '')
+    .replace(/[\\"]/g, '-')
+    .trim();
+  if (!asciiName || asciiName === '.mp4') asciiName = 'album.mp4';
   return `attachment; filename="${asciiName}"; filename*=UTF-8''${encodeURIComponent(utf8Name)}`;
 }
 
@@ -2916,13 +3089,22 @@ html.hv-album-thumb [data-hv-thumb-page] {
 }
 \`;
   (document.head || document.documentElement).appendChild(css);
-  apply();
-  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', apply, { once: true });
-  window.addEventListener('load', apply, { once: true });
-  requestAnimationFrame(apply);
-  setTimeout(apply, 80);
-  setTimeout(apply, 250);
-  setTimeout(apply, 800);
+  let done = false;
+  function tryApply() {
+    if (done) return;
+    const list = pages();
+    if (!list.length) return;
+    apply();
+    done = true;
+  }
+  tryApply();
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', tryApply, { once: true });
+  }
+  window.addEventListener('load', tryApply, { once: true });
+  requestAnimationFrame(tryApply);
+  // One late try for albums that mount pages via inline scripts — not a pulse train.
+  setTimeout(tryApply, 120);
 })();
 </script>`;
   if (html.includes('</head>')) return html.replace('</head>', `${snippet}\n</head>`);
@@ -3508,7 +3690,836 @@ function jsonObject(value: Record<string, unknown>): JsonObject {
   ))) as JsonObject;
 }
 
+function parseOptionalNonNegativeInt(value: unknown): number | undefined {
+  const n = Number(value);
+  if (!Number.isInteger(n) || n < 0) return undefined;
+  return n;
+}
+
+function parseOptionalPositiveInt(value: unknown): number | undefined {
+  const n = Number(value);
+  if (!Number.isInteger(n) || n <= 0) return undefined;
+  return n;
+}
+
+export interface ParsedAlbumPageTarget {
+  index: number;
+  label: string;
+  kind: 'numbered' | 'last' | 'cover' | 'current';
+}
+
+export function parseAlbumPageTargetFromUserText(
+  text: string,
+  pageCount?: number,
+  selectedIndex?: number,
+): ParsedAlbumPageTarget | null {
+  const raw = String(text || '');
+  const compact = raw.replace(/\s+/g, '');
+  const numbered = /(?:\u7b2c)([0-9０-９]{1,3}|[一二三四五六七八九十百两兩]{1,6})(?:\u9875|\u9801|p|page)/i.exec(compact)
+    || /\bpage\s*([0-9]{1,3})\b/i.exec(raw)
+    || /\bp\s*([0-9]{1,3})\b/i.exec(raw);
+  if (numbered?.[1]) {
+    const n = parsePageOrdinal(numbered[1]);
+    if (n && (!pageCount || n <= pageCount)) {
+      return { index: n - 1, label: `page ${n}`, kind: 'numbered' };
+    }
+  }
+  if (/(\u6700\u540e|\u6700\u5f8c|\u672b)(?:\u4e00)?(?:\u9875|\u9801)|last\s+page|final\s+page/i.test(compact)) {
+    if (pageCount && pageCount > 0) {
+      return { index: pageCount - 1, label: 'last page', kind: 'last' };
+    }
+  }
+  if (/(?:\u5c01\u9762)(?:\u9875|\u9801)?|cover\s+page/i.test(compact)) {
+    return { index: 0, label: 'cover page', kind: 'cover' };
+  }
+  if (/(?:\u8fd9|\u9019|\u5f53\u524d|\u7576\u524d|\u672c)(?:\u4e00)?(?:\u9875|\u9801)|current\s+page|this\s+page/i.test(compact)) {
+    if (selectedIndex !== undefined) {
+      return { index: selectedIndex, label: 'current selected page', kind: 'current' };
+    }
+  }
+  return null;
+}
+
+function parsePageOrdinal(value: string): number | null {
+  const normalized = value.replace(/[０-９]/g, (ch) => String(ch.charCodeAt(0) - 0xff10));
+  if (/^\d+$/.test(normalized)) {
+    const n = Number(normalized);
+    return Number.isInteger(n) && n > 0 ? n : null;
+  }
+  return parseChinesePositiveInteger(normalized);
+}
+
+function parseChinesePositiveInteger(value: string): number | null {
+  if (!value) return null;
+  const digits: Record<string, number> = {
+    '\u96f6': 0,
+    '\u4e00': 1,
+    '\u4e8c': 2,
+    '\u4e24': 2,
+    '\u5169': 2,
+    '\u4e09': 3,
+    '\u56db': 4,
+    '\u4e94': 5,
+    '\u516d': 6,
+    '\u4e03': 7,
+    '\u516b': 8,
+    '\u4e5d': 9,
+  };
+  if (!/[\u5341\u767e]/.test(value)) {
+    let out = '';
+    for (const ch of value) {
+      if (!(ch in digits)) return null;
+      out += String(digits[ch]);
+    }
+    const n = Number(out);
+    return Number.isInteger(n) && n > 0 ? n : null;
+  }
+  let total = 0;
+  let current = 0;
+  for (const ch of value) {
+    if (ch === '\u5341') {
+      total += (current || 1) * 10;
+      current = 0;
+    } else if (ch === '\u767e') {
+      total += (current || 1) * 100;
+      current = 0;
+    } else if (ch in digits) {
+      const digit = digits[ch];
+      if (digit === undefined) return null;
+      current = digit;
+    } else {
+      return null;
+    }
+  }
+  total += current;
+  return total > 0 ? total : null;
+}
+
+function resolveAlbumPageFocusFromRequest(args: {
+  userText: string;
+  selectedIndex?: number;
+  pageCount?: number;
+  selectedSummary?: string;
+}): AlbumPageFocus | undefined {
+  const selectedIndex = args.selectedIndex;
+  const parsed = parseAlbumPageTargetFromUserText(args.userText, args.pageCount, selectedIndex);
+  if (parsed) {
+    const conflictWithSelected = selectedIndex !== undefined && parsed.index !== selectedIndex;
+    return {
+      index: parsed.index,
+      pageCount: args.pageCount,
+      ...(args.selectedSummary && !conflictWithSelected ? { summary: args.selectedSummary } : {}),
+      source: 'user_text',
+      label: parsed.label,
+      ...(selectedIndex !== undefined && { selectedIndex }),
+      conflictWithSelected,
+    };
+  }
+  if (selectedIndex !== undefined) {
+    return {
+      index: selectedIndex,
+      pageCount: args.pageCount,
+      ...(args.selectedSummary && { summary: args.selectedSummary }),
+      source: 'selected_page',
+      label: 'selected page',
+    };
+  }
+  return undefined;
+}
+
+interface AlbumHtmlElementRange {
+  tagName: string;
+  openStart: number;
+  openEnd: number;
+  closeStart: number;
+  closeEnd: number;
+}
+
+export interface AlbumImageSlotPatchResult {
+  html: string;
+  key: string;
+  pageIndex: number;
+  pageCount: number;
+}
+
+export interface AlbumStructuredPatchResult {
+  html: string;
+  action: 'append_page_with_image' | 'add_image_slot' | 'text' | 'cta' | 'image_size' | 'layout';
+  pageIndex: number;
+  pageCount: number;
+  key?: string;
+  summary: string;
+}
+
+export function patchAlbumHtmlForSimpleRequest(
+  html: string,
+  args: { userText: string; targetPageIndex?: number; imageUrl?: string } = { userText: '' },
+): AlbumStructuredPatchResult | null {
+  if (!html || !looksLikeAlbumHtml(html)) return null;
+  if (args.imageUrl && isAlbumAppendPageWithUploadedImageRequest(args.userText)) {
+    return patchAlbumHtmlAppendPageWithImage(html, {
+      userText: args.userText,
+      imageUrl: args.imageUrl,
+    });
+  }
+  const pageIndex = args.targetPageIndex;
+  if (pageIndex === undefined) return null;
+  const pages = findAlbumPageElementRanges(html);
+  if (!pages.length || pageIndex < 0 || pageIndex >= pages.length) return null;
+
+  if (isAlbumEditableImageSlotRequest(args.userText)) {
+    const patched = patchAlbumHtmlAddImageSlot(html, { targetPageIndex: pageIndex });
+    if (!patched) return null;
+    return {
+      ...patched,
+      action: 'add_image_slot',
+      summary: `added editable image slot ${patched.key} on page ${patched.pageIndex + 1}`,
+    };
+  }
+
+  const ctaIntent = parseAlbumCtaPatchIntent(args.userText);
+  if (ctaIntent) return patchAlbumHtmlCta(html, pages, pageIndex, ctaIntent);
+
+  const imageSizeIntent = parseAlbumImageSizePatchIntent(args.userText);
+  if (imageSizeIntent) return patchAlbumHtmlImageSize(html, pages, pageIndex, imageSizeIntent);
+
+  const layoutIntent = parseAlbumLayoutPatchIntent(args.userText);
+  if (layoutIntent) return patchAlbumHtmlLayout(html, pages, pageIndex, layoutIntent);
+
+  const textIntent = parseAlbumTextPatchIntent(args.userText);
+  if (textIntent) return patchAlbumHtmlText(html, pages, pageIndex, textIntent);
+
+  return null;
+}
+
+export function patchAlbumHtmlAppendPageWithImage(
+  html: string,
+  args: { userText: string; imageUrl: string },
+): AlbumStructuredPatchResult | null {
+  if (!html || !looksLikeAlbumHtml(html)) return null;
+  const imageUrl = String(args.imageUrl || '').trim();
+  if (!imageUrl) return null;
+  if (!isAlbumAppendPageWithUploadedImageRequest(args.userText)) return null;
+
+  const pages = findAlbumPageElementRanges(html);
+  if (!pages.length) return null;
+  const pageIndex = pages.length;
+  const pageNumber = pageIndex + 1;
+  const keyPrefix = `page_${pageNumber}`;
+  const title = extractAlbumAppendPageTitle(args.userText)
+    || filenameTitleFromUrl(imageUrl)
+    || `Page ${pageNumber}`;
+  const lastPage = pages[pages.length - 1]!;
+  const lastOpenTag = html.slice(lastPage.openStart, lastPage.openEnd);
+  const pageTag = lastPage.tagName || 'section';
+  const classes = new Set((getAttrValue(lastOpenTag, 'class') || '').split(/\s+/).filter(Boolean));
+  classes.delete('active');
+  classes.delete('is-active');
+  classes.add('page');
+  classes.add('hv-appended-page');
+  const pageIndent = lineIndentBefore(html, lastPage.openStart);
+  const childIndent = pageIndent ? `${pageIndent}  ` : '  ';
+  const innerIndent = `${childIndent}  `;
+  const pageHtml = [
+    '',
+    `${pageIndent}<${pageTag} class="${escapeHtmlAttr(Array.from(classes).join(' '))}" data-album-page="${escapeHtmlAttr(keyPrefix)}" data-page="${escapeHtmlAttr(keyPrefix)}" data-page-title="${escapeHtmlAttr(title)}">`,
+    `${childIndent}<div class="hv-appended-page-inner" style="min-height:100%;display:flex;flex-direction:column;justify-content:center;gap:clamp(16px,4vh,34px);padding:clamp(24px,7vw,72px);box-sizing:border-box;">`,
+    `${innerIndent}<p data-hv-text="${escapeHtmlAttr(`${keyPrefix}.kicker`)}" style="margin:0;font:700 clamp(12px,2vw,18px)/1.2 system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;letter-spacing:.16em;text-transform:uppercase;color:var(--primary-color,#2563eb);">NEW PAGE</p>`,
+    `${innerIndent}<h1 data-hv-text="${escapeHtmlAttr(`${keyPrefix}.title`)}" style="margin:0;font:800 clamp(34px,8vw,86px)/.95 system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;letter-spacing:0;">${escapeHtmlText(title)}</h1>`,
+    `${innerIndent}<img data-hv-image="${escapeHtmlAttr(`${keyPrefix}.hero_image`)}" src="${escapeHtmlAttr(imageUrl)}" alt="${escapeHtmlAttr(title)}" style="width:100%;max-height:58vh;object-fit:cover;border-radius:clamp(14px,3vw,28px);box-shadow:0 24px 70px rgba(0,0,0,.28);display:block;" />`,
+    `${childIndent}</div>`,
+    `${pageIndent}</${pageTag}>`,
+  ].join('\n');
+
+  const inserted = `${html.slice(0, lastPage.closeEnd)}${pageHtml}${html.slice(lastPage.closeEnd)}`;
+  const patched = syncAlbumAppendPageChrome(inserted, pages.length, pages.length + 1);
+  return {
+    html: patched,
+    action: 'append_page_with_image',
+    pageIndex,
+    pageCount: pages.length + 1,
+    key: `${keyPrefix}.hero_image`,
+    summary: `appended page ${pageNumber} with uploaded image (${title})`,
+  };
+}
+
+export function patchAlbumHtmlAddImageSlot(
+  html: string,
+  args: { targetPageIndex?: number } = {},
+): AlbumImageSlotPatchResult | null {
+  if (!html || !looksLikeAlbumHtml(html)) return null;
+  if (args.targetPageIndex === undefined) return null;
+  const pages = findAlbumPageElementRanges(html);
+  if (!pages.length) return null;
+  const pageIndex = Math.floor(args.targetPageIndex);
+  if (!Number.isInteger(pageIndex) || pageIndex < 0 || pageIndex >= pages.length) return null;
+
+  const page = pages[pageIndex]!;
+  const key = nextAlbumImageSlotKey(html, pageIndex);
+  const indent = lineIndentBefore(html, page.closeStart);
+  const slotHtml = buildAlbumImageSlotHtml(key, indent ? `${indent}  ` : '  ');
+  const patched = `${html.slice(0, page.closeStart)}${slotHtml}\n${indent}${html.slice(page.closeStart)}`;
+  return {
+    html: patched,
+    key,
+    pageIndex,
+    pageCount: pages.length,
+  };
+}
+
+function syncAlbumAppendPageChrome(html: string, oldPageCount: number, newPageCount: number): string {
+  let out = updateAlbumStaticPageTotals(html, oldPageCount, newPageCount);
+  out = updateAlbumPageCountConstants(out, oldPageCount, newPageCount);
+  out = appendAlbumStaticDots(out, oldPageCount, newPageCount);
+  return out;
+}
+
+function updateAlbumStaticPageTotals(html: string, oldPageCount: number, newPageCount: number): string {
+  return html.replace(/(\b\d{1,3}\s*[\/／]\s*)(\d{1,3})(?=\b)/g, (match, prefix: string, total: string) => {
+    if (Number(total) !== oldPageCount) return match;
+    return `${prefix}${formatAlbumCountLike(total, newPageCount)}`;
+  });
+}
+
+function updateAlbumPageCountConstants(html: string, oldPageCount: number, newPageCount: number): string {
+  const names = '(?:totalPages|pageCount|totalPageCount|totalSlides|slideCount|slidesCount|pagesCount)';
+  const assignment = new RegExp(`(\\b${names}\\b\\s*=\\s*)(["']?)${oldPageCount}\\2(?=\\s*[;,\\n])`, 'g');
+  const property = new RegExp(`(\\b${names}\\b\\s*:\\s*)(["']?)${oldPageCount}\\2(?=\\s*[,}\\n])`, 'g');
+  return html
+    .replace(assignment, (_match, prefix: string, quote: string) => `${prefix}${quote}${newPageCount}${quote}`)
+    .replace(property, (_match, prefix: string, quote: string) => `${prefix}${quote}${newPageCount}${quote}`)
+    .replace(
+      /\bdata-(?:total-pages|page-count|total-count)\s*=\s*(["'])(\d{1,3})\1/gi,
+      (match, quote: string, total: string) =>
+        Number(total) === oldPageCount ? match.replace(total, String(newPageCount)) : match,
+    );
+}
+
+function appendAlbumStaticDots(html: string, oldPageCount: number, newPageCount: number): string {
+  const containers = findElementRangesByOpeningTag(
+    html,
+    /<([a-z][\w:-]*)(?=[\s>])(?=[^>]*(?:\bid\s*=\s*["'][^"']*(?:dots|Dots|pageDots|dotsWrap|mobileDots)[^"']*["']|\bclass\s*=\s*["'][^"']*(?:\bdots\b|\bpage-dots\b|\bpagination-dots\b|\bcarousel-dots\b)[^"']*["']))[^>]*>/gi,
+  );
+  if (!containers.length) return html;
+  let out = html;
+  for (const container of [...containers].reverse()) {
+    const dotRanges = findElementRangesByOpeningTag(
+      out,
+      /<([a-z][\w:-]*)(?=[\s>])(?=[^>]*(?:\bclass\s*=\s*["'][^"']*\bdot\b[^"']*["']|\bdata-(?:dot|page-dot|album-dot)\b))[^>]*>/gi,
+    ).filter((range) => range.openStart >= container.openEnd && range.closeEnd <= container.closeStart);
+    if (dotRanges.length !== oldPageCount) continue;
+    const lastDot = dotRanges[dotRanges.length - 1]!;
+    const dotHtml = out.slice(lastDot.openStart, lastDot.closeEnd);
+    const indent = lineIndentBefore(out, lastDot.openStart);
+    const newDotHtml = cloneAlbumDotHtml(dotHtml, newPageCount - 1, newPageCount);
+    out = `${out.slice(0, container.closeStart)}\n${indent}${newDotHtml}${out.slice(container.closeStart)}`;
+  }
+  return out;
+}
+
+function cloneAlbumDotHtml(dotHtml: string, zeroBasedIndex: number, pageNumber: number): string {
+  let out = dotHtml;
+  const oldOpen = /^<[^>]+>/.exec(out)?.[0] ?? '';
+  if (oldOpen) {
+    let open = oldOpen;
+    const cls = getAttrValue(open, 'class');
+    if (cls) {
+      const classes = cls.split(/\s+/).filter((item) => item && !/^(?:active|current|is-active|selected)$/i.test(item));
+      open = setAttrValue(open, 'class', classes.join(' '));
+    }
+    if (/\baria-current\s*=/.test(open)) open = setAttrValue(open, 'aria-current', 'false');
+    if (/\baria-label\s*=/.test(open)) open = setAttrValue(open, 'aria-label', `Go to page ${pageNumber}`);
+    for (const attr of ['data-index', 'data-page-index', 'data-slide-index']) {
+      if (new RegExp(`\\b${escapeRegExp(attr)}\\s*=`).test(open)) {
+        open = setAttrValue(open, attr, String(zeroBasedIndex));
+      }
+    }
+    for (const attr of ['data-page', 'data-slide']) {
+      if (new RegExp(`\\b${escapeRegExp(attr)}\\s*=`).test(open)) {
+        open = setAttrValue(open, attr, String(pageNumber));
+      }
+    }
+    open = open.replace(/\bonclick\s*=\s*(["'])(.*?)\1/i, (match, quote: string, value: string) => {
+      const nextValue = value.replace(/\b\d{1,3}\b/g, (num) => {
+        const n = Number(num);
+        if (n === pageNumber - 1 || n === pageNumber - 2) return String(pageNumber - 1);
+        if (n === pageNumber || n === pageNumber - 1) return String(pageNumber);
+        return num;
+      });
+      return `onclick=${quote}${escapeHtmlAttr(nextValue)}${quote}`;
+    });
+    out = `${open}${out.slice(oldOpen.length)}`;
+  }
+  out = out.replace(/>\s*\d{1,3}\s*</, `>${pageNumber}<`);
+  return out;
+}
+
+function formatAlbumCountLike(sample: string, value: number): string {
+  return sample.length > 1 && /^0/.test(sample)
+    ? String(value).padStart(sample.length, '0')
+    : String(value);
+}
+
+function patchAlbumHtmlText(
+  html: string,
+  pages: AlbumHtmlElementRange[],
+  pageIndex: number,
+  intent: AlbumTextPatchIntent,
+): AlbumStructuredPatchResult | null {
+  const page = pages[pageIndex]!;
+  const candidates = findElementRangesByOpeningTag(
+    html,
+    /<([a-z][\w:-]*)(?=[\s>])(?=[^>]*\bdata-hv-text\s*=)[^>]*>/gi,
+  ).filter((range) => range.openStart >= page.openEnd && range.closeEnd <= page.closeStart);
+  if (!candidates.length) return null;
+  const target = pickAlbumTextTarget(html, candidates, intent);
+  if (!target) return null;
+  const key = getAttrValue(html.slice(target.openStart, target.openEnd), 'data-hv-text') || '';
+  const patched = `${html.slice(0, target.openEnd)}${escapeHtmlText(intent.value)}${html.slice(target.closeStart)}`;
+  return {
+    html: patched,
+    action: 'text',
+    pageIndex,
+    pageCount: pages.length,
+    key,
+    summary: `updated text ${key || 'field'} on page ${pageIndex + 1}`,
+  };
+}
+
+function patchAlbumHtmlCta(
+  html: string,
+  pages: AlbumHtmlElementRange[],
+  pageIndex: number,
+  intent: AlbumCtaPatchIntent,
+): AlbumStructuredPatchResult | null {
+  const page = pages[pageIndex]!;
+  const existing = findElementRangesByOpeningTag(
+    html,
+    /<([a-z][\w:-]*)(?=[\s>])(?=[^>]*\bdata-hv-cta\s*=)[^>]*>/gi,
+  ).find((range) => range.openStart >= page.openEnd && range.closeEnd <= page.closeStart);
+  const key = existing
+    ? getAttrValue(html.slice(existing.openStart, existing.openEnd), 'data-hv-cta') || `page_${pageIndex + 1}.cta`
+    : nextAlbumCtaKey(html, pageIndex);
+  const ctaHtml = buildAlbumCtaHtml(key, intent.label, intent.href, existing ? lineIndentBefore(html, existing.openStart) : pageChildIndent(html, page));
+  const patched = existing
+    ? `${html.slice(0, existing.openStart)}${ctaHtml}${html.slice(existing.closeEnd)}`
+    : `${html.slice(0, page.closeStart)}\n${ctaHtml}\n${lineIndentBefore(html, page.closeStart)}${html.slice(page.closeStart)}`;
+  return {
+    html: patched,
+    action: 'cta',
+    pageIndex,
+    pageCount: pages.length,
+    key,
+    summary: `${existing ? 'updated' : 'added'} CTA ${key} on page ${pageIndex + 1}`,
+  };
+}
+
+function patchAlbumHtmlImageSize(
+  html: string,
+  pages: AlbumHtmlElementRange[],
+  pageIndex: number,
+  intent: AlbumImageSizePatchIntent,
+): AlbumStructuredPatchResult | null {
+  const page = pages[pageIndex]!;
+  const target = findOpeningTagsByAttribute(html, 'data-hv-image', page).find((tag) =>
+    !/\bhv-editable-image-slot\b/.test(getAttrValue(tag.text, 'class') || ''));
+  if (!target) return null;
+  const key = getAttrValue(target.text, 'data-hv-image') || '';
+  const style = intent.direction === 'larger'
+    ? 'width:100%;max-width:100%;min-height:clamp(220px,42vh,520px);transform:scale(1.08);transform-origin:center;'
+    : 'width:82%;max-width:82%;min-height:clamp(120px,24vh,280px);transform:scale(.92);transform-origin:center;';
+  const className = intent.direction === 'larger' ? 'hv-image-larger' : 'hv-image-smaller';
+  const openTag = addClassToTag(mergeStyleIntoTag(target.text, style), className);
+  return {
+    html: `${html.slice(0, target.start)}${openTag}${html.slice(target.end)}`,
+    action: 'image_size',
+    pageIndex,
+    pageCount: pages.length,
+    key,
+    summary: `made image ${key || 'field'} ${intent.direction} on page ${pageIndex + 1}`,
+  };
+}
+
+function patchAlbumHtmlLayout(
+  html: string,
+  pages: AlbumHtmlElementRange[],
+  pageIndex: number,
+  intent: AlbumLayoutPatchIntent,
+): AlbumStructuredPatchResult | null {
+  const page = pages[pageIndex]!;
+  const openTag = html.slice(page.openStart, page.openEnd);
+  const style = intent.variant === 'horizontal'
+    ? 'display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);align-items:center;gap:clamp(16px,4vw,48px);'
+    : 'display:flex;flex-direction:column;justify-content:center;gap:clamp(14px,4vh,32px);';
+  const className = intent.variant === 'horizontal' ? 'hv-layout-horizontal' : 'hv-layout-vertical';
+  const patchedOpen = addClassToTag(mergeStyleIntoTag(openTag, style), className);
+  return {
+    html: `${html.slice(0, page.openStart)}${patchedOpen}${html.slice(page.openEnd)}`,
+    action: 'layout',
+    pageIndex,
+    pageCount: pages.length,
+    summary: `changed page ${pageIndex + 1} layout to ${intent.variant}`,
+  };
+}
+
+interface AlbumTextPatchIntent {
+  fieldHint?: string;
+  key?: string;
+  value: string;
+}
+
+interface AlbumCtaPatchIntent {
+  label: string;
+  href?: string;
+}
+
+interface AlbumImageSizePatchIntent {
+  direction: 'larger' | 'smaller';
+}
+
+interface AlbumLayoutPatchIntent {
+  variant: 'horizontal' | 'vertical';
+}
+
+function parseAlbumTextPatchIntent(text: string): AlbumTextPatchIntent | null {
+  const raw = String(text || '').trim();
+  if (!raw) return null;
+  if (/(?:\bcta\b|按钮|按鈕|链接|連結|link|button|图片|照片|圖|图|布局|排版|上传|上傳|占位)/i.test(raw)) return null;
+  const explicit = /(?:data-hv-text|字段|field|key)\s*["'“”]?([A-Za-z0-9_.:-]{2,80})["'“”]?.{0,24}(?:改成|改为|改為|换成|換成|设为|設為|=|:|：)\s*["'“”]?([^"'“”\n。；;]{1,120})/i.exec(raw);
+  if (explicit?.[1] && explicit[2]) {
+    return { key: explicit[1], value: cleanupPatchValue(explicit[2]) };
+  }
+  const hinted = /(?:把|将|將)?\s*(标题|標題|主标题|主標題|副标题|副標題|正文|文案|描述|说明|說明|slogan|口号|口號|headline|title|subtitle|body|desc(?:ription)?)\s*(?:文案|文字|内容|內容)?\s*(?:改成|改为|改為|换成|換成|设为|設為)\s*["'“”]?([^"'“”\n。；;]{1,120})/i.exec(raw);
+  if (hinted?.[2]) {
+    return { fieldHint: hinted[1], value: cleanupPatchValue(hinted[2]) };
+  }
+  return null;
+}
+
+function parseAlbumCtaPatchIntent(text: string): AlbumCtaPatchIntent | null {
+  const raw = String(text || '').trim();
+  if (!/(?:\bcta\b|行动引导|行動引導|按钮|按鈕|button|链接|連結|link)/i.test(raw)) return null;
+  const href = extractFirstUrlOrHref(raw);
+  const labelPatterns = [
+    /(?:\bcta\b|行动引导|行動引導|按钮|按鈕|button|链接|連結|link).{0,18}(?:改成|改为|改為|换成|換成|设为|設為|叫|文案为|文案為)\s*["'“”]?([^"'“”\n。；;，,]{1,60})/i,
+    /(?:新增|添加|加(?:一个|一個)?|插入).{0,12}(?:\bcta\b|行动引导|行動引導|按钮|按鈕|button)\s*["'“”]?([^"'“”\n。；;，,]{1,60})/i,
+  ];
+  let label = '';
+  for (const pattern of labelPatterns) {
+    const match = pattern.exec(raw);
+    if (match?.[1]) {
+      label = cleanupPatchValue(match[1].replace(/(?:链接|連結|link|href)\s*[:：]?.*$/i, ''));
+      break;
+    }
+  }
+  if (!label) {
+    const common = /(立即咨询|立即諮詢|联系我们|聯絡我們|预约|預約|马上购买|立即购买|了解更多|查看更多|Contact us|Learn more|Buy now)/i.exec(raw);
+    label = common?.[1] ? cleanupPatchValue(common[1]) : '';
+  }
+  if (!label && href) label = '了解更多';
+  if (!label) return null;
+  return href ? { label, href } : { label };
+}
+
+function parseAlbumImageSizePatchIntent(text: string): AlbumImageSizePatchIntent | null {
+  const raw = String(text || '');
+  if (isAlbumEditableImageSlotRequest(raw)) return null;
+  if (/(?:图片|照片|图|圖|image|photo|picture).{0,14}(?:大一点|大一點|更大|放大|占比大|宽一点|寬一點|larger|bigger|enlarge)|(?:大一点|大一點|更大|放大).{0,10}(?:图片|照片|图|圖|image|photo|picture)/i.test(raw)) {
+    return { direction: 'larger' };
+  }
+  if (/(?:图片|照片|图|圖|image|photo|picture).{0,14}(?:小一点|小一點|更小|缩小|縮小|smaller|shrink)|(?:小一点|小一點|更小|缩小|縮小).{0,10}(?:图片|照片|图|圖|image|photo|picture)/i.test(raw)) {
+    return { direction: 'smaller' };
+  }
+  return null;
+}
+
+function parseAlbumLayoutPatchIntent(text: string): AlbumLayoutPatchIntent | null {
+  const raw = String(text || '');
+  if (/(?:左右排版|左右布局|左右排列|左图右文|左圖右文|右图左文|右圖左文|两列|兩列|双列|雙列|horizontal|two\s*columns?)/i.test(raw)) {
+    return { variant: 'horizontal' };
+  }
+  if (/(?:上下排版|上下布局|上下排列|上图下文|上圖下文|下图上文|下圖上文|纵向排列|縱向排列|vertical|stacked)/i.test(raw)) {
+    return { variant: 'vertical' };
+  }
+  return null;
+}
+
+function findAlbumPageElementRanges(html: string): AlbumHtmlElementRange[] {
+  const marked = normalizeAlbumPageRanges(findElementRangesByOpeningTag(
+    html,
+    /<([a-z][\w:-]*)(?=[\s>])(?=[^>]*\bdata-(?:album-page|page)\s*=)[^>]*>/gi,
+  ));
+  if (marked.length > 0) return marked;
+  return normalizeAlbumPageRanges(findElementRangesByOpeningTag(
+    html,
+    /<([a-z][\w:-]*)(?=[\s>])(?=[^>]*\bclass\s*=\s*["'][^"']*(?:\balbum-page\b|\bpage\b)[^"']*["'])[^>]*>/gi,
+  ));
+}
+
+interface AlbumHtmlOpeningTag {
+  tagName: string;
+  start: number;
+  end: number;
+  text: string;
+}
+
+function findOpeningTagsByAttribute(
+  html: string,
+  attrName: string,
+  within?: AlbumHtmlElementRange,
+): AlbumHtmlOpeningTag[] {
+  const safeAttr = escapeRegExp(attrName);
+  const re = new RegExp(`<([a-z][\\w:-]*)(?=[\\s>])(?=[^>]*\\b${safeAttr}\\s*=)[^>]*>`, 'gi');
+  const out: AlbumHtmlOpeningTag[] = [];
+  let match: RegExpExecArray | null;
+  while ((match = re.exec(html)) !== null) {
+    if (within && (match.index < within.openEnd || re.lastIndex > within.closeStart)) continue;
+    out.push({
+      tagName: String(match[1] || '').toLowerCase(),
+      start: match.index,
+      end: re.lastIndex,
+      text: match[0],
+    });
+  }
+  return out;
+}
+
+function findElementRangesByOpeningTag(html: string, openRe: RegExp): AlbumHtmlElementRange[] {
+  const ranges: AlbumHtmlElementRange[] = [];
+  const seen = new Set<number>();
+  let match: RegExpExecArray | null;
+  while ((match = openRe.exec(html)) !== null) {
+    if (seen.has(match.index)) continue;
+    seen.add(match.index);
+    const openTag = match[0];
+    const tagName = String(match[1] || '').toLowerCase();
+    if (!tagName || isVoidHtmlTag(tagName) || /\/\s*>$/.test(openTag)) continue;
+    const close = findMatchingElementClose(html, tagName, match.index);
+    if (!close) continue;
+    ranges.push({
+      tagName,
+      openStart: match.index,
+      openEnd: openRe.lastIndex,
+      closeStart: close.start,
+      closeEnd: close.end,
+    });
+  }
+  return ranges;
+}
+
+function normalizeAlbumPageRanges(ranges: AlbumHtmlElementRange[]): AlbumHtmlElementRange[] {
+  const unique = [...new Map(ranges.map((range) => [range.openStart, range])).values()]
+    .sort((a, b) => a.openStart - b.openStart);
+  return unique.filter((range) => !unique.some((other) =>
+    other !== range &&
+    other.openStart < range.openStart &&
+    other.closeEnd > range.closeEnd));
+}
+
+function findMatchingElementClose(
+  html: string,
+  tagName: string,
+  openStart: number,
+): { start: number; end: number } | null {
+  const tagRe = new RegExp(`<\\/?${escapeRegExp(tagName)}\\b[^>]*>`, 'gi');
+  tagRe.lastIndex = openStart;
+  let depth = 0;
+  let match: RegExpExecArray | null;
+  while ((match = tagRe.exec(html)) !== null) {
+    const tag = match[0];
+    const isClosing = /^<\s*\//.test(tag);
+    const isSelfClosing = /\/\s*>$/.test(tag) || isVoidHtmlTag(tagName);
+    if (isClosing) {
+      depth -= 1;
+      if (depth === 0) return { start: match.index, end: tagRe.lastIndex };
+    } else if (!isSelfClosing) {
+      depth += 1;
+    }
+  }
+  return null;
+}
+
+function nextAlbumImageSlotKey(html: string, pageIndex: number): string {
+  const keys = collectHvAttributeKeys(html, 'image');
+  const base = `page_${pageIndex + 1}.bottom_image`;
+  if (!keys.has(base)) return base;
+  for (let i = 2; i < 100; i += 1) {
+    const candidate = `${base}_${i}`;
+    if (!keys.has(candidate)) return candidate;
+  }
+  return `${base}_${Date.now()}`;
+}
+
+function collectHvAttributeKeys(html: string, kind: 'text' | 'image' | 'cta'): Set<string> {
+  const keys = new Set<string>();
+  const re = new RegExp(`\\bdata-hv-${kind}\\s*=\\s*(["'])(.*?)\\1`, 'gi');
+  let match: RegExpExecArray | null;
+  while ((match = re.exec(html)) !== null) {
+    const key = String(match[2] || '').trim();
+    if (key) keys.add(key);
+  }
+  return keys;
+}
+
+function nextAlbumCtaKey(html: string, pageIndex: number): string {
+  const keys = collectHvAttributeKeys(html, 'cta');
+  const base = `page_${pageIndex + 1}.cta`;
+  if (!keys.has(base)) return base;
+  for (let i = 2; i < 100; i += 1) {
+    const candidate = `${base}_${i}`;
+    if (!keys.has(candidate)) return candidate;
+  }
+  return `${base}_${Date.now()}`;
+}
+
+function pickAlbumTextTarget(
+  html: string,
+  candidates: AlbumHtmlElementRange[],
+  intent: AlbumTextPatchIntent,
+): AlbumHtmlElementRange | null {
+  if (intent.key) {
+    const exact = candidates.find((range) =>
+      getAttrValue(html.slice(range.openStart, range.openEnd), 'data-hv-text') === intent.key);
+    if (exact) return exact;
+    return null;
+  }
+  const hint = String(intent.fieldHint || '').toLowerCase();
+  const ranked = candidates.map((range, index) => {
+    const openTag = html.slice(range.openStart, range.openEnd);
+    const key = (getAttrValue(openTag, 'data-hv-text') || '').toLowerCase();
+    let score = Math.max(0, 100 - index);
+    if (/(标题|標題|headline|title)/i.test(hint)) {
+      if (/(title|headline|brand|name|heading)/i.test(key)) score += 1000;
+      if (/^h[1-3]$/i.test(range.tagName)) score += 300;
+    } else if (/(副标题|副標題|subtitle|subhead)/i.test(hint)) {
+      if (/(subtitle|subhead|sub_title|tagline|slogan)/i.test(key)) score += 1000;
+    } else if (/(正文|文案|描述|说明|說明|body|desc)/i.test(hint)) {
+      if (/(body|desc|description|copy|text|intro|content)/i.test(key)) score += 1000;
+      if (/^p$/i.test(range.tagName)) score += 200;
+    } else if (/(slogan|口号|口號)/i.test(hint)) {
+      if (/(slogan|tagline|subtitle)/i.test(key)) score += 1000;
+    }
+    if (/(nav|menu|button|cta)/i.test(key)) score -= 500;
+    return { range, score };
+  }).sort((a, b) => b.score - a.score);
+  return ranked[0]?.range || null;
+}
+
+function buildAlbumCtaHtml(key: string, label: string, href: string | undefined, indent: string): string {
+  const safeHref = href || '#';
+  return `${indent}<a class="hv-cta-button" data-hv-cta="${escapeHtmlAttr(key)}" href="${escapeHtmlAttr(safeHref)}" target="_blank" rel="noopener" style="display:inline-flex;align-items:center;justify-content:center;margin-top:clamp(12px,3vh,28px);padding:.8em 1.25em;border-radius:999px;background:var(--primary-color,#2563eb);color:#fff;text-decoration:none;font-weight:700;">${escapeHtmlText(label)}</a>`;
+}
+
+function pageChildIndent(html: string, page: AlbumHtmlElementRange): string {
+  const closingIndent = lineIndentBefore(html, page.closeStart);
+  return closingIndent ? `${closingIndent}  ` : '  ';
+}
+
+function mergeStyleIntoTag(openTag: string, style: string): string {
+  const current = getAttrValue(openTag, 'style') || '';
+  return setAttrValue(openTag, 'style', mergeStyleText(current, style));
+}
+
+function mergeStyleText(current: string, additions: string): string {
+  const props = new Map<string, string>();
+  const add = (style: string) => {
+    for (const part of style.split(';')) {
+      const idx = part.indexOf(':');
+      if (idx <= 0) continue;
+      const name = part.slice(0, idx).trim().toLowerCase();
+      const value = part.slice(idx + 1).trim();
+      if (name && value) props.set(name, value);
+    }
+  };
+  add(current);
+  add(additions);
+  return Array.from(props.entries()).map(([name, value]) => `${name}:${value}`).join(';');
+}
+
+function addClassToTag(openTag: string, className: string): string {
+  const classes = new Set((getAttrValue(openTag, 'class') || '').split(/\s+/).filter(Boolean));
+  classes.add(className);
+  return setAttrValue(openTag, 'class', Array.from(classes).join(' '));
+}
+
+function getAttrValue(openTag: string, attrName: string): string | null {
+  const re = new RegExp(`\\b${escapeRegExp(attrName)}\\s*=\\s*(["'])(.*?)\\1`, 'i');
+  return re.exec(openTag)?.[2] ?? null;
+}
+
+function setAttrValue(openTag: string, attrName: string, value: string): string {
+  const escaped = escapeHtmlAttr(value);
+  const re = new RegExp(`(\\b${escapeRegExp(attrName)}\\s*=\\s*)(["'])(.*?)\\2`, 'i');
+  if (re.test(openTag)) {
+    return openTag.replace(re, `$1"${escaped}"`);
+  }
+  return openTag.replace(/\s*\/?>$/, (end) => ` ${attrName}="${escaped}"${end}`);
+}
+
+function extractFirstUrlOrHref(text: string): string | undefined {
+  const match = /\b(?:https?:\/\/[^\s"'“”<>]+|mailto:[^\s"'“”<>]+|tel:[^\s"'“”<>]+)/i.exec(text);
+  if (!match?.[0]) return undefined;
+  return match[0].replace(/[，,。；;]+$/, '');
+}
+
+function cleanupPatchValue(value: string): string {
+  return String(value || '')
+    .trim()
+    .replace(/^[：:，,\s]+/, '')
+    .replace(/[。；;，,]\s*$/, '')
+    .trim();
+}
+
+function buildAlbumImageSlotHtml(key: string, indent: string): string {
+  const textKey = `${key}_label`;
+  return [
+    '',
+    `${indent}<div class="hv-editable-image-slot" data-hv-image="${escapeHtmlAttr(key)}" style="margin-top:clamp(14px,4vh,32px);min-height:clamp(120px,24vh,260px);border:1.5px dashed rgba(148,163,184,.72);border-radius:18px;display:grid;place-items:center;background:rgba(148,163,184,.12);overflow:hidden;">`,
+    `${indent}  <span data-hv-text="${escapeHtmlAttr(textKey)}" style="font:600 16px/1.4 system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:rgba(148,163,184,.95);letter-spacing:0;">图片占位</span>`,
+    `${indent}</div>`,
+  ].join('\n');
+}
+
+function lineIndentBefore(text: string, index: number): string {
+  const lineStart = text.lastIndexOf('\n', Math.max(0, index - 1)) + 1;
+  const prefix = text.slice(lineStart, index);
+  return /^[ \t]*/.exec(prefix)?.[0] ?? '';
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function escapeHtmlAttr(value: string): string {
+  return String(value)
+    .replace(/&/g, '&amp;')
+    .replace(/"/g, '&quot;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+
+function escapeHtmlText(value: string): string {
+  return String(value)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+
+function isVoidHtmlTag(tagName: string): boolean {
+  return /^(?:area|base|br|col|embed|hr|img|input|link|meta|param|source|track|wbr)$/i.test(tagName);
+}
+
 // `Attachment` is declared above (at the buildHtmlGenerationPrompt section)
+
+interface AlbumPageFocus {
+  index: number;
+  pageCount?: number;
+  summary?: string;
+  source?: 'user_text' | 'selected_page';
+  label?: string;
+  selectedIndex?: number;
+  conflictWithSelected?: boolean;
+}
 
 interface BuildPromptArgs {
   tmpl: import('@html-video/core').TemplateMetadata | null;
@@ -3519,6 +4530,8 @@ interface BuildPromptArgs {
   attachments: Attachment[];
   /** When set, iterate-phase prompts target only this frame's HTML. */
   focusFrameId?: string;
+  /** When set, album iteration should treat this page as the primary edit target. */
+  albumPageFocus?: AlbumPageFocus;
   /** True when the project already has a real generated preview, not just a template seed. */
   hasGeneratedPreview?: boolean;
   /** The user's original opening subject, locked across phases. */
@@ -3539,8 +4552,10 @@ interface Attachment {
    * content — inlined directly into the prompt. A bare path is useless to HTTP
    * agents (Messages API runs in the cloud, can't read local disk), and even
    * for CLI agents the content should be the source material, not a file ref.
-   */
+  */
   inlineText?: string;
+  /** Browser-safe URL for generated HTML. Prefer the Studio proxy for uploads. */
+  browserUrl?: string;
 }
 
 /**
@@ -3605,8 +4620,8 @@ function normalizeAspectLabel(value?: string): string {
   const raw = String(value || '').trim();
   const ratio = /\b(16\s*[:：]\s*9|9\s*[:：]\s*16|1\s*[:：]\s*1|4\s*[:：]\s*5)\b/.exec(raw);
   if (ratio?.[1]) return ratio[1].replace(/\s/g, '').replace('：', ':');
-  if (/横屏|landscape|wide/i.test(raw)) return '16:9';
-  if (/竖屏|手机|portrait|vertical/i.test(raw)) return '9:16';
+  if (/电脑|desktop|\bpc\b|横屏|landscape|wide/i.test(raw)) return '16:9';
+  if (/手机|mobile|phone|竖屏|portrait|vertical/i.test(raw)) return '9:16';
   if (/方形|square/i.test(raw)) return '1:1';
   if (/小红书|xiaohongshu|rednote/i.test(raw)) return '4:5';
   return '16:9';
@@ -3632,10 +4647,10 @@ async function persistResolutionFromInputs(
   const current = proj.preferences?.resolution;
   const prevMeta = (proj.preferences as { generationMeta?: Record<string, unknown> } | undefined)?.generationMeta;
   const ratioLabel =
-    normalized === '9:16' ? '9:16 竖屏'
+    normalized === '9:16' ? '手机'
       : normalized === '1:1' ? '1:1 方形'
         : normalized === '4:5' ? '4:5 小红书'
-          : '16:9 横屏';
+          : '电脑';
   const nextMeta = prevMeta && typeof prevMeta === 'object'
     ? { ...prevMeta, ratio: ratioLabel }
     : prevMeta;
@@ -3681,7 +4696,7 @@ function parseConfiguredCreateRequest(text: string): PhaseInputs | undefined {
   };
   const pickedType = pickLine('(?:内容类型|类型)') || '电子相册';
   const pickedStyle = pickLine('风格');
-  const aspect = pickLine('(?:比例|画面尺寸|尺寸)');
+  const aspect = pickLine('(?:展示设备|比例|画面尺寸|尺寸)');
   const pageCount = /(?:页数\/帧数|页数|帧数)\s*[:：]\s*(\d{1,2})/.exec(text)?.[1];
   const topic =
     /主题和素材说明\s*[:：]\s*([\s\S]*?)\n\s*生成要求\s*[:：]/.exec(text)?.[1]?.trim()
@@ -4187,8 +5202,8 @@ export function parseFormatReply(text: string): Record<string, string> | undefin
   // --- aspect: explicit ratio (16:9 / 9:16 / 1:1 / 4:5) or a keyword ---
   const ratio = /\b(16\s*[:：]\s*9|9\s*[:：]\s*16|1\s*[:：]\s*1|4\s*[:：]\s*5)\b/.exec(t);
   const ratioNorm = ratio?.[1]?.replace(/\s/g, '').replace('：', ':');
-  if (ratioNorm === '16:9' || /横屏|landscape|宽屏/i.test(t)) out.aspect = '16:9 横屏';
-  else if (ratioNorm === '9:16' || /竖屏|手机|portrait|vertical/i.test(t)) out.aspect = '9:16 手机竖屏';
+  if (ratioNorm === '16:9' || /电脑|desktop|\bpc\b|横屏|landscape|宽屏/i.test(t)) out.aspect = '16:9 横屏';
+  else if (ratioNorm === '9:16' || /手机|竖屏|portrait|vertical/i.test(t)) out.aspect = '9:16 手机竖屏';
   else if (ratioNorm === '1:1' || /方形|square/i.test(t)) out.aspect = '1:1 方形';
   else if (ratioNorm === '4:5' || /小红书|xiaohongshu|rednote/i.test(t)) out.aspect = '4:5 小红书';
 
@@ -4243,11 +5258,27 @@ function renderAttachment(a: Attachment): string[] {
   }
   const rows = [`- [${a.kind}] ${a.filename} — ${a.path}`];
   if (a.path && (a.kind === 'image' || a.kind === 'video' || a.kind === 'audio')) {
-    const assetUrl = /^https?:\/\//i.test(a.path) ? a.path : `/asset?path=${encodeURIComponent(a.path)}`;
+    const assetUrl = attachmentBrowserUrl(a);
     rows.push(`  Browser URL for HTML src/href: ${assetUrl}`);
     rows.push(`  IMPORTANT: when embedding this asset in generated HTML, use the Browser URL above exactly. Do not use the local filesystem path and do not use only the filename.`);
   }
   return rows;
+}
+
+function projectAssetBrowserUrl(projectId: string, assetId: string): string {
+  return `/api/projects/${encodeURIComponent(projectId)}/assets/${encodeURIComponent(assetId)}/content`;
+}
+
+function attachmentBrowserUrl(a: Attachment): string {
+  if (a.browserUrl) return a.browserUrl;
+  if (!a.path) return '';
+  if (/^https?:\/\//i.test(a.path) || /^\/api\/projects\//i.test(a.path)) return a.path;
+  return `/asset?path=${encodeURIComponent(a.path)}`;
+}
+
+function firstImageAttachmentBrowserUrl(attachments: Attachment[]): string | undefined {
+  const image = attachments.find((a) => a.kind === 'image' && attachmentBrowserUrl(a));
+  return image ? attachmentBrowserUrl(image) : undefined;
 }
 
 /** A design.md / frame.md / DESIGN.md attachment is a brand + motion SPEC the
@@ -4335,8 +5366,247 @@ function isAlbumType(text: string): boolean {
   return /电子相册|相册|画册|照片集|photo\s*album|photobook|photo\s*book|album|gallery|scroll\s*story/i.test(text);
 }
 
+export function isAlbumEditableImageSlotRequest(text: string): boolean {
+  const raw = String(text || '');
+  const lower = raw.toLowerCase();
+  if (isUploadedImageReferenceWithoutSlotRequest(raw)) return false;
+  return (
+    /(上传|上傳).{0,16}(图片|照片|图像|图|image|photo)/i.test(raw) ||
+    /(图片|照片|图像|图).{0,16}(上传|上傳|替换|更换|换|改|占位|位置|地方|预留|預留|插入)/i.test(raw) ||
+    /(预留|預留|留|加|新增|添加|插入).{0,18}(图片|照片|图像|图).{0,18}(位置|地方|区域|區域|占位|槽位)?/i.test(raw) ||
+    /(图片|照片|图像|图).{0,8}(占位|槽位)/i.test(raw) ||
+    /(放图|放图片|放照片|换图片|换照片|替换图片|替换照片|更换图片|更换照片)/i.test(raw) ||
+    /\b(uploadable|changeable|replaceable|reserved)\s+(image|photo|picture)\b/i.test(lower) ||
+    /\b(image|photo|picture)\s+(slot|placeholder|area|place|space)\b/i.test(lower) ||
+    /\b(place|area|space)\s+to\s+(upload|change|replace)\s+(an?\s+)?(image|photo|picture)\b/i.test(lower)
+  );
+}
+
+function isUploadedImageReferenceWithoutSlotRequest(text: string): boolean {
+  const raw = String(text || '');
+  const lower = raw.toLowerCase();
+  const mentionsUploadedImage =
+    /(?:\u6211|\u672c\u6b21|\u5df2|\u521a|\u525b)?\s*(?:\u4e0a\u4f20|\u4e0a\u50b3)\s*(?:\u7684)?\s*(?:\u8fd9|\u9019|\u8fd9\u4e2a|\u9019\u500b|\u8fd9\u5f20|\u9019\u5f35|\u8fd9\u5f35|\u9019\u5f20|\u8be5|\u9019\u500b|\u8fd9\u4e2a)?\s*(?:\u56fe\u7247|\u5716\u7247|\u7167\u7247|\u56fe\u50cf|\u5716\u50cf|\u56fe|\u5716)/i.test(raw)
+    || /\b(?:uploaded|attached)\s+(?:image|photo|picture)\b/i.test(lower);
+  if (!mentionsUploadedImage) return false;
+  const asksForSlot =
+    /(?:\u4f4d\u7f6e|\u5730\u65b9|\u533a\u57df|\u5340\u57df|\u5360\u4f4d|\u69fd\u4f4d|\u9884\u7559|\u9810\u7559|\u53ef\u4ee5\u4e0a\u4f20|\u53ef\u4e0a\u4f20|\u7528\u6765\u4e0a\u4f20)/i.test(raw)
+    || /\b(?:slot|placeholder|uploadable|place|area|space)\b/i.test(lower);
+  return !asksForSlot;
+}
+
+function isAlbumAppendPageWithUploadedImageRequest(text: string): boolean {
+  const raw = String(text || '');
+  const lower = raw.toLowerCase();
+  const asksForNewPage =
+    /(?:\u65b0\u589e|\u6dfb\u52a0|\u52a0|\u63d2\u5165|\u8ffd\u52a0).{0,12}(?:\u4e00)?(?:\u9875|\u9801|\u9875\u9762|\u9801\u9762)/i.test(raw)
+    || /(?:add|append|insert|create)\s+(?:a\s+)?(?:new\s+)?page/i.test(lower);
+  if (!asksForNewPage) return false;
+  const mentionsEnd =
+    /(?:\u76f8\u518c)?(?:\u672b\u5c3e|\u6700\u540e|\u6700\u5f8c|\u7ed3\u5c3e|\u7d50\u5c3e|\u5c3e\u90e8|\u540e\u9762|\u5f8c\u9762)/i.test(raw)
+    || /\b(?:end|last|final|append)\b/i.test(lower);
+  const mentionsUploadedImage = isUploadedImageReferenceWithoutSlotRequest(raw)
+    || /(?:\u4e0a\u4f20|\u4e0a\u50b3).{0,12}(?:\u56fe\u7247|\u5716\u7247|\u7167\u7247|\u56fe|\u5716)/i.test(raw)
+    || /\b(?:uploaded|attached)\s+(?:image|photo|picture)\b/i.test(lower);
+  return mentionsUploadedImage && (mentionsEnd || /(?:\u65b0\u589e|\u6dfb\u52a0|\u52a0|\u63d2\u5165|\u8ffd\u52a0)/i.test(raw));
+}
+
+function extractAlbumAppendPageTitle(text: string): string {
+  const raw = String(text || '').trim();
+  const patterns = [
+    /(?:\u6807\u9898|\u6a19\u984c)\s*(?:\u662f|\u4e3a|\u70ba|\u53eb|\u5199\u6210|\u8bbe\u4e3a|\u8a2d\u70ba|:|：)?\s*["'\u201c\u201d\u2018\u2019]?([^"',，。；;\n]{1,80})/i,
+    /\btitle\s*(?:is|as|:)?\s*["']?([^"',.;\n]{1,80})/i,
+  ];
+  for (const pattern of patterns) {
+    const match = pattern.exec(raw);
+    if (match?.[1]) {
+      return cleanupPatchValue(match[1].replace(/(?:\u52a0\u4e0a|\u5e76|\u7136\u540e|\u7136\u5f8c|\u4f7f\u7528|\u7528)\s*.*$/i, ''));
+    }
+  }
+  return '';
+}
+
+function filenameTitleFromUrl(url: string): string {
+  try {
+    const parsed = new URL(url, 'http://studio.local');
+    const name = decodeURIComponent(parsed.pathname.split('/').filter(Boolean).pop() || '');
+    return cleanupPatchValue(name.replace(/\.[a-z0-9]{1,8}$/i, ''));
+  } catch {
+    return '';
+  }
+}
+
+function albumEditableImageSlotPromptInstructions(userText?: string): string[] {
+  const lines: string[] = [];
+  if (isAlbumEditableImageSlotRequest(userText || '')) {
+    lines.push(`USER INTENT NORMALIZATION: the user's wording appears to ask for a place where they can upload/change/insert an image. Interpret that as a Studio-editable image slot, not as an instruction to build an upload feature inside the album page.`);
+  }
+  lines.push(`Album editable image-slot contract: if the user asks for an uploadable image area, a place to upload/change/insert an image, an image slot, an image placeholder, or a reserved image area, create a normal visual placeholder tagged with data-hv-image, for example <div class="img-placeholder" data-hv-image="page_5.bottom_image"><span data-hv-text="page_5.bottom_image_label">...</span></div>.`);
+  lines.push(`Forbidden in album HTML: <input type="file">, drag/drop upload zones, FileReader scripts, upload/clear buttons, input.files handling, accept="image/..." file inputs, or any browser-native upload logic. Studio's right-side editor handles the actual upload.`);
+  return lines;
+}
+
+export function validateAlbumHtmlHasNoInPageUploadControls(html: string): string | null {
+  const checks: Array<[RegExp, string]> = [
+    [/<input\b[^>]*\btype\s*=\s*["']?file["']?[^>]*>/i, 'contains <input type="file">'],
+    [/\bFileReader\b/i, 'contains FileReader upload preview code'],
+    [/\b(?:input|event|e)\.files\b|\bfiles\s*\[\s*0\s*\]/i, 'contains browser File API handling'],
+    [/\baccept\s*=\s*["'][^"']*image\//i, 'contains an image file picker accept attribute'],
+    [/\baddEventListener\s*\(\s*["'](?:dragover|dragleave|drop)["']/i, 'contains drag/drop upload event handlers'],
+    [/\bon(?:dragover|dragleave|drop)\s*=/i, 'contains inline drag/drop upload handlers'],
+    [/\b(?:id|class)\s*=\s*["'][^"']*(?:upload-area|uploadArea|uploadInput|uploadPreview|uploadClear|drag-over)[^"']*["']/i, 'contains in-page upload UI elements'],
+    [/<button\b[^>]*(?:upload|clear|remove|delete)[^>]*>/i, 'contains upload/clear button logic'],
+  ];
+  for (const [pattern, reason] of checks) {
+    if (pattern.test(html)) return reason;
+  }
+  return null;
+}
+
+export interface AlbumHtmlPersistValidationResult {
+  ok: boolean;
+  reasons: string[];
+}
+
+function firstAlbumPersistValidationReason(oldHtml: string, newHtml: string): string | null {
+  const result = validateAlbumHtmlBeforePersist(oldHtml, newHtml);
+  return result.ok ? null : result.reasons.join('; ');
+}
+
+export function validateAlbumHtmlBeforePersist(oldHtml: string, newHtml: string): AlbumHtmlPersistValidationResult {
+  const reasons: string[] = [];
+  const uploadControlIssue = validateAlbumHtmlHasNoInPageUploadControls(newHtml);
+  if (uploadControlIssue) reasons.push(uploadControlIssue);
+  const localPathIssue = detectAlbumLocalFilePath(newHtml);
+  if (localPathIssue) reasons.push(localPathIssue);
+
+  const oldMetrics = collectAlbumHtmlEditMetrics(oldHtml);
+  const newMetrics = collectAlbumHtmlEditMetrics(newHtml);
+  if (oldMetrics.protectedImageRefs.size > 0) {
+    let missing = 0;
+    for (const ref of oldMetrics.protectedImageRefs) {
+      if (!newMetrics.protectedImageRefs.has(ref)) missing += 1;
+    }
+    if (missing > 0) {
+      const missingRatio = missing / oldMetrics.protectedImageRefs.size;
+      if (oldMetrics.protectedImageRefs.size <= 2 || (missing >= 2 && missingRatio > 0.25)) {
+        reasons.push(`lost uploaded image references (${missing}/${oldMetrics.protectedImageRefs.size} missing)`);
+      }
+    }
+  }
+  if (oldMetrics.pageMarkers > 0) {
+    if (newMetrics.pageMarkers === 0) {
+      reasons.push('lost all data-album-page/data-page markers');
+    } else {
+      const allowedLoss = Math.max(1, Math.floor(oldMetrics.pageMarkers * 0.25));
+      if (oldMetrics.pageMarkers - newMetrics.pageMarkers > allowedLoss) {
+        reasons.push(`page count dropped too much (${oldMetrics.pageMarkers} -> ${newMetrics.pageMarkers})`);
+      }
+    }
+  }
+
+  for (const kind of ['text', 'image', 'cta'] as const) {
+    const oldKeys = oldMetrics.hvKeys[kind];
+    if (oldKeys.size === 0) continue;
+    const newKeys = newMetrics.hvKeys[kind];
+    if (newKeys.size === 0) {
+      reasons.push(`lost all data-hv-${kind} keys (${oldKeys.size} -> 0)`);
+      continue;
+    }
+    let missing = 0;
+    for (const key of oldKeys) {
+      if (!newKeys.has(key)) missing += 1;
+    }
+    const missingRatio = missing / oldKeys.size;
+    if (missing >= 3 && missingRatio > 0.4) {
+      reasons.push(`lost too many data-hv-${kind} keys (${missing}/${oldKeys.size} missing)`);
+    }
+  }
+
+  return { ok: reasons.length === 0, reasons };
+}
+
+function collectAlbumHtmlEditMetrics(html: string): {
+  pageMarkers: number;
+  hvKeys: Record<'text' | 'image' | 'cta', Set<string>>;
+  protectedImageRefs: Set<string>;
+} {
+  const pageMarkers = Array.from(html.matchAll(/\bdata-(?:album-page|page)\s*=\s*["'][^"']*["']/gi)).length;
+  const hvKeys: Record<'text' | 'image' | 'cta', Set<string>> = {
+    text: new Set(),
+    image: new Set(),
+    cta: new Set(),
+  };
+  const re = /\bdata-hv-(text|image|cta)\s*=\s*["']([^"']+)["']/gi;
+  let match: RegExpExecArray | null;
+  while ((match = re.exec(html)) !== null) {
+    const kind = match[1]?.toLowerCase();
+    const key = (match[2] || '').trim();
+    if ((kind === 'text' || kind === 'image' || kind === 'cta') && key) {
+      hvKeys[kind].add(key);
+    }
+  }
+  return { pageMarkers, hvKeys, protectedImageRefs: collectProtectedAlbumImageRefs(html) };
+}
+
+function collectProtectedAlbumImageRefs(html: string): Set<string> {
+  const refs = new Set<string>();
+  const assetRe = /(?:https?:\/\/[^/"'()\s]+)?\/?api\/projects\/[^/"'#?()\s]+\/assets\/[^/"'#?()\s]+\/content/gi;
+  for (const match of html.matchAll(assetRe)) {
+    const raw = match[0] || '';
+    if (raw) refs.add(raw.replace(/^https?:\/\/[^/]+/i, '').replace(/^\/?/, '/'));
+  }
+  const dataRe = /data:image\/[a-z0-9.+-]+;base64,[a-z0-9+/=]+/gi;
+  for (const match of html.matchAll(dataRe)) {
+    if (match[0]) refs.add(match[0]);
+  }
+  return refs;
+}
+
+function detectAlbumLocalFilePath(html: string): string | null {
+  const checks: Array<[RegExp, string]> = [
+    [/\bfile:\/\/\/?[a-z]:[\\/]/i, 'contains a file:// Windows local path'],
+    [/\bfile:\/\/\/(?:Users|home)\//i, 'contains a file:// local path'],
+    [/\b(?:src|href)\s*=\s*["'][^"']*[a-z]:\\[^"']*["']/i, 'contains a Windows local path in src/href'],
+    [/\b(?:src|href)\s*=\s*["'](?:\/Users\/|\/home\/)[^"']*["']/i, 'contains a local filesystem path in src/href'],
+    [/url\(\s*["']?(?:file:\/\/|[a-z]:\\|\/Users\/|\/home\/)/i, 'contains a local filesystem path in CSS url()'],
+  ];
+  for (const [pattern, reason] of checks) {
+    if (pattern.test(html)) return reason;
+  }
+  return null;
+}
+
 function looksLikeAlbumHtml(html: string): boolean {
-  return /ALBUM-SCROLL-STORY|album-scroll-story|scroll-snap-type|data-album-page|albumPage|photo\s*album|electronic\s*album/i.test(html);
+  // Keep in sync with core fileLooksLikeAlbumHtml — AI albums often lack
+  // ALBUM-SCROLL-STORY markers but still have #album / data-page / snap.
+  return /ALBUM-SCROLL-STORY|album-scroll-story|scroll-snap-type|data-album-page|albumPage|photo\s*album|electronic\s*album|data-page=|class=["'][^"']*\balbum\b|id=["']album["']/i.test(html);
+}
+
+/**
+ * For electronic albums, bake Studio asset URLs into data URIs and point
+ * exportMp4 at that file so Playwright file:// recording still shows images.
+ * Also flags hard-cut slideshow + no soundtrack.
+ */
+async function prepareAlbumSlideshowExport(
+  ctx: CliContext,
+  projectId: string,
+): Promise<{
+  htmlSourcePath: string;
+  albumSlideshow: true;
+  skipSoundtrack: true;
+} | null> {
+  const html = await ctx.orchestrator.readRawHtml(projectId).catch(() => null);
+  if (!html || !looksLikeAlbumHtml(html)) return null;
+  const projectDir = await ctx.projects.ensureDir(projectId);
+  const htmlSourcePath = join(projectDir, '.export-album-slideshow.html');
+  const standalone = await inlineAlbumAssetsForExport(hardenAlbumHtml(html), projectId, ctx);
+  await writeFile(htmlSourcePath, standalone, 'utf8');
+  return {
+    htmlSourcePath,
+    albumSlideshow: true,
+    skipSoundtrack: true,
+  };
 }
 
 function buildStylePhasePrompt(pickedType: string): string {
@@ -4365,6 +5635,7 @@ function buildStylePhasePrompt(pickedType: string): string {
 
 function buildHtmlGenerationPrompt(args: BuildPromptArgs): string {
   const { tmpl, exampleHtml, priorHtml, history, userText, attachments, openingTopic, hasGeneratedPreview } = args;
+  const albumPageFocus = args.albumPageFocus;
 
   // When a template is selected, its own source HTML is the style ground truth —
   // NOT a prior render. Otherwise a project that was previously rendered in some
@@ -4736,16 +6007,21 @@ function buildHtmlGenerationPrompt(args: BuildPromptArgs): string {
       p.push(`- Output ONE standalone interactive HTML document, not a content-graph and not multiple html#frame blocks.`);
       p.push(`- Treat the frame/page count as album page count. Prefer 4-6 pages unless the user specified otherwise.`);
       p.push(`- Mark every album page container with data-album-page or data-page, for example <section class="page" data-album-page="cover">...</section>, so Studio can edit one page at a time.`);
-      p.push(`- Mobile layout (REQUIRED, narrow screens): vertical full-viewport pages with scroll-snap; hide desktop prev/next chrome if needed; keep dots; one page per screen.`);
-      p.push(`- Desktop / PC layout (REQUIRED, wide screens): show Previous/Next controls, page counter, and dots; support Arrow/Page keyboard navigation; allow a more spacious multi-column page layout.`);
-      p.push(`- Deliver BOTH layouts in ONE HTML file via CSS media queries. Do NOT output only mobile or only desktop; opening the same file on phone and PC must both work.`);
-      p.push(`- Mobile interaction: vertical scroll with scroll-snap; each page fills one viewport and the next page is reached by swiping/down-scrolling.`);
-      p.push(`- Desktop interaction: visible Previous/Next controls, page dots or counter, and keyboard navigation for Arrow/Page keys.`);
+      if (aspect === '9:16') {
+        p.push(`- Display device: phone / 手机 ONLY (${resolution}). Do NOT also build a desktop dual layout.`);
+        p.push(`- Phone layout (REQUIRED): vertical full-viewport pages with scroll-snap; one page per screen; keep page dots; hide large Previous/Next chrome.`);
+        p.push(`- Phone interaction: vertical scroll with scroll-snap; each page fills one viewport.`);
+      } else {
+        p.push(`- Display device: desktop / 电脑 ONLY (${resolution}). Do NOT also build a phone-portrait dual layout.`);
+        p.push(`- Desktop / PC layout (REQUIRED): show Previous/Next controls, page counter, and dots; support Arrow/Page keyboard navigation; allow a more spacious multi-column page layout.`);
+        p.push(`- Desktop interaction: visible Previous/Next controls, page dots or counter, and keyboard navigation for Arrow/Page keys.`);
+      }
       p.push(`- Use uploaded images/screenshots/materials as real album media. For image attachments, put the provided "Browser URL for HTML src/href" into <img src="..."> exactly; never use a Windows/local filesystem path and never use only the filename.`);
       p.push(`- If the user asks for image-to-album, preserve the uploaded image order: first image = first page, second image = second page, and so on.`);
       p.push(`- If the source is HTML, extract its visible content and visual structure into album pages.`);
       p.push(`- Tag visible text with data-hv-text keys so Studio can edit it after generation.`);
       p.push(`- Tag every replaceable album image with data-hv-image using stable keys such as cover.hero_image, page_2.photo, logo. For background-photo blocks, put data-hv-image on the element that owns the inline background-image.`);
+      p.push(...albumEditableImageSlotPromptInstructions(userText).map((line) => `- ${line}`));
       p.push(`- Tag primary action buttons, contact buttons, phone/wechat/email links, and purchase/booking/contact actions with data-hv-cta. The CTA visible copy must remain editable text. Prefer real <a href="..."> links (target=_blank) when a URL exists; do not leave outbound URLs only on inert <button> tags.`);
       p.push(`- Define theme colors in :root CSS variables, including --primary-color. Use var(--primary-color) for primary buttons, highlights, active dots, and brand accents instead of hardcoded repeated colors.`);
       p.push('');
@@ -4873,6 +6149,24 @@ h1{font-size:8vw;letter-spacing:-.03em;animation:in 1.2s ease forwards;opacity:0
   } else if (isAlbumIteration) {
     it.push(`The user is iterating on an existing electronic album HTML. Apply their request below by rewriting the CURRENT album as ONE complete standalone interactive HTML document.`);
     it.push(`Preserve the current album's visual style and existing content unless the user explicitly asks to change them. If the user asks to add a page, add a new scroll-snap album page. If they provide a CTA URL, make the relevant button/link point to that URL. If they attach an image, use its Browser URL as a real <img> asset in the album. Preserve or add data-hv-text, data-hv-image, data-hv-cta, and :root --primary-color so Studio can edit the result.`);
+    it.push(...albumEditableImageSlotPromptInstructions(userText));
+    if (albumPageFocus) {
+      const pageNumber = albumPageFocus.index + 1;
+      const pageCount = albumPageFocus.pageCount ?? '?';
+      const selectedPageNumber = albumPageFocus.selectedIndex !== undefined ? albumPageFocus.selectedIndex + 1 : null;
+      it.push(``);
+      it.push(`TARGET PAGE SCOPE (IMPORTANT): The target page is album page ${pageNumber} of ${pageCount}${albumPageFocus.label ? ` (${albumPageFocus.label})` : ''}. Target source: ${albumPageFocus.source === 'user_text' ? 'explicit user wording' : 'current Studio selection'}.${albumPageFocus.summary ? ` Page summary: "${albumPageFocus.summary.slice(0, 160)}".` : ''}`);
+      if (albumPageFocus.conflictWithSelected && selectedPageNumber !== null) {
+        it.push(`The user text targets page ${pageNumber}, while Studio currently selected page ${selectedPageNumber}. Follow the user text and ignore the selected-page fallback for this request.`);
+      }
+      if (albumPageFocus.source === 'user_text') {
+        it.push(`Because the user explicitly referred to this page, treat the request as primarily about page ${pageNumber}.`);
+      } else {
+        it.push(`The user did not name a different page, so treat the request as primarily about the current selected page ${pageNumber}.`);
+      }
+      it.push(`Unless the user explicitly says "whole album", "all pages", "整本", "所有页", or asks for a global style/content change, only change the target page's layout/content/media. Preserve every other page's visible text, page order, visual style, navigation controls, data-album-page/data-page markers, and data-hv-text/data-hv-image/data-hv-cta keys.`);
+      it.push(`You must still return the full album HTML document, but non-target pages should be carried through unchanged as much as possible.`);
+    }
   } else {
     it.push(`The user is iterating on an existing HTML video. Apply their request below — write a fresh complete HTML page that delivers the same content, in roughly the same visual style, but with the requested change.`);
   }
@@ -4901,7 +6195,11 @@ h1{font-size:8vw;letter-spacing:-.03em;animation:in 1.2s ease forwards;opacity:0
   }
   const iterateResolution = resolutionForAspect(inputs.collected?.aspect).resolution;
   if (isAlbumIteration) {
-    it.push(`Electronic album output requirements: ONE complete <!doctype html> document in a fenced \`\`\`html block. Keep BOTH mobile and PC layouts in the same file via CSS media queries: mobile = vertical scroll-snap pages; PC = visible prev/next controls + keyboard paging. Keep page dots/counter or controls, and editable tags: data-hv-text for visible text, data-hv-image for replaceable images/background images, data-hv-cta for action/contact links, and :root --primary-color for theme color. Use the current aspect/resolution (${iterateResolution}). All visible text must stay in the user's language; for Chinese requests, translate/avoid English labels like "BRAND STRENGTH" unless they are proper nouns. No prose outside the block. Do NOT return an empty reply.`);
+    const iterateAspect = resolutionForAspect(inputs.collected?.aspect).aspect;
+    const iterateDeviceHint = iterateAspect === '9:16'
+      ? 'Target phone / 手机 only (9:16): vertical scroll-snap pages, keep dots, hide large prev/next chrome. Do NOT add a separate desktop dual layout.'
+      : 'Target desktop / 电脑 only (16:9 or landscape): visible prev/next + keyboard paging, spacious layout. Do NOT add a separate phone-portrait dual layout.';
+    it.push(`Electronic album output requirements: ONE complete <!doctype html> document in a fenced \`\`\`html block. ${iterateDeviceHint} Keep page dots/counter or controls, and editable tags: data-hv-text for visible text, data-hv-image for replaceable images/background images, data-hv-cta for action/contact links, and :root --primary-color for theme color. Never create in-page upload controls; image replacement must be represented only by data-hv-image slots. Use the current aspect/resolution (${iterateResolution}). All visible text must stay in the user's language; for Chinese requests, translate/avoid English labels like "BRAND STRENGTH" unless they are proper nouns. No prose outside the block. Do NOT return an empty reply.`);
   } else {
     it.push(`Output: ONE complete HTML document. Begin your reply with \`\`\`html and end with \`\`\`. Inline all CSS / JS. Full-bleed ${iterateResolution}. Preserve or add editable markers: data-hv-text for visible text, data-hv-image for replaceable images/background images, data-hv-cta for action/contact links, and :root --primary-color for theme color. All visible text must stay in the user's language. No prose outside the block. Do NOT return an empty reply.`);
   }
@@ -4962,6 +6260,41 @@ function summariseHtmlForIterate(html: string): {
     bgColors,
     fontFamilies,
   };
+}
+
+function buildAlbumPersistValidationRepairPrompt(args: {
+  userText: string;
+  currentHtml: string;
+  reasons: string[];
+  attachments: Attachment[];
+}): string {
+  const summary = summariseHtmlForIterate(args.currentHtml);
+  const parts: string[] = [
+    'The previous album HTML failed Studio persistence validation.',
+    `Validation failure(s): ${args.reasons.join('; ')}`,
+    'Rewrite the CURRENT electronic album now as ONE complete standalone HTML document.',
+    '',
+    'Output exactly ONE fenced ```html block containing a complete <!doctype html> document. No prose outside the block.',
+    'Keep the album as an interactive scroll-snap electronic album with page dots/counter/controls.',
+    'Preserve the existing album content and visual style as much as possible while applying the user request.',
+    'Preserve or add data-hv-text, data-hv-image, data-hv-cta, data-album-page/data-page markers, and :root --primary-color.',
+    'Do not remove existing editable keys unless the user explicitly asked to delete that content. Do not reduce the number of album pages unless the user explicitly asked to remove pages.',
+    'Do not remove existing uploaded image references such as /api/projects/.../assets/.../content or data:image/... unless the user explicitly asked to delete or replace that image.',
+    'Do not use local filesystem paths such as C:\\Users\\... or file:// URLs. Use existing browser-safe asset URLs/data URIs already present in the album or the provided Browser URL from attachments.',
+    ...albumEditableImageSlotPromptInstructions(args.userText),
+    '',
+    `User request: ${args.userText.slice(0, 1000)}`,
+    summary.headline ? `Current headline: ${summary.headline}` : '',
+    summary.subheads.length ? `Current visible text:\n${summary.subheads.slice(0, 12).map((s) => `- ${s}`).join('\n')}` : '',
+    summary.dataPoints.length ? `Current data points:\n${summary.dataPoints.slice(0, 8).map((s) => `- ${s}`).join('\n')}` : '',
+    summary.bgColors.length ? `Palette: ${summary.bgColors.join(' / ')}` : '',
+    summary.fontFamilies.length ? `Fonts: ${summary.fontFamilies.join(', ')}` : '',
+  ].filter(Boolean);
+  if (args.attachments.length > 0) {
+    parts.push('', 'Attachments:');
+    for (const a of args.attachments) parts.push(...renderAttachment(a));
+  }
+  return parts.join('\n');
 }
 
 /**
@@ -5043,6 +6376,130 @@ function hardenAlbumHtml(html: string): string {
     else out = `${out}\n${script}`;
   }
 
+  return out;
+}
+
+/** Load bytes for a project asset (local file store or OSS), used by content proxy + HTML export. */
+async function loadProjectAssetBytes(
+  ctx: CliContext,
+  projectId: string,
+  assetId: string,
+): Promise<{ mime: string; body: Buffer } | null> {
+  if (ctx.database?.mode !== 'postgres' || !ctx.database.handle) {
+    try {
+      const project = await ctx.orchestrator.load(projectId);
+      const asset = project.assets.find((item) => item.id === assetId);
+      if (!asset?.path) return null;
+      const safe = resolve(asset.path);
+      const localWorkRoot = resolveLocalWorkRoot(ctx);
+      if (!isPathInside(localWorkRoot, safe) || !existsSync(safe)) return null;
+      const body = await readFile(safe);
+      const mime = asset.metadata?.mimeType
+        || AssetStore.guessMime(safe).mime
+        || 'application/octet-stream';
+      return { mime, body };
+    } catch {
+      return null;
+    }
+  }
+  try {
+    const assets = await projectAssetPersistence(ctx).listForProject(projectId);
+    const asset = assets.find((item) => item.id === assetId && item.status !== 'deleted');
+    if (!asset?.oss_key) return null;
+    const ossConfig = loadOssConfig(ctx.projectRoot);
+    if (!ossConfig?.enabled) return null;
+    const downloaded = await downloadFromAliyunOss(ossConfig, { key: asset.oss_key });
+    return {
+      mime: asset.mime_type || downloaded.contentType || 'application/octet-stream',
+      body: Buffer.from(downloaded.body),
+    };
+  } catch (error) {
+    console.warn('[studio] loadProjectAssetBytes failed:', error);
+    return null;
+  }
+}
+
+/**
+ * Replace Studio-only asset URLs with data: URIs so exported HTML opens offline
+ * (file:// or any static host) without needing the local Studio server.
+ */
+async function inlineAlbumAssetsForExport(
+  html: string,
+  projectId: string,
+  ctx: CliContext,
+): Promise<string> {
+  const refRe = /(?:https?:\/\/[^/"'\s]+)?\/?api\/projects\/([^/"'#?\s]+)\/assets\/([^/"'#?\s]+)\/content/gi;
+  const refs = new Map<string, { projectId: string; assetId: string; samples: Set<string> }>();
+  let inlinedCount = 0;
+  let failedCount = 0;
+  let oversizedCount = 0;
+  let match: RegExpExecArray | null;
+  while ((match = refRe.exec(html)) !== null) {
+    const rawPid = match[1] || '';
+    const rawAid = match[2] || '';
+    let pid: string;
+    let aid: string;
+    try {
+      pid = decodeURIComponent(rawPid);
+      aid = decodeURIComponent(rawAid);
+    } catch {
+      pid = rawPid;
+      aid = rawAid;
+    }
+    if (!pid || !aid) continue;
+    const key = `${pid}\0${aid}`;
+    let entry = refs.get(key);
+    if (!entry) {
+      entry = { projectId: pid, assetId: aid, samples: new Set() };
+      refs.set(key, entry);
+    }
+    entry.samples.add(match[0]);
+  }
+  if (refs.size === 0) return html;
+
+  let out = html;
+  for (const entry of refs.values()) {
+    // Prefer the exporting project's id when HTML accidentally points elsewhere.
+    const loadId = entry.projectId === projectId ? entry.projectId : projectId;
+    const loaded = await loadProjectAssetBytes(ctx, loadId, entry.assetId)
+      || (loadId !== entry.projectId
+        ? await loadProjectAssetBytes(ctx, entry.projectId, entry.assetId)
+        : null);
+    if (!loaded) {
+      failedCount += 1;
+      console.warn(`[studio] export-html: could not inline asset ${entry.assetId}`);
+      continue;
+    }
+    // Exported albums should be standalone. Modern phone photos can easily be
+    // larger than 12MB, so keep a high guardrail only for truly pathological
+    // assets instead of silently leaving Studio-authenticated URLs behind.
+    if (loaded.body.length > 64 * 1024 * 1024) {
+      oversizedCount += 1;
+      console.warn(`[studio] export-html: skip inlining oversized asset ${entry.assetId} (${loaded.body.length} bytes)`);
+      continue;
+    }
+    const dataUri = `data:${loaded.mime};base64,${loaded.body.toString('base64')}`;
+    const variants = new Set<string>(entry.samples);
+    for (const pid of [entry.projectId, encodeURIComponent(entry.projectId)]) {
+      for (const aid of [entry.assetId, encodeURIComponent(entry.assetId)]) {
+        variants.add(`/api/projects/${pid}/assets/${aid}/content`);
+        variants.add(`api/projects/${pid}/assets/${aid}/content`);
+      }
+    }
+    for (const sample of variants) {
+      if (!sample || !out.includes(sample)) continue;
+      out = out.split(sample).join(dataUri);
+    }
+    inlinedCount += 1;
+  }
+  const remaining = out.match(/\/?api\/projects\/[^/"'#?\s]+\/assets\/[^/"'#?\s]+\/content/gi);
+  const marker = `<!-- hv-export-assets refs=${refs.size} inlined=${inlinedCount} failed=${failedCount} oversized=${oversizedCount} remaining=${remaining?.length ?? 0} -->`;
+  out = /<head[^>]*>/i.test(out)
+    ? out.replace(/<head([^>]*)>/i, `<head$1>\n${marker}`)
+    : `${marker}\n${out}`;
+  if (remaining?.length) {
+    console.warn(`[studio] export-html: ${remaining.length} Studio asset URL(s) remain after inlining`);
+  }
   return out;
 }
 
