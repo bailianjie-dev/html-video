@@ -17,6 +17,20 @@ export interface HtmlPublishInput {
 
 export type HtmlPublisher = (input: HtmlPublishInput) => Promise<HtmlPublication>;
 
+export type RevisionedRawHtmlWriteResult =
+  | {
+      ok: true;
+      project: Project;
+      htmlPath: string;
+      htmlUrl?: string;
+      previousRevision: number;
+      revision: number;
+    }
+  | {
+      ok: false;
+      currentRevision: number;
+    };
+
 /**
  * Persistence boundary for project metadata and project-local working files.
  *
@@ -37,6 +51,11 @@ export interface ProjectPersistence {
     htmlPath: string;
     htmlUrl?: string;
   }>;
+  writeRawHtmlIfRevision?(
+    projectId: string,
+    html: string,
+    expectedRevision: number,
+  ): Promise<RevisionedRawHtmlWriteResult>;
 
   readFrameHtml?(projectId: string, nodeId: string): Promise<string | null>;
   writeFrameHtml?(

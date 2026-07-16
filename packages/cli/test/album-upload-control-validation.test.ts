@@ -394,6 +394,24 @@ test('unified persist validation rejects lost uploaded project asset URLs', () =
   assert.match(result.reasons.join('\n'), /uploaded image references/i);
 });
 
+test('unified persist validation allows one explicitly replaced project image reference', () => {
+  const oldRef = '/api/projects/proj_1/assets/asset_1/content';
+  const oldHtml = `<!doctype html><html><body>
+    <section data-album-page="page_1">
+      <img data-hv-image="page_1.hero" src="${oldRef}">
+    </section>
+  </body></html>`;
+  const newHtml = `<!doctype html><html><body>
+    <section data-album-page="page_1">
+      <img data-hv-image="page_1.hero" src="/api/projects/proj_1/assets/asset_2/content">
+    </section>
+  </body></html>`;
+
+  assert.deepEqual(validateAlbumHtmlBeforePersist(oldHtml, newHtml, {
+    allowedRemovedImageRefs: new Set([oldRef]),
+  }), { ok: true, reasons: [] });
+});
+
 test('unified persist validation rejects lost data image references', () => {
   const dataUri = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB';
   const oldHtml = `<!doctype html><html><body>

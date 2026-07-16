@@ -114,13 +114,23 @@ export async function runAgentTurn(opts: RunAgentTurnOptions): Promise<AgentTurn
         if (details?.album_changed === true) {
           events.append('album.changed', {
             revision: details.revision ?? null,
+            previousRevision: details.previous_revision ?? null,
             pageCount: details.page_count ?? null,
+            changedPages: details.changed_pages ?? [],
+            changeSummary: details.change_summary ?? null,
+            operation: details.operation ?? null,
+            pageNumber: details.page_number ?? null,
             toolCallId: event.id ?? null,
           });
           events.append('preview.ready', {
             previewUrl: details.preview_url ?? null,
             revision: details.revision ?? null,
+            previousRevision: details.previous_revision ?? null,
             pageCount: details.page_count ?? null,
+            changedPages: details.changed_pages ?? [],
+            changeSummary: details.change_summary ?? null,
+            operation: details.operation ?? null,
+            pageNumber: details.page_number ?? null,
           });
         }
       } else if (event.type === 'error') {

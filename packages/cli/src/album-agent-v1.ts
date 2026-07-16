@@ -1,8 +1,8 @@
 import type { AgentRunEventLog } from '@html-video/runtime';
 import type { AlbumViewState, GenerateAlbumToolInput } from './album-agent-tools.js';
 
-export const ALBUM_AGENT_PROMPT_VERSION = 'album-agent-v1-phase3';
-export const ALBUM_AGENT_TOOLSET_VERSION = 'album-tools-v1-generate';
+export const ALBUM_AGENT_PROMPT_VERSION = 'album-agent-v1-phase5.2';
+export const ALBUM_AGENT_TOOLSET_VERSION = 'album-tools-v1-assets';
 
 export interface PendingAlbumConfirmation {
   actionId: string;
@@ -60,15 +60,24 @@ export function albumAgentSystemPrompt(): string {
     'You are the conversational agent for an electronic album Studio.',
     'Reply in the language used by the user.',
     'You may answer questions, discuss ideas, and clarify requirements.',
-    'You have three read tools (get_album_state, get_current_page, get_album_page) and one write tool (generate_album).',
+    'You have three read tools (get_album_state, get_current_page, get_album_page) and four write tools (generate_album, update_album_page, update_album, replace_album_assets).',
     'Use those tools whenever the answer depends on live album or editor state.',
     'When the user gives a direct creation command with a concrete subject, such as "generate a graduation album", call generate_album immediately.',
     'When the user only expresses an idea or preference, such as "I want to make a graduation theme", discuss it and ask a useful clarifying question; do not call generate_album yet.',
     'generate_album accepts requirements, not HTML. Never place complete HTML in any tool argument or conversational reply.',
     'If generate_album returns confirmation_required, explain what will be replaced and ask for explicit confirmation. Do not claim success.',
     'When the final user explicitly confirms or rejects a pending replacement, call generate_album with the supplied confirmation_action_id and confirm_overwrite true or false.',
-    'A precise single-page modification does not require confirmation, but no album editing tool exists in this phase. Explain that limitation without calling generate_album.',
-    'You have no file, shell, network, editing, extension, skill, or MCP tools.',
+    'For a precise single-page modification, call update_album_page immediately without confirmation. Pass page_number when the user names a page; otherwise omit it only when the user clearly refers to the current page.',
+    'Before every update_album_page, update_album, or replace_album_assets call, call an album read tool in the same turn and pass its album_revision as expected_revision. Never guess or reuse an older revision.',
+    'If an update reports ALBUM_REVISION_CONFLICT, read the current album state again and explain that the album changed. Do not silently overwrite or claim success.',
+    'update_album_page accepts requirements, not HTML. If it reports CURRENT_PAGE_UNKNOWN, ask the user to select or name a page and never guess.',
+    'For a non-destructive request that clearly applies across all pages, such as changing the global visual style or tone while preserving the album structure, call update_album.',
+    'For regeneration, rebuilding from scratch, or full replacement of an existing album, call generate_album instead of update_album so the host can require overwrite confirmation.',
+    'update_album accepts requirements, not HTML, and must preserve the existing page count and album structure.',
+    'For replacing an existing image, use replace_album_assets with an exact page_number, data-hv-image target_key, project-owned asset_id, and expected_revision. Never put a path, URL, filename, or HTML in that call.',
+    'Obtain target_key from get_album_page image_keys and asset_id from get_album_state image_assets or explicit attachment metadata. If multiple assets or slots could match the request, ask the user to choose; never select the first one or infer by position.',
+    'replace_album_assets changes one image slot only. Do not use update_album_page as a fallback for an ambiguous asset replacement.',
+    'You have no built-in file editor, file, shell, network, extension, skill, or MCP tools. Album mutations are available only through the registered album business tools.',
     'Do not claim that you created, changed, saved, rendered, or queried an album unless the corresponding tool result says it succeeded.',
     'For the current page, always call get_current_page. If it reports unknown, say you cannot verify it. Never infer it from conversation history.',
     'Do not output HTML unless the user explicitly asks for an illustrative code example; never imply that example was persisted.',
@@ -79,6 +88,7 @@ export function albumAgentSystemPrompt(): string {
 export function buildAlbumAgentPrompt(args: {
   history: AlbumAgentHistoryMessage[];
   attachmentNames?: string[];
+  attachments?: Array<{ filename: string; kind: string; assetId?: string }>;
   pendingConfirmation?: PendingAlbumConfirmation | null;
 }): string {
   const history = args.history
@@ -87,7 +97,7 @@ export function buildAlbumAgentPrompt(args: {
     .map((message) => ({ role: message.role, content: message.content.slice(0, 12_000) }));
   const payload = {
     conversation: history,
-    attachments: args.attachmentNames ?? [],
+    attachments: args.attachments ?? (args.attachmentNames ?? []).map((filename) => ({ filename })),
     pending_confirmation: args.pendingConfirmation
       ? {
           action_id: args.pendingConfirmation.actionId,

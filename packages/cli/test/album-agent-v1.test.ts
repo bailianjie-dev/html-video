@@ -13,15 +13,26 @@ test('agent v1 is default and legacy workflow requires an explicit flag', () => 
   assert.equal(useLegacyAlbumWorkflow({ HV_STUDIO_LEGACY_WORKFLOW: '0' }), false);
 });
 
-test('phase 3 system policy delegates only complete generation and preserves live-state rules', () => {
+test('phase 5.2 system policy delegates generation, updates, and explicit asset replacement', () => {
   const prompt = albumAgentSystemPrompt();
   assert.match(prompt, /generate_album/i);
+  assert.match(prompt, /update_album_page/i);
+  assert.match(prompt, /update_album/i);
+  assert.match(prompt, /replace_album_assets/i);
   assert.match(prompt, /direct creation command/i);
   assert.match(prompt, /only expresses an idea or preference/i);
   assert.match(prompt, /confirmation_required/i);
-  assert.match(prompt, /no file, shell, network, editing/i);
+  assert.match(prompt, /single-page modification/i);
+  assert.match(prompt, /without confirmation/i);
+  assert.match(prompt, /album_revision as expected_revision/i);
+  assert.match(prompt, /ALBUM_REVISION_CONFLICT/i);
+  assert.match(prompt, /full replacement/i);
+  assert.match(prompt, /no built-in file editor/i);
+  assert.match(prompt, /only through the registered album business tools/i);
   assert.match(prompt, /Never infer it from conversation history/i);
   assert.match(prompt, /Do not claim that you created/i);
+  assert.match(prompt, /never select the first one/i);
+  assert.match(prompt, /data-hv-image target_key/i);
 });
 
 test('agent prompt carries an opaque pending overwrite action without HTML', () => {
@@ -52,10 +63,11 @@ test('agent prompt carries bounded conversation and attachment metadata', () => 
       { role: 'assistant', content: '你好，有什么可以帮你？' },
       { role: 'user', content: '我想做毕业主题' },
     ],
-    attachmentNames: ['photo.jpg'],
+    attachments: [{ filename: 'photo.jpg', kind: 'image', assetId: 'asset-photo-1' }],
   });
 
   assert.match(prompt, /我想做毕业主题/);
   assert.match(prompt, /photo\.jpg/);
+  assert.match(prompt, /asset-photo-1/);
   assert.doesNotMatch(prompt, /ignore this persisted system event/);
 });

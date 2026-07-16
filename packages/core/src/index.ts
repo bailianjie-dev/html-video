@@ -31,6 +31,7 @@ export type {
   HtmlPublisher,
   HtmlPublishInput,
   ProjectPersistence,
+  RevisionedRawHtmlWriteResult,
 } from './services/project-persistence.js';
 export type { PostgresProjectPersistenceOptions } from './services/postgres-project-persistence.js';
 export type {

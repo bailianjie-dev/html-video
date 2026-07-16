@@ -28,6 +28,7 @@ import { HtmlVideoError } from './errors.js';
 import type { AssetStore } from './asset-store.js';
 import type { EngineRegistry, TemplateRegistry } from './registry.js';
 import type { ProjectPersistence } from './services/project-persistence.js';
+import type { RevisionedRawHtmlWriteResult } from './services/project-persistence.js';
 
 export interface CreateProjectInput {
   name: string;
@@ -224,6 +225,31 @@ export class ProjectOrchestrator {
     const { existsSync } = await import('node:fs');
     if (!existsSync(project.lastPreviewHtmlPath)) return null;
     return readFile(project.lastPreviewHtmlPath, 'utf8');
+  }
+
+  async writePreviewHtmlRawIfRevision(
+    projectId: string,
+    html: string,
+    expectedRevision: number,
+  ): Promise<RevisionedRawHtmlWriteResult> {
+    if (this.deps.projects.writeRawHtmlIfRevision) {
+      return this.deps.projects.writeRawHtmlIfRevision(projectId, html, expectedRevision);
+    }
+    const current = await this.deps.projects.load(projectId);
+    const currentRevision = Number.isSafeInteger(current.albumRevision) && Number(current.albumRevision) >= 0
+      ? Number(current.albumRevision)
+      : 0;
+    if (currentRevision !== expectedRevision) return { ok: false, currentRevision };
+    const written = await this.writePreviewHtmlRaw(projectId, html);
+    written.project.albumRevision = expectedRevision + 1;
+    await this.deps.projects.save(written.project);
+    return {
+      ok: true,
+      project: written.project,
+      htmlPath: written.htmlPath,
+      previousRevision: expectedRevision,
+      revision: expectedRevision + 1,
+    };
   }
 
   // ---------------- v0.8: ContentGraph + multi-frame ----------------

@@ -1,8 +1,8 @@
 import { randomUUID } from 'node:crypto';
-import { mkdir, writeFile } from 'node:fs/promises';
+import { mkdir, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { ContentGraph } from '@html-video/content-graph';
-import type { DbClient } from '../db/client.js';
+import type { DbClient, TransactionalDbClient } from '../db/client.js';
 import type { AlbumPageRow, AlbumRow, JsonObject, JsonValue } from '../db/types.js';
 import { HtmlVideoError } from '../errors.js';
 import { AlbumPageRepository } from '../repositories/album-page-repository.js';
@@ -17,7 +17,12 @@ import {
   projectStatusToAlbumStatus,
   projectToAlbumSettings,
 } from './project-mapper.js';
-import type { HtmlPublication, HtmlPublisher, ProjectPersistence } from './project-persistence.js';
+import type {
+  HtmlPublication,
+  HtmlPublisher,
+  ProjectPersistence,
+  RevisionedRawHtmlWriteResult,
+} from './project-persistence.js';
 import type { UserContext } from './user-context.js';
 import { safeWorkDirectorySegment } from './work-directory.js';
 
@@ -178,6 +183,102 @@ export class PostgresProjectPersistence implements ProjectPersistence {
       htmlPath,
       ...(publication && { htmlUrl: publication.url }),
     };
+  }
+
+  async writeRawHtmlIfRevision(
+    projectId: string,
+    html: string,
+    expectedRevision: number,
+  ): Promise<RevisionedRawHtmlWriteResult> {
+    const user = this.opts.getUserContext();
+    const initialAlbum = await this.requireAlbum(projectId, user);
+    const initialRevision = albumRevision(initialAlbum);
+    if (initialRevision !== expectedRevision) {
+      return { ok: false, currentRevision: initialRevision };
+    }
+
+    const nextRevision = expectedRevision + 1;
+    const projectDir = await this.ensureDir(projectId);
+    const htmlPath = join(projectDir, `preview-revision-${nextRevision}.html`);
+    await writeFile(htmlPath, html, 'utf8');
+    let publication: HtmlPublication | null = null;
+    try {
+      publication = await this.publishHtml(user, projectId, `preview-revision-${nextRevision}`, html);
+      const commit = async (
+        albums: AlbumRepository,
+        pages: AlbumPageRepository,
+      ): Promise<{ updated: AlbumRow | null; currentRevision: number }> => {
+        const current = await findAlbumForProjectId(albums, user.userId, projectId);
+        if (!current || current.status === 'deleted') {
+          throw new HtmlVideoError('project-not-found', `Project ${projectId} not found`);
+        }
+        const project = albumRowToProject(current);
+        project.lastPreviewHtmlPath = htmlPath;
+        project.albumRevision = nextRevision;
+        if ((project.frames?.length ?? 0) === 0) {
+          project.frames = [];
+          delete project.contentGraphPath;
+        }
+        if (project.status === 'draft') project.status = 'previewed';
+        const settings = projectToAlbumSettings(project, current.settings);
+        const updated = await albums.updateIfAlbumRevision(
+          user.userId,
+          current.id,
+          expectedRevision,
+          {
+            status: projectStatusToAlbumStatus(project.status),
+            settings,
+            ...(publication && { last_preview_html_url: publication.url }),
+          },
+          user.actorId,
+        );
+        if (!updated) {
+          const latest = await albums.findById(user.userId, current.id);
+          return { updated: null, currentRevision: latest ? albumRevision(latest) : expectedRevision };
+        }
+
+        const existingPreview = await pages.findByNodeId(user.userId, current.id, 'preview');
+        const existingPages = existingPreview ? [] : await pages.listByAlbum(user.userId, current.id);
+        const previewPageNo = existingPreview?.page_no
+          ?? Math.max(0, ...existingPages.map((page) => page.page_no)) + 1;
+        await pages.upsertByAlbumAndNodeId({
+          id: existingPreview?.id ?? randomUUID(),
+          user_id: user.userId,
+          album_id: current.id,
+          node_id: 'preview',
+          page_no: previewPageNo,
+          title: project.name,
+          status: 'ready',
+          duration_ms: projectDurationMs(project) || 3000,
+          raw_html: html,
+          ...(publicationFields(publication)),
+          content: { kind: 'single_preview', local_html_path: htmlPath },
+          created_by: existingPreview?.created_by ?? user.actorId,
+          updated_by: user.actorId,
+        });
+        return { updated, currentRevision: nextRevision };
+      };
+
+      const db = this.opts.db as Partial<TransactionalDbClient>;
+      const outcome = typeof db.transaction === 'function'
+        ? await db.transaction((tx) => commit(new AlbumRepository(tx), new AlbumPageRepository(tx)))
+        : await commit(this.albums, this.pages);
+      if (!outcome.updated) {
+        await rm(htmlPath, { force: true }).catch(() => {});
+        return { ok: false, currentRevision: outcome.currentRevision };
+      }
+      return {
+        ok: true,
+        project: albumRowToProject(outcome.updated),
+        htmlPath,
+        ...(publication && { htmlUrl: publication.url }),
+        previousRevision: expectedRevision,
+        revision: nextRevision,
+      };
+    } catch (error) {
+      await rm(htmlPath, { force: true }).catch(() => {});
+      throw error;
+    }
   }
 
   async readFrameHtml(projectId: string, nodeId: string): Promise<string | null> {
@@ -394,6 +495,22 @@ export class PostgresProjectPersistence implements ProjectPersistence {
 
 function isUuid(value: string): boolean {
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
+}
+
+async function findAlbumForProjectId(
+  albums: AlbumRepository,
+  userId: string,
+  projectId: string,
+): Promise<AlbumRow | null> {
+  const bySourceProjectId = await albums.findBySourceProjectId(userId, projectId);
+  if (bySourceProjectId) return bySourceProjectId;
+  if (!isUuid(projectId)) return null;
+  return albums.findById(userId, projectId);
+}
+
+function albumRevision(album: AlbumRow): number {
+  const value = Number(album.settings.album_revision ?? 0);
+  return Number.isSafeInteger(value) && value >= 0 ? value : 0;
 }
 
 function isFormalProjectAlbum(album: AlbumRow): boolean {

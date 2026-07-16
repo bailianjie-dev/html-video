@@ -101,6 +101,33 @@ export class AlbumRepository {
     ));
   }
 
+  async updateIfAlbumRevision(
+    userId: string,
+    id: string,
+    expectedRevision: number,
+    patch: UpdateAlbumPatch,
+    updatedBy: string,
+  ): Promise<AlbumRow | null> {
+    const { assignments, values } = buildUpdateSet(patch, 4, {
+      updated_by: updatedBy,
+      updated_time: new Date(),
+    }, ALBUM_UPDATE_COLUMNS);
+    if (!assignments) return null;
+    return firstRow(await this.db.query<AlbumRow>(
+      `UPDATE ai_album_albums
+       SET ${assignments}
+       WHERE user_id = $1
+         AND id = $2
+         AND CASE
+           WHEN COALESCE(settings->>'album_revision', '') ~ '^[0-9]+$'
+             THEN (settings->>'album_revision')::bigint
+           ELSE 0
+         END = $3
+       RETURNING *`,
+      [userId, id, expectedRevision, ...values],
+    ));
+  }
+
   async updateSettings(userId: string, id: string, settings: JsonObject, updatedBy: string): Promise<AlbumRow | null> {
     return this.update(userId, id, { settings }, updatedBy);
   }

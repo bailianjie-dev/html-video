@@ -84,8 +84,17 @@ test('successful album tool results emit semantic change and preview events', as
         details: {
           ok: true,
           album_changed: true,
+          previous_revision: 2,
           revision: 3,
           page_count: 6,
+          changed_pages: [2],
+          change_summary: {
+            page_count: 1,
+            text_count: 1,
+            structural_change: false,
+          },
+          operation: 'update_album_page',
+          page_number: 2,
           preview_url: '/preview/project-1',
         },
       },
@@ -114,6 +123,46 @@ test('successful album tool results emit semantic change and preview events', as
   assert.deepEqual(events.list().find((event) => event.type === 'preview.ready')?.data, {
     previewUrl: '/preview/project-1',
     revision: 3,
+    previousRevision: 2,
     pageCount: 6,
+    changedPages: [2],
+    changeSummary: {
+      page_count: 1,
+      text_count: 1,
+      structural_change: false,
+    },
+    operation: 'update_album_page',
+    pageNumber: 2,
   });
+});
+
+test('revision conflicts do not emit album change or preview events', async () => {
+  const def = fakeHttpAgent(async (_prompt, _context, onEvent) => {
+    onEvent({
+      type: 'tool_result',
+      id: 'tool-conflict',
+      output: {
+        details: {
+          ok: false,
+          code: 'ALBUM_REVISION_CONFLICT',
+          expected_revision: 2,
+          current_revision: 3,
+          album_changed: false,
+        },
+      },
+    });
+    onEvent({ type: 'text', chunk: 'The album changed. Please retry.' });
+    return { exitCode: 0 };
+  });
+  const events = new AgentRunEventLog('run-conflict', 'session-conflict');
+
+  await runAgentTurn({
+    def,
+    prompt: 'update',
+    context: { cwd: process.cwd() },
+    events,
+  });
+
+  assert.equal(events.list().some((event) => event.type === 'album.changed'), false);
+  assert.equal(events.list().some((event) => event.type === 'preview.ready'), false);
 });

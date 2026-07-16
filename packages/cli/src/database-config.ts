@@ -1,7 +1,7 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { Pool, type PoolConfig } from 'pg';
-import type { DbClient, DbQueryResult } from '@html-video/core';
+import type { DbClient, DbQueryResult, TransactionalDbClient } from '@html-video/core';
 
 export interface DatabaseConfig {
   enabled: boolean;
@@ -18,7 +18,7 @@ export interface DatabaseConfig {
 }
 
 export interface PgClientHandle {
-  db: DbClient;
+  db: TransactionalDbClient;
   close(): Promise<void>;
 }
 
@@ -47,12 +47,36 @@ export function createPgClient(config: DatabaseConfig): PgClientHandle {
     connectionTimeoutMillis: config.connectTimeout * 1000,
   };
   const pool = new Pool(poolConfig);
+  const query = async <T = unknown>(
+    sql: string,
+    params?: readonly unknown[],
+  ): Promise<DbQueryResult<T>> => {
+    const result = await pool.query(sql, params ? [...params] : undefined);
+    const rows = Array.isArray(result.rows) ? result.rows as T[] : [];
+    return { rows, rowCount: result.rowCount ?? rows.length };
+  };
   return {
     db: {
-      async query<T = unknown>(sql: string, params?: readonly unknown[]): Promise<DbQueryResult<T>> {
-        const result = await pool.query(sql, params ? [...params] : undefined);
-        const rows = Array.isArray(result.rows) ? result.rows as T[] : [];
-        return { rows, rowCount: result.rowCount ?? rows.length };
+      query,
+      async transaction<T>(fn: (tx: DbClient) => Promise<T>): Promise<T> {
+        const client = await pool.connect();
+        try {
+          await client.query('BEGIN');
+          const result = await fn({
+            async query<R = unknown>(sql: string, params?: readonly unknown[]): Promise<DbQueryResult<R>> {
+              const queried = await client.query(sql, params ? [...params] : undefined);
+              const rows = Array.isArray(queried.rows) ? queried.rows as R[] : [];
+              return { rows, rowCount: queried.rowCount ?? rows.length };
+            },
+          });
+          await client.query('COMMIT');
+          return result;
+        } catch (error) {
+          await client.query('ROLLBACK').catch(() => {});
+          throw error;
+        } finally {
+          client.release();
+        }
       },
     },
     close: () => pool.end(),
