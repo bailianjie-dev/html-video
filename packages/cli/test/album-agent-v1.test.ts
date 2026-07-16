@@ -6,7 +6,6 @@ import {
   albumAgentSystemPrompt,
   buildAlbumAgentDynamicContext,
   buildAlbumAgentPrompt,
-  useLegacyAlbumWorkflow,
 } from '../dist/album-agent-v1.js';
 
 const PROJECT_CONTEXT = {
@@ -21,13 +20,6 @@ function snapshot(name: string): string {
     .replace(/\r\n/g, '\n')
     .trimEnd();
 }
-
-test('agent v1 is default and legacy workflow requires an explicit flag', () => {
-  assert.equal(useLegacyAlbumWorkflow({}), false);
-  assert.equal(useLegacyAlbumWorkflow({ HV_STUDIO_LEGACY_WORKFLOW: '1' }), true);
-  assert.equal(useLegacyAlbumWorkflow({ HV_STUDIO_LEGACY_WORKFLOW: 'true' }), true);
-  assert.equal(useLegacyAlbumWorkflow({ HV_STUDIO_LEGACY_WORKFLOW: '0' }), false);
-});
 
 test('phase 5.3 system policy delegates generation, updates, and explicit asset replacement', () => {
   const prompt = albumAgentSystemPrompt();

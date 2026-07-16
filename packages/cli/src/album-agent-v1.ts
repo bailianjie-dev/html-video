@@ -108,13 +108,6 @@ export interface RegisteredAgentRun {
   completedAt?: number;
 }
 
-const TRUE_VALUES = new Set(['1', 'true', 'yes', 'on']);
-
-/** Agent v1 is the default; this switch keeps the previous generation workflow available. */
-export function useLegacyAlbumWorkflow(env: NodeJS.ProcessEnv = process.env): boolean {
-  return TRUE_VALUES.has((env.HV_STUDIO_LEGACY_WORKFLOW ?? '').trim().toLowerCase());
-}
-
 export function albumAgentSystemPrompt(): string {
   return [
     '# Role',

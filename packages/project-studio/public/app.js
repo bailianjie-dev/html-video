@@ -2611,12 +2611,12 @@ function updateGenerationControls() {
 
 const GENERATION_PROGRESS_STEPS = [
   { at: 0, text: '已提交需求，正在连接 AI 助手…' },
-  { at: 3000, text: '正在分析主题、场景和素材…' },
-  { at: 8000, text: '正在规划相册页面结构与叙事顺序…' },
-  { at: 15000, text: '正在生成页面文案、版式和视觉细节…' },
-  { at: 26000, text: '正在输出完整 HTML，相册生成通常需要几十秒…' },
-  { at: 45000, text: '仍在生成中：模型正在完善页面代码，请保持页面打开…' },
-  { at: 75000, text: '生成时间较长：复杂相册会更慢，完成后会自动刷新预览…' },
+  { at: 3000, text: '正在理解请求并读取项目状态…' },
+  { at: 8000, text: '正在决定回复方式或所需工具…' },
+  { at: 15000, text: 'AI 助手正在处理本轮请求…' },
+  { at: 26000, text: '工具或模型仍在执行，请保持页面打开…' },
+  { at: 45000, text: '本轮处理时间较长，完成后会同步结果…' },
+  { at: 75000, text: '复杂操作可能需要更久，请继续保持页面打开…' },
 ];
 
 function generationProgressTextForElapsed(elapsedMs) {
@@ -4976,14 +4976,14 @@ function parseHvConfirm(text) {
 function renderFormCard(form, submitted, msgIdx) {
   const title = form.title || 'Tell me a bit more…';
   const fields = form.fields || [];
-  const allowAttachments = form.allow_attachments !== false;
   const fieldsHtml = fields.map((f, i) => {
     const key = f.key || `field_${i}`;
     const label = f.label || key;
     const ph = f.placeholder || '';
     const required = f.required ? '<span class="req">*</span>' : '';
     const def = (submitted && submitted[key] !== undefined ? submitted[key] : (f.default ?? ''));
-    const dis = submitted ? 'disabled' : '';
+    // Phase 7 keeps historical cards visible, but the legacy workflow is inert.
+    const dis = 'disabled';
     let control;
     if (f.kind === 'textarea') {
       control = `<textarea data-form-msg="${msgIdx}" data-form-key="${esc(key)}" rows="2" placeholder="${esc(ph)}" ${dis}>${esc(def)}</textarea>`;
@@ -5022,17 +5022,8 @@ function renderFormCard(form, submitted, msgIdx) {
   const totalHtml = hasPerFrame && !submitted
     ? `<div class="form-total" id="form-total-${msgIdx}"></div>`
     : '';
-  const dropHtml = allowAttachments && !submitted ? `
-    <div class="form-attachments" data-form-msg="${msgIdx}">
-      <div class="form-drop-hint">📎 拖拽 / 粘贴 / 选择文件作为素材（logo、截图、数据 CSV…可选）</div>
-      <div class="form-attachment-list" id="form-att-${msgIdx}"></div>
-      <input type="file" id="form-file-${msgIdx}" multiple style="display:none" />
-      <button type="button" class="form-attach-btn" data-form-msg="${msgIdx}">+ 添加文件</button>
-    </div>` : '';
-  const actionsHtml = submitted ? '' : `
-    <div class="form-actions">
-      <button class="form-submit" data-form-msg="${msgIdx}">提交 ↵</button>
-    </div>`;
+  const dropHtml = '';
+  const actionsHtml = '';
   return `<div class="form-card${submitted ? ' submitted' : ''}">
     <div class="form-title">${esc(title)}</div>
     <div class="form-fields">${fieldsHtml}</div>
@@ -5046,7 +5037,6 @@ function renderFormCard(form, submitted, msgIdx) {
 function renderConfirmCard(confirm, resolved, msgIdx) {
   const title = confirm.title || 'Looks right?';
   const summary = confirm.summary || [];
-  const actions = confirm.actions || ['generate', 'edit'];
   const summaryHtml = summary.map((s) => {
     const label = s.label || s.key || '';
     const value = s.value !== undefined ? String(s.value) : '';
@@ -5055,11 +5045,7 @@ function renderConfirmCard(confirm, resolved, msgIdx) {
       <div class="confirm-value">${esc(value) || '<span class="muted">—</span>'}</div>
     </div>`;
   }).join('');
-  const actionsHtml = resolved ? '' : `
-    <div class="confirm-actions">
-      ${actions.includes('generate') ? `<button class="confirm-go" data-confirm-msg="${msgIdx}" data-action="generate">✓ 开始生成</button>` : ''}
-      ${actions.includes('edit') ? `<button class="confirm-edit" data-confirm-msg="${msgIdx}" data-action="edit">✏️ 修改</button>` : ''}
-    </div>`;
+  const actionsHtml = '';
   return `<div class="confirm-card${resolved ? ' resolved' : ''}">
     <div class="confirm-title">${esc(title)}</div>
     <div class="confirm-summary">${summaryHtml}</div>
@@ -5069,7 +5055,6 @@ function renderConfirmCard(confirm, resolved, msgIdx) {
 }
 
 function renderOptionCard(opts, picked, msgIdx) {
-  const allowFreeform = opts.allow_freeform !== false;
   const optsHtml = (opts.options || []).map((o, i) => {
     const label = o.label ?? String(o);
     const hint = o.hint ?? '';
@@ -5077,7 +5062,7 @@ function renderOptionCard(opts, picked, msgIdx) {
     const cls = 'opt' + (isPicked ? ' picked' : '');
     // Once the user has picked anything on this card, ALL buttons lock —
     // including the picked one, so the same option can't fire twice.
-    const disabled = picked ? 'disabled' : '';
+    const disabled = 'disabled';
     return `<button class="${cls}" data-opt-msg="${msgIdx}" data-opt-i="${i}" ${disabled}>
       <span class="label">${esc(label)}</span>
       ${hint ? `<span class="hint">${esc(hint)}</span>` : ''}
@@ -5085,12 +5070,7 @@ function renderOptionCard(opts, picked, msgIdx) {
   }).join('');
   // Inline freeform input — saves a trip to the bottom composer when the
   // user just wants to type a custom answer to this card's question.
-  const freeformHtml = allowFreeform && !picked ? `
-    <div class="freeform-input">
-      <textarea data-freeform-msg="${msgIdx}" rows="1"
-        placeholder="…or type your own answer"></textarea>
-      <button class="freeform-send" data-freeform-msg="${msgIdx}" disabled>↵ Send</button>
-    </div>` : '';
+  const freeformHtml = '';
   return `<div class="opt-card">
     <div class="question">${esc(opts.question)}</div>
     <div class="opts">${optsHtml}</div>
@@ -5219,6 +5199,7 @@ function renderPreview({ refreshFramesStrip = true } = {}) {
       applyStudioDevicePreview(iframe);
       syncAlbumPagesFromPreview(iframe, { refreshStrip: refreshFramesStrip });
       wirePreviewTextLocate(iframe);
+      wireAlbumPreviewWheelNav(iframe);
       scheduleGenerationPreviewLayout();
     });
   }
@@ -5545,7 +5526,7 @@ async function startAlbumPageTextEdit(pageIndex) {
   if (typeof pageIndex === 'number' && !Number.isNaN(pageIndex)) {
     state.activeAlbumPage = Math.max(0, Math.min((state.albumPageCount || 1) - 1, pageIndex));
     updateAlbumPageTabActive();
-    scrollPreviewToAlbumPage(state.activeAlbumPage, 'auto');
+    scrollPreviewToAlbumPage(state.activeAlbumPage, 'auto', { mode: 'browse' });
   }
   await flushTextEditsIfNeeded();
   state.albumPageTextEditActive = true;
@@ -5568,8 +5549,9 @@ async function selectAlbumPage(pageIndex, { startEdit = false } = {}) {
   if (pageChanged) await flushTextEditsIfNeeded();
   state.activeAlbumPage = safeIndex;
   updateAlbumPageTabActive();
-  // Rail navigation must be instant + reliable (smooth scrollIntoView often no-ops).
-  scrollPreviewToAlbumPage(safeIndex, 'auto');
+  // Rail / toolbar navigation: keep centre preview in browse mode so wheel
+  // and scroll-snap can still move between pages.
+  scrollPreviewToAlbumPage(safeIndex, 'auto', { mode: 'browse' });
   if (startEdit) {
     state.albumPageTextEditActive = true;
     if (document.querySelector('.generation-side-dock')) {
@@ -5624,8 +5606,9 @@ function syncAlbumPagesFromPreview(iframe, { refreshStrip = true } = {}) {
   // so device-shell switches (refreshStrip=false) and text edits stay quiet.
   void refreshStrip;
   updateAlbumPageEditControls();
-  scrollPreviewToAlbumPage(state.activeAlbumPage, 'auto');
+  scrollPreviewToAlbumPage(state.activeAlbumPage, 'auto', { mode: 'browse' });
   wireAlbumPageScrollSync(iframe);
+  wireAlbumPreviewWheelNav(iframe);
 }
 
 /** Update left-rail page titles without remounting thumb iframes. */
@@ -5758,6 +5741,23 @@ function scrollPreviewToAlbumPage(index, behavior = 'smooth', opts = {}) {
 
   if (browse) {
     rewireAlbumPageScrollSync(iframe);
+    // Still verify: if scroll/snap failed, hard-cut so the selected page is visible.
+    // Wheel nav (wireAlbumPreviewWheelNav) then discrete-switches while locked.
+    const verifyBrowse = () => {
+      try {
+        const host = scroller.getBoundingClientRect?.();
+        const rect = page.getBoundingClientRect();
+        if (!host || !scrolled) {
+          focusAlbumPreviewPage(doc, safeIndex);
+          return;
+        }
+        const aligned = Math.abs(rect.top - host.top) < 48 && Math.abs(rect.left - host.left) < 48;
+        if (!aligned) focusAlbumPreviewPage(doc, safeIndex);
+      } catch {
+        focusAlbumPreviewPage(doc, safeIndex);
+      }
+    };
+    requestAnimationFrame(() => requestAnimationFrame(verifyBrowse));
     return;
   }
 
@@ -5772,8 +5772,8 @@ function scrollPreviewToAlbumPage(index, behavior = 'smooth', opts = {}) {
     if (!aligned || !scrolled) focusAlbumPreviewPage(doc, safeIndex);
   };
   requestAnimationFrame(() => requestAnimationFrame(verifyAndMaybeHardCut));
-  // Instant path for auto/rail clicks — don't wait for smooth scroll failures.
-  if (behavior === 'auto') focusAlbumPreviewPage(doc, safeIndex);
+  // Do NOT hard-cut immediately on auto: that locks overflow + display:none and
+  // kills wheel page browsing. Only hard-cut when the scroll verify fails above.
 }
 
 /** Reset scroll-sync after DOM page order changes (reorder / duplicate / delete). */
@@ -5874,6 +5874,57 @@ function clearAlbumPreviewPageFocus(doc) {
     el.removeAttribute('data-hv-preview-page');
     el.classList.remove('hv-preview-page-active');
   });
+}
+
+/**
+ * When centre preview is locked in hard-cut (other pages display:none), native
+ * wheel scroll cannot change pages. Translate wheel into discrete page switches.
+ * In normal browse mode, leave wheel alone so scroll-snap can work.
+ */
+function wireAlbumPreviewWheelNav(iframe) {
+  try {
+    const doc = iframe?.contentDocument;
+    if (!doc?.documentElement || doc.documentElement.dataset.hvStudioWheelNav === '1') return;
+    doc.documentElement.dataset.hvStudioWheelNav = '1';
+    let lockedUntil = 0;
+    doc.addEventListener('wheel', (e) => {
+      if (!isElectronicAlbumProject()) return;
+      const count = Number(state.albumPageCount) || 0;
+      if (count <= 1) return;
+
+      const inHardCut = doc.documentElement.classList.contains('hv-album-preview-focus');
+      if (!inHardCut) {
+        const album = doc.getElementById('album')
+          || doc.querySelector('.album, [data-album], .scroll-container, .story-container, .album-container, .pages')
+          || doc.scrollingElement;
+        const canScroll = Boolean(
+          album
+          && (
+            album.scrollHeight > album.clientHeight + 8
+            || album.scrollWidth > album.clientWidth + 8
+          ),
+        );
+        if (canScroll) return;
+      }
+
+      const dy = e.deltaY || 0;
+      const dx = e.deltaX || 0;
+      const delta = Math.abs(dy) >= Math.abs(dx) ? dy : dx;
+      if (Math.abs(delta) < 10) return;
+
+      const now = Date.now();
+      if (now < lockedUntil) {
+        e.preventDefault();
+        return;
+      }
+      const dir = delta > 0 ? 1 : -1;
+      const next = Math.max(0, Math.min(count - 1, (Number(state.activeAlbumPage) || 0) + dir));
+      if (next === state.activeAlbumPage) return;
+      e.preventDefault();
+      lockedUntil = now + 380;
+      selectAlbumPage(next);
+    }, { passive: false, capture: true });
+  } catch { /* cross-origin / missing doc */ }
 }
 
 /** Make a left-rail thumb show only page N (full album HTML scrolls unreliably). */
@@ -5990,6 +6041,33 @@ html.hv-album-thumb [data-hv-thumb-page="${safe}"] * {
   return true;
 }
 
+/** Content width available for a page thumb inside the left generation rail. */
+function albumRailThumbBoxWidth(stripOrThumb) {
+  const thumb = stripOrThumb?.classList?.contains?.('frame-thumb')
+    ? stripOrThumb
+    : stripOrThumb?.querySelector?.('.frame-thumb');
+  const fromThumb = Math.floor(thumb?.clientWidth || thumb?.getBoundingClientRect?.().width || 0);
+  if (fromThumb > 24) return fromThumb;
+
+  const strip = stripOrThumb?.classList?.contains?.('frames-strip')
+    ? stripOrThumb
+    : stripOrThumb?.closest?.('.frames-strip') || document.getElementById('frames-strip');
+  const stripW = Math.floor(strip?.clientWidth || strip?.getBoundingClientRect?.().width || 0);
+  if (stripW > 24) {
+    const styles = getComputedStyle(strip);
+    const pad = (Number.parseFloat(styles.paddingLeft) || 0)
+      + (Number.parseFloat(styles.paddingRight) || 0);
+    return Math.max(72, Math.round(stripW - pad));
+  }
+
+  const workbench = strip?.closest?.('.generation-workbench')
+    || document.querySelector('.generation-workbench');
+  const railW = Number.parseFloat(
+    workbench ? getComputedStyle(workbench).getPropertyValue('--generation-rail-w') : '',
+  ) || 176;
+  return Math.max(72, Math.round(railW) - 16);
+}
+
 function fitAlbumThumbIframe(iframe) {
   if (!iframe) return;
   const thumb = iframe.closest?.('.frame-thumb');
@@ -5998,25 +6076,18 @@ function fitAlbumThumbIframe(iframe) {
   const res = projectPreviewResolution(p);
   const nativeW = Number(res.width) || 1920;
   const nativeH = Number(res.height) || 1080;
-  // Prefer the stable width from layout; fall back to rail card width (~96).
-  const boxW = Math.max(
-    1,
-    Math.floor(thumb.clientWidth || thumb.getBoundingClientRect?.().width || 96),
-  );
+  const boxW = Math.max(1, albumRailThumbBoxWidth(thumb));
   const scale = boxW / Math.max(1, nativeW);
   const boxH = Math.max(54, Math.ceil(nativeH * scale));
-  // Set height only once — rewriting it across delayed prepare() ticks is what
-  // makes the left rail "jitter" on open.
   const painted = Number.parseFloat(thumb.style.height);
-  if (!(painted > 0)) {
+  // Keep height in sync with the real rail width (was stuck at the old 96px crop).
+  if (!(painted > 0) || Math.abs(painted - boxH) > 1) {
     thumb.style.height = `${boxH}px`;
   }
   thumb.style.maxHeight = 'none';
   iframe.style.setProperty('--thumb-native-w', `${nativeW}px`);
   iframe.style.setProperty('--thumb-native-h', `${nativeH}px`);
-  iframe.style.setProperty('--thumb-scale', String(
-    Number.parseFloat(iframe.style.getPropertyValue('--thumb-scale')) || scale,
-  ));
+  iframe.style.setProperty('--thumb-scale', String(scale));
   iframe.style.setProperty('--thumb-offset-y', '0px');
 }
 
@@ -6248,7 +6319,7 @@ async function refreshAfterPreviewReady({ frameCount = 0, focusedFrame = '' } = 
     updateAlbumPageTabActive();
     updateAlbumPageEditControls();
     if (typeof renderFramesStrip === 'function') renderFramesStrip();
-    scrollPreviewToAlbumPage(state.activeAlbumPage, 'auto');
+    scrollPreviewToAlbumPage(state.activeAlbumPage, 'auto', { mode: 'browse' });
     if (state.albumPageTextEditActive) await refreshTextFields();
   } else if (typeof renderFramesStrip === 'function') {
     renderFramesStrip();
@@ -6372,9 +6443,8 @@ function renderAlbumPagesStrip(strip, p) {
   const res = projectPreviewResolution(p);
   const nativeW = res.width || 1920;
   const nativeH = res.height || 1080;
-  // Compact rail crop: fill width, short height, bias toward vertical mid
-  // so centered hero copy is visible (top-only crop looks empty).
-  const thumbBoxW = 96;
+  // Fill the current left-rail width (CSS --generation-rail-w), not a fixed 96px.
+  const thumbBoxW = albumRailThumbBoxWidth(strip);
   const thumbScale = thumbBoxW / nativeW;
   const thumbH = Math.max(54, Math.round(nativeH * thumbScale));
   const thumbStyle = `--thumb-native-w:${nativeW}px;--thumb-native-h:${nativeH}px;--thumb-scale:${thumbScale};--thumb-offset-y:0px`;
@@ -7002,7 +7072,7 @@ async function performAlbumPageAction(action, pageIndex) {
     state.albumPageSummaries = pages.map((page) => summarizeAlbumPageElement(page));
     updateAlbumRailIndicesFromDom(state.albumPageSummaries);
     updateAlbumPageTabActive();
-    scrollPreviewToAlbumPage(state.activeAlbumPage, 'auto');
+    scrollPreviewToAlbumPage(state.activeAlbumPage, 'auto', { mode: 'browse' });
     await saveAlbumPageOperation(doc, Math.min(activeIndex, pages.length - 1), message);
   } catch (error) {
     console.warn('[studio] album page operation failed:', error);
@@ -8322,20 +8392,6 @@ function cssEscape(s) {
   return String(s).replace(/["\\]/g, '\\$&');
 }
 
-function currentAlbumPageAiFocus() {
-  if (!isElectronicAlbumProject() || !Number(state.albumPageCount)) return null;
-  const pageCount = Math.max(1, Number(state.albumPageCount) || 1);
-  const pageIndex = Math.max(0, Math.min(pageCount - 1, Number(state.activeAlbumPage) || 0));
-  const summaries = Array.isArray(state.albumPageSummaries) ? state.albumPageSummaries : [];
-  const summary = String(summaries[pageIndex] || '').trim();
-  return {
-    index: pageIndex,
-    pageNumber: pageIndex + 1,
-    pageCount,
-    summary,
-  };
-}
-
 // ============== send message ==============
 function currentAgentViewStateSnapshot({ bumpRevision = false } = {}) {
   if (!state.selectedId) return null;
@@ -8577,27 +8633,16 @@ async function sendMessage() {
   updateGenerationControls();
   syncGenerationEmptyPreview();
 
-  // Iterate scope: when the user has selected a specific frame in the
-  // strip, the iterate-phase server route should only rewrite that frame.
-  // We pass the focus along on every send (server uses it only for iterate).
-  const focusFrame = state.iterateFocusFrameId || '';
-  const albumPageFocus = focusFrame ? null : currentAlbumPageAiFocus();
   const agentViewState = currentAgentViewStateSnapshot({ bumpRevision: true });
 
-  // User message includes attachment summary + focus chip
+  // The current page is carried by agent_view_state, not by chat text.
   const attSummary = hasAttachments
     ? `\n\n📎 ${state.pendingAttachments.length} attachment(s): ${state.pendingAttachments.map(a => a.name).join(', ')}`
     : '';
-  const focusSummary = focusFrame ? `\n\n🎯 focus: frame ${focusFrame}` : '';
-  const albumFocusSummary = albumPageFocus
-    ? `\n\n🎯 focus: album page ${albumPageFocus.pageNumber}/${albumPageFocus.pageCount}${albumPageFocus.summary ? ` · ${albumPageFocus.summary}` : ''}`
-    : '';
   state.messages.push({
     role: 'user',
-    content: text + attSummary + focusSummary + albumFocusSummary,
+    content: text + attSummary,
     ts: Date.now(),
-    ...(focusFrame ? { focusFrameId: focusFrame } : {}),
-    ...(albumPageFocus ? { albumPageIndex: albumPageFocus.index } : {}),
   });
   const initialRunState = createAgentRunUiState();
   initialRunState.statusText = '正在连接 Agent';
@@ -8607,7 +8652,6 @@ async function sendMessage() {
   startGenerationProgressTicker(thinkingIdx);
   renderChatLog();
 
-  let assistantIdx = -1;
   const agentRunContext = {
     projectId: genProjectId,
     runMessageIndex: thinkingIdx,
@@ -8620,12 +8664,6 @@ async function sendMessage() {
     if (hasAttachments) {
       const fd = new FormData();
       fd.append('content', text);
-      if (focusFrame) fd.append('focus_frame_id', focusFrame);
-      if (albumPageFocus) {
-        fd.append('album_page_index', String(albumPageFocus.index));
-        fd.append('album_page_count', String(albumPageFocus.pageCount));
-        if (albumPageFocus.summary) fd.append('album_page_summary', albumPageFocus.summary);
-      }
       if (agentViewState) fd.append('agent_view_state', JSON.stringify(agentViewState));
       for (const a of state.pendingAttachments) fd.append('file', a.file, a.name);
       // Clear UI attachments before request so user sees them disappear
@@ -8642,12 +8680,6 @@ async function sendMessage() {
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({
           content: text,
-          ...(focusFrame ? { focus_frame_id: focusFrame } : {}),
-          ...(albumPageFocus ? {
-            album_page_index: albumPageFocus.index,
-            album_page_count: albumPageFocus.pageCount,
-            album_page_summary: albumPageFocus.summary,
-          } : {}),
           ...(agentViewState ? { agent_view_state: agentViewState } : {}),
         }),
       });
@@ -8691,61 +8723,8 @@ async function sendMessage() {
           if (!dataLine) continue;
           let ev;
           try { ev = JSON.parse(dataLine.slice(6)); } catch { continue; }
-          if (ev?.version === 1) {
-            await applyAgentRunEvent(ev, agentRunContext);
-            continue;
-          }
-          if (ev.type === 'text') {
-            setGenerationProgress('模型正在输出内容，正在整理生成结果…', thinkingIdx);
-            if (assistantIdx === -1) {
-              // Replace thinking with assistant message
-              state.messages[thinkingIdx] = { role: 'assistant', agent: 'AI助手', content: '', ts: Date.now() };
-              assistantIdx = thinkingIdx;
-            }
-            state.messages[assistantIdx].content += ev.chunk;
-            renderChatLog();
-          } else if (ev.type === 'preview_ready') {
-            const frameCount = ev.frames || 0;
-            const focusedFrame = ev.focused_frame;
-            const summary = focusedFrame
-              ? '✓ 已更新选中页面'
-              : frameCount > 0
-                ? `✓ 已生成 ${frameCount} 页预览`
-                : '✓ 预览已更新';
-            const event = focusedFrame
-              ? '预览已刷新'
-              : frameCount > 0
-                ? `预览已刷新（${frameCount} 页）`
-                : '预览已刷新';
-            setGenerationProgress('预览已生成，正在刷新页面和缩略图…', thinkingIdx);
-            if (assistantIdx === -1) {
-              state.messages[thinkingIdx] = { role: 'assistant', agent: 'AI助手', content: summary, ts: Date.now() };
-              assistantIdx = thinkingIdx;
-            } else {
-              state.messages[assistantIdx].content = summary;
-            }
-            state.messages.push({ role: 'preview-event', content: event, ts: Date.now() });
-            renderChatLog();
-            await refreshAfterPreviewReady({ frameCount, focusedFrame });
-          } else if (ev.type === 'progress') {
-            setGenerationProgress(ev.message || ev.stage || '正在生成中…', thinkingIdx);
-          } else if (ev.type === 'warning') {
-            setGenerationProgress('生成遇到提示，正在等待可用结果…', thinkingIdx);
-            if (assistantIdx === -1) {
-              state.messages[thinkingIdx] = { role: 'assistant', agent: 'AI助手', content: '', ts: Date.now() };
-              assistantIdx = thinkingIdx;
-            }
-            state.messages[assistantIdx].content += '\n\n⚠️ ' + ev.message;
-            renderChatLog();
-          } else if (ev.type === 'error') {
-            stopGenerationProgressTicker('生成失败，请查看错误信息。');
-            if (assistantIdx === -1) {
-              state.messages[thinkingIdx] = { role: 'system', content: '⚠️ ' + ev.message, ts: Date.now() };
-            } else {
-              state.messages[assistantIdx].content += '\n\n⚠️ ' + ev.message;
-            }
-            renderChatLog();
-          }
+          if (ev?.version !== 1) continue;
+          await applyAgentRunEvent(ev, agentRunContext);
         }
       }
     }

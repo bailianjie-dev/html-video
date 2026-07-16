@@ -1790,10 +1790,10 @@
   .generation-workbench {
     min-height: 0;
     display: grid;
-    /* 左缩略图窄轨 | 预览为主视觉 | 右坞默认略收 */
-    --generation-rail-w: 128px;
-    --generation-side-min: 248px;
-    --generation-side-max: 280px;
+    /* 左缩略图轨 | 中间预览 | 右侧 AI / 编辑坞 */
+    --generation-rail-w: 176px;
+    --generation-side-min: 320px;
+    --generation-side-max: 380px;
     grid-template-columns:
       var(--generation-rail-w)
       minmax(0, 1fr)
@@ -1805,14 +1805,16 @@
   }
   @media (min-width: 1440px) {
     .generation-workbench {
-      --generation-side-min: 268px;
-      --generation-side-max: 300px;
+      --generation-rail-w: 188px;
+      --generation-side-min: 340px;
+      --generation-side-max: 400px;
     }
   }
   @media (min-width: 1680px) {
     .generation-workbench {
-      --generation-side-min: 280px;
-      --generation-side-max: 320px;
+      --generation-rail-w: 200px;
+      --generation-side-min: 360px;
+      --generation-side-max: 420px;
     }
   }
   .generation-page-rail {
@@ -1906,7 +1908,7 @@
     background: #0b1220;
   }
   .generation-page-rail .frames-strip .frame-thumb iframe {
-    --thumb-scale: calc(96 / 1920);
+    --thumb-scale: calc(144 / 1920);
     transform-origin: top left;
     opacity: 0;
   }
@@ -2911,9 +2913,9 @@
     .album-preview-shell { grid-template-columns: 1fr; }
     .image-album-flow { grid-template-columns: 1fr; }
     .generation-workbench {
-      --generation-rail-w: 118px;
-      --generation-side-min: 240px;
-      --generation-side-max: 268px;
+      --generation-rail-w: 152px;
+      --generation-side-min: 300px;
+      --generation-side-max: 340px;
       grid-template-columns:
         var(--generation-rail-w)
         minmax(240px, 1fr)
@@ -2922,7 +2924,7 @@
     body.generation-side-collapsed .generation-workbench {
       grid-template-columns: var(--generation-rail-w) minmax(240px, 1fr) 48px;
     }
-    .generation-page-rail .frames-strip .frame-thumb { height: 80px; max-height: 80px; }
+    .generation-page-rail .frames-strip .frame-thumb { height: 96px; max-height: 96px; }
   }
 
   @media (max-width: 760px) {
