@@ -43,8 +43,11 @@ out/
 # Env / secrets
 .env
 .env.*
-!.env.example
 *.pem
+
+# Local config overrides under config/ (passwords, AccessKeys, machine-specific)
+config/*.local.toml
+config/*.local.env
 
 # Wrangler / Cloudflare
 .wrangler/
@@ -56,6 +59,7 @@ tmp/
 
 # Per-user runtime state (projects, assets, preview, MP4 outputs)
 # This dir is created by the CLI / studio at runtime and is per-developer.
+# Committed project config lives in config/; do not put secrets here.
 .html-video/
 
 # Generated video output (large binaries)
@@ -65,7 +69,3 @@ tmp/
 *.gif
 output/
 renders/
-
-.html-video/oss.toml
-
-.html-video/database.toml

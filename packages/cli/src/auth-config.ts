@@ -1,6 +1,5 @@
 import { createHash, createHmac, timingSafeEqual } from 'node:crypto';
-import { existsSync, readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { resolveTomlConfig } from './config-files.js';
 
 /** Legacy single-account username; used when auth.toml has no [[auth.users]]. */
 export const DEV_AUTH_USERNAME = 'admin';
@@ -18,9 +17,12 @@ export interface AuthConfig {
 }
 
 export function loadAuthConfig(projectRoot: string): AuthConfig | null {
-  const sourcePath = join(projectRoot, '.html-video', 'auth.toml');
-  if (!existsSync(sourcePath)) return null;
-  const parsed = parseAuthToml(readFileSync(sourcePath, 'utf8'));
+  // Auth uses [[auth.users]] array tables — prefer local file wholesale over base.
+  const resolved = resolveTomlConfig(projectRoot, 'auth', { mergeSections: false });
+  if (!resolved) return null;
+  // Prefer local when both exist (resolveTomlConfig already chose local content
+  // when mergeSections is false and local exists).
+  const parsed = parseAuthToml(resolved.content);
   if (!parsed || isPlaceholderPassword(parsed.defaultPassword)) return null;
 
   const users = parsed.users.length > 0
@@ -36,7 +38,7 @@ export function loadAuthConfig(projectRoot: string): AuthConfig | null {
       }];
 
   if (users.some((user) => isPlaceholderPassword(user.password))) return null;
-  return { defaultPassword: parsed.defaultPassword, users, sourcePath };
+  return { defaultPassword: parsed.defaultPassword, users, sourcePath: resolved.sourcePath };
 }
 
 export function findAuthUser(config: AuthConfig, userId: string): AuthUser | undefined {
@@ -205,5 +207,6 @@ function safeEqual(left: string, right: string): boolean {
 }
 
 function isPlaceholderPassword(password: string): boolean {
-  return /^(change[_-]?me|your[_-]?password|replace[_-]?with[_-]?real[_-]?password)$/i.test(password.trim());
+  return /^(change[_-]?me|your[_-]?password|replace[_-]?with[_-]?(real[_-]?)?password|replace[_-]?with[_-]?demo[_-]?password)$/i
+    .test(password.trim());
 }

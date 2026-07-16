@@ -10,6 +10,7 @@
   },
   "scripts": {
     "build": "echo 'project-studio is static; nothing to build'",
-    "typecheck": "echo 'project-studio is static html'"
+    "typecheck": "echo 'project-studio is static html'",
+    "test": "node --test \"test/**/*.test.mjs\""
   }
 }

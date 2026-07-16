@@ -1,7 +1,6 @@
-import { existsSync, readFileSync } from 'node:fs';
-import { join } from 'node:path';
 import { Pool, type PoolConfig } from 'pg';
 import type { DbClient, DbQueryResult, TransactionalDbClient } from '@html-video/core';
+import { resolveTomlConfig } from './config-files.js';
 
 export interface DatabaseConfig {
   enabled: boolean;
@@ -23,15 +22,11 @@ export interface PgClientHandle {
 }
 
 export function loadDatabaseConfig(projectRoot: string): DatabaseConfig | null {
-  const candidates = [
-    join(projectRoot, '.html-video', 'database.toml'),
-    join(projectRoot, 'database.toml'),
-  ];
-  const sourcePath = candidates.find((path) => existsSync(path));
-  if (!sourcePath) return null;
-  const parsed = parseDatabaseToml(readFileSync(sourcePath, 'utf8'));
+  const resolved = resolveTomlConfig(projectRoot, 'database');
+  if (!resolved) return null;
+  const parsed = parseDatabaseToml(resolved.content);
   if (!parsed) return null;
-  return { ...parsed, sourcePath };
+  return { ...parsed, sourcePath: resolved.sourcePath };
 }
 
 export function createPgClient(config: DatabaseConfig): PgClientHandle {

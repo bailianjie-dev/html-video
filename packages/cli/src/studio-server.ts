@@ -169,7 +169,7 @@ export async function startStudioServer(
         const authConfig = loadAuthConfig(ctx.projectRoot);
         if (!authConfig) {
           return json(res, 503, {
-            error: 'Temporary login is not configured. Create .html-video/auth.toml from config/auth.example.toml.',
+            error: 'Temporary login is not configured. Copy config/auth.toml to config/auth.local.toml and set a real password.',
           });
         }
         const username = typeof body.username === 'string'
@@ -226,7 +226,7 @@ export async function startStudioServer(
         if (!cfg) {
           return json(res, 500, {
             ok: false,
-            error: 'Database config not found or invalid. Create .html-video/database.toml with a [database] section.',
+            error: 'Database config not found or invalid. Use config/database.toml + config/database.local.toml with a [database] section.',
           });
         }
         if (!cfg.enabled) {
@@ -296,7 +296,7 @@ export async function startStudioServer(
         if (!cfg) {
           return json(res, 500, {
             ok: false,
-            error: 'Database config not found or invalid. Create .html-video/database.toml with a [database] section.',
+            error: 'Database config not found or invalid. Use config/database.toml + config/database.local.toml with a [database] section.',
           });
         }
         if (!cfg.enabled) {
@@ -466,7 +466,7 @@ export async function startStudioServer(
         if (!dbCfg) {
           return json(res, 500, {
             ok: false,
-            error: 'Database config not found or invalid. Create .html-video/database.toml with a [database] section.',
+            error: 'Database config not found or invalid. Use config/database.toml + config/database.local.toml with a [database] section.',
           });
         }
         if (!dbCfg.enabled) {
@@ -482,7 +482,7 @@ export async function startStudioServer(
         if (!ossCfg) {
           return json(res, 500, {
             ok: false,
-            error: 'OSS config not found or invalid. Create .html-video/oss.toml from .html-video/oss.example.toml.',
+            error: 'OSS config not found or invalid. Use config/oss.toml + config/oss.local.toml with an [oss] section.',
           });
         }
         if (!ossCfg.enabled) {
@@ -575,7 +575,7 @@ export async function startStudioServer(
         if (!cfg) {
           return json(res, 500, {
             ok: false,
-            error: 'Database config not found or invalid. Create .html-video/database.toml with a [database] section.',
+            error: 'Database config not found or invalid. Use config/database.toml + config/database.local.toml with a [database] section.',
           });
         }
         if (!cfg.enabled) {
@@ -3721,8 +3721,20 @@ async function handleAlbumAgentV1Message(args: {
   });
 
   const projectDir = await ctx.projects.ensureDir(projectId);
+  const promptAlbum = await readAlbumModel(ctx, projectId);
+  const promptTemplate = promptAlbum.templateId && ctx.templates.has(promptAlbum.templateId)
+    ? ctx.templates.get(promptAlbum.templateId)
+    : null;
   const prompt = buildAlbumAgentPrompt({
     history,
+    project: {
+      albumExists: promptAlbum.exists,
+      template: promptAlbum.templateId
+        ? { id: promptAlbum.templateId, name: promptTemplate?.name ?? null }
+        : null,
+      revision: promptAlbum.revision,
+      pageCount: promptAlbum.pageCount,
+    },
     attachments: attachments.map((attachment) => ({
       filename: attachment.filename,
       kind: attachment.kind,

@@ -22,21 +22,22 @@
 
 ## 配置文件
 
+配置统一放在 `config/`，分成基本配置与本地配置：
+
+| 文件 | 说明 |
+|------|------|
+| `config/database.toml` | 基本配置（可提交） |
+| `config/database.local.toml` | 本地覆盖（gitignore，放密码） |
+| `config/oss.toml` | 基本配置（可提交） |
+| `config/oss.local.toml` | 本地覆盖（gitignore，放 AccessKey） |
+| `config/auth.toml` | 登录模板（可提交，占位密码） |
+| `config/auth.local.toml` | 真实密码（gitignore） |
+| `config/agent.env` | Pi Agent 基本环境变量模板 |
+| `config/agent.local.env` | 本机 API Key（gitignore） |
+
+详见 `config/README.md`。兼容旧路径：`.html-video/*.toml`、根目录 `database.toml` / `oss.toml`、根目录 `.env`。
+
 ### PostgreSQL
-
-真实配置文件路径：
-
-```text
-.html-video/database.toml
-```
-
-模板文件路径：
-
-```text
-.html-video/database.example.toml
-```
-
-配置结构：
 
 ```toml
 [database]
@@ -56,25 +57,10 @@ connect_timeout = 10
 
 - `enabled = true`：正式项目接口使用 PostgreSQL 持久化
 - `enabled = false`：继续使用原本本地文件持久化
-- 系统优先读取 `.html-video/database.toml`
-- 如果找不到，再尝试读取项目根目录下的 `database.toml`
+- 加载顺序：`config/database.toml` + `config/database.local.toml`（本地覆盖基本）→ 兼容 `.html-video/database.toml` → 根目录 `database.toml`
 - 接口返回配置时会隐藏敏感字段，不会返回数据库密码
 
 ### OSS
-
-真实配置文件路径：
-
-```text
-.html-video/oss.toml
-```
-
-模板文件路径：
-
-```text
-.html-video/oss.example.toml
-```
-
-配置结构：
 
 ```toml
 [oss]
@@ -300,7 +286,7 @@ Invoke-RestMethod -Method Get http://127.0.0.1:3071/api/dev/album-persistence-he
 原因：
 
 - 当前连接的数据库里没有执行迁移
-- 或者 `.html-video/database.toml` 中 `name` 指向了错误数据库
+- 或者 `config/database.local.toml`（或兼容路径 `.html-video/database.toml`）中 `name` 指向了错误数据库
 
 排查：
 
@@ -314,14 +300,14 @@ Invoke-RestMethod -Method Get http://127.0.0.1:3071/api/dev/album-persistence-he
 
 原因：
 
-- 没有 `.html-video/database.toml`
+- 没有有效的 `config/database.toml` / `config/database.local.toml`（或兼容的 `.html-video/database.toml`）
 - TOML 字段缺失
 - `host`、`name`、`user`、`password` 至少一个为空
 
 排查：
 
 ```powershell
-Test-Path .html-video/database.toml
+Test-Path config/database.local.toml
 ```
 
 然后检查 `[database]` 配置块是否完整。
@@ -330,7 +316,7 @@ Test-Path .html-video/database.toml
 
 原因：
 
-- `.html-video/database.toml` 中设置了：
+- `config/database.toml` 或 `config/database.local.toml` 中设置了：
 
 ```toml
 enabled = false
@@ -345,14 +331,14 @@ enabled = false
 
 原因：
 
-- 没有 `.html-video/oss.toml`
+- 没有有效的 `config/oss.toml` / `config/oss.local.toml`（或兼容的 `.html-video/oss.toml`）
 - TOML 字段缺失
 - `endpoint`、`bucket`、`access_key_id`、`access_key_secret` 至少一个为空
 
 排查：
 
 ```powershell
-Test-Path .html-video/oss.toml
+Test-Path config/oss.local.toml
 ```
 
 然后检查 `[oss]` 配置块是否完整。
@@ -425,7 +411,7 @@ node packages/cli/dist/bin.js --cwd . oss-gc --execute
 ```
 
 可用 `--retention-days <n>` 和 `--limit <n>` 临时覆盖配置。默认值可写入
-`.html-video/oss.toml`：
+`config/oss.toml` 或 `config/oss.local.toml`：
 
 ```toml
 [oss]

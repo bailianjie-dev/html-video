@@ -1,6 +1,15 @@
 // html-video studio v0.4 — chat-driven HTML + template gallery + text-node editor
 
 import { t, getLocale, setLocale, AVAILABLE_LOCALES } from './i18n.js';
+import {
+  buildAgentViewStateSnapshot,
+  createAgentRunUiState,
+  preserveActivePageIndex,
+  reduceAgentRunUiEvent,
+  restoreAgentRunUiState,
+  serializeAgentRunUiState,
+  toolUiFromStoredMessage,
+} from './agent-run-ui.js';
 
 // Re-render whole UI on language change.
 document.addEventListener('hv-locale-change', () => {
@@ -113,6 +122,8 @@ const state = {
   agentViewClientRevision: Date.now(),
   agentViewLastSyncKey: '',
   agentViewSyncTimer: null,
+  agentRunUi: null,
+  resumingAgentRun: false,
   albumPageTextEditActive: false, // 电子相册：点「编辑本页」后右侧只显示当前页字段
   // Phase C: per-frame native Remotion enhancement
   albumPageActionBusy: false,
@@ -489,7 +500,7 @@ function wireAuthForm() {
       });
       if (!result.ok || !result.data?.user?.authenticated) {
         error.textContent = result.status === 503
-          ? '临时登录尚未配置，请先创建 .html-video/auth.toml'
+          ? '临时登录尚未配置，请先复制 config/auth.toml 为 config/auth.local.toml 并设置真实密码'
           : '用户名或密码错误';
         passwordInput.select();
         return;
@@ -819,6 +830,8 @@ async function selectProject(id, options = {}) {
   state.activeAlbumPage = 0;
   state.albumPageTextEditActive = false;
   state.enhancing = null;
+  state.agentRunUi = null;
+  state.resumingAgentRun = false;
   // Phase C: map graph node id → kind so the strip can show the "⚡ Enhance"
   // toggle only on data frames. One fetch per project switch.
   state.frameKinds = {};
@@ -846,6 +859,15 @@ async function selectProject(id, options = {}) {
   state.generationComposerOpen = true;
   try { state.messages = (await API.getMessages(id)).messages ?? []; }
   catch { state.messages = []; }
+  let restoredRunMessageIndex = -1;
+  const restoredRun = restoredAgentRunUi(id);
+  if (restoredRun?.status === 'running') {
+    state.agentRunUi = restoredRun;
+    state.messages.push({ role: 'agent-run', runState: restoredRun, ts: Date.now(), recovered: true });
+    restoredRunMessageIndex = state.messages.length - 1;
+    state.composing = true;
+    state.generationProgressText = '正在恢复 Agent 运行状态…';
+  }
   // Do not inject export-done into the AI chat — MP4 export uses toast +
   // automatic download from the export button, not a dialogue card.
   // If a generation is still running on the backend for this project, surface a
@@ -865,6 +887,9 @@ async function selectProject(id, options = {}) {
   if (await enrichFrameLabelsFromHtml(id)) renderFramesStrip();
   await refreshProjectAssets(id);
   await refreshTextFields();
+  if (restoredRunMessageIndex !== -1 && id === state.selectedId) {
+    void resumeAgentRun(id, restoredRunMessageIndex);
+  }
 }
 
 const NAV_ITEMS = [
@@ -885,6 +910,11 @@ function navIcon(name) {
     templates: '<rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/>',
     settings: '<circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 0 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 0 1-4 0v-.2a1.7 1.7 0 0 0-1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 0 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 0 1 0-4h.2a1.7 1.7 0 0 0 1.5-1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 0 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3h.1a1.7 1.7 0 0 0 1-1.5V3a2 2 0 0 1 4 0v.2a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 0 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8v.1a1.7 1.7 0 0 0 1.5 1H21a2 2 0 0 1 0 4h-.2a1.7 1.7 0 0 0-1.4 1Z"/>',
     attach: '<path d="m21.4 11.6-8.5 8.5a5.2 5.2 0 0 1-7.4-7.4l9.1-9.1a3.5 3.5 0 0 1 5 5l-9.1 9.1a1.8 1.8 0 0 1-2.5-2.5l8.5-8.5"/>',
+    tool: '<path d="M14.7 6.3a4 4 0 0 0-5-5l2.1 2.1-2.4 2.4-2.1-2.1a4 4 0 0 0 5 5l6.6 6.6a2 2 0 1 1-2.8 2.8l-6.6-6.6"/>',
+    check: '<path d="m5 12 4 4L19 6"/>',
+    clock: '<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>',
+    alert: '<path d="M12 3 2.8 19h18.4L12 3Z"/><path d="M12 9v4M12 16h.01"/>',
+    close: '<path d="m6 6 12 12M18 6 6 18"/>',
   };
   return `<svg ${common}>${paths[name] ?? paths.edit}</svg>`;
 }
@@ -2605,6 +2635,17 @@ function setGenerationProgress(text, thinkingIdx = null) {
     && state.messages[thinkingIdx].role === 'thinking'
   ) {
     state.messages[thinkingIdx].content = state.generationProgressText || t('chat.thinking');
+    renderChatLog();
+  } else if (
+    thinkingIdx !== null
+    && state.messages[thinkingIdx]?.role === 'agent-run'
+    && !['completed', 'failed', 'cancelled'].includes(state.messages[thinkingIdx].runState?.status)
+    && !state.messages[thinkingIdx].runState?.tools?.some((tool) => tool.status === 'running')
+  ) {
+    state.messages[thinkingIdx].runState = {
+      ...state.messages[thinkingIdx].runState,
+      statusText: state.generationProgressText || 'AI 助手正在思考',
+    };
     renderChatLog();
   }
   updateGenerationControls();
@@ -4569,6 +4610,101 @@ function isGenerationSuccessMessage(m) {
   return /```json#content-graph|故事板规划完成|storyboard (generated|regenerated|restyled)|^✓\s*(?:已生成\s*\d+\s*页预览|预览已更新|updated the HTML preview|HTML preview updated)/i.test(raw);
 }
 
+const TOOL_DISPLAY_NAMES = {
+  get_album_state: '读取相册状态',
+  get_current_page: '读取当前页',
+  get_album_page: '读取相册页面',
+  generate_album: '生成相册',
+  update_album: '修改整本相册',
+  update_album_page: '修改单页',
+  replace_album_assets: '替换相册图片',
+  confirm_album_action: '确认相册操作',
+};
+
+const TOOL_STATUS_VIEW = {
+  running: { label: '执行中', icon: 'clock' },
+  succeeded: { label: '已完成', icon: 'check' },
+  confirmation_required: { label: '等待确认', icon: 'alert' },
+  conflict: { label: '版本冲突', icon: 'alert' },
+  validation_failed: { label: '校验失败', icon: 'alert' },
+  failed: { label: '执行失败', icon: 'close' },
+  cancelled: { label: '已取消', icon: 'close' },
+};
+
+function renderToolResultDetails(result) {
+  if (!result) return '';
+  const rows = [];
+  const revision = result.revision ?? result.currentRevision;
+  if (revision !== null && revision !== undefined) rows.push(`<span>当前 revision <b>${esc(revision)}</b></span>`);
+  if (result.previousRevision !== null && result.previousRevision !== undefined) {
+    rows.push(`<span>上一 revision <b>${esc(result.previousRevision)}</b></span>`);
+  }
+  if (result.changedPages?.length) rows.push(`<span>变更页面 <b>${esc(result.changedPages.join('、'))}</b></span>`);
+  if (result.pageNumber !== null && result.pageNumber !== undefined) rows.push(`<span>页面 <b>${esc(result.pageNumber)}</b></span>`);
+  if (result.pageCount !== null && result.pageCount !== undefined) rows.push(`<span>共 <b>${esc(result.pageCount)}</b> 页</span>`);
+  if (result.changedTextKeys) rows.push(`<span>文本变更 <b>${esc(result.changedTextKeys)}</b> 项</span>`);
+  if (result.changedImageKeys?.length) rows.push(`<span>图片槽位 <b>${esc(result.changedImageKeys.join('、'))}</b></span>`);
+  if (result.changedCtaKeys) rows.push(`<span>CTA 变更 <b>${esc(result.changedCtaKeys)}</b> 项</span>`);
+  if (result.changedStyleVariables) rows.push(`<span>样式变量 <b>${esc(result.changedStyleVariables)}</b> 项</span>`);
+  if (result.structuralChange) rows.push('<span>包含结构变更</span>');
+  if (result.targetKey) rows.push(`<span>实际替换 <b>${esc(result.targetKey)}</b></span>`);
+
+  let notice = '';
+  if (result.confirmationRequired) {
+    notice = `<div class="agent-tool-notice confirmation">
+      <b>需要确认后才能继续</b>
+      ${result.confirmationSummary ? `<span>${esc(result.confirmationSummary)}</span>` : ''}
+      ${result.expectedRevision !== null ? `<span>基于 revision ${esc(result.expectedRevision)}</span>` : ''}
+    </div>`;
+  } else if (result.code === 'ALBUM_REVISION_CONFLICT') {
+    notice = `<div class="agent-tool-notice conflict">
+      <b>相册已被其他操作更新</b>
+      <span>预期 revision ${esc(result.expectedRevision ?? '未知')}，当前 revision ${esc(result.currentRevision ?? '未知')}</span>
+    </div>`;
+  } else if (result.ok === false) {
+    notice = `<div class="agent-tool-notice failure">
+      <b>${esc(result.code || 'TOOL_FAILED')}</b>
+      ${result.message ? `<span>${esc(result.message)}</span>` : ''}
+    </div>`;
+  }
+
+  return `${rows.length ? `<div class="agent-tool-result">${rows.join('')}</div>` : ''}${notice}`;
+}
+
+function renderAgentTool(tool) {
+  const status = TOOL_STATUS_VIEW[tool.status] ?? TOOL_STATUS_VIEW.running;
+  const name = TOOL_DISPLAY_NAMES[tool.name] ?? tool.name ?? '未知工具';
+  return `<div class="agent-tool ${esc(tool.status || 'running')}">
+    <div class="agent-tool-head">
+      <span class="agent-tool-icon">${navIcon(status.icon)}</span>
+      <span class="agent-tool-name">${esc(name)}</span>
+      <span class="agent-tool-status">${esc(status.label)}</span>
+    </div>
+    <div class="agent-tool-args">${(tool.argumentSummary || []).map((part) => `<span>${esc(part)}</span>`).join('')}</div>
+    ${renderToolResultDetails(tool.result)}
+  </div>`;
+}
+
+function renderAgentRunMessage(runState, { persisted = false } = {}) {
+  const run = runState || createAgentRunUiState();
+  const statusIcon = run.status === 'completed'
+    ? 'check'
+    : run.status === 'failed' || run.status === 'cancelled'
+      ? 'alert'
+      : 'clock';
+  const meta = [run.agent, run.model].filter(Boolean).join(' · ');
+  return `<div class="msg agent-run ${esc(run.status || 'idle')}${persisted ? ' persisted' : ''}">
+    <div class="agent-run-head">
+      <span class="agent-run-icon">${navIcon(statusIcon)}</span>
+      <span class="agent-run-status">${esc(run.statusText || 'Agent 处理中')}</span>
+      ${run.latestRevision !== null && run.latestRevision !== undefined ? `<span class="agent-run-revision">revision ${esc(run.latestRevision)}</span>` : ''}
+    </div>
+    ${meta ? `<div class="agent-run-meta">${esc(meta)}</div>` : ''}
+    ${run.tools?.length ? `<div class="agent-tools">${run.tools.map(renderAgentTool).join('')}</div>` : '<div class="agent-run-thinking">正在分析请求并选择下一步</div>'}
+    ${run.error?.message ? `<div class="agent-run-error"><b>${esc(run.error.code || 'RUN_ERROR')}</b><span>${esc(run.error.message)}</span></div>` : ''}
+  </div>`;
+}
+
 function renderMessage(m, idx) {
   if (m.role === 'user') {
     const userContent = (m.content ?? '').trim();
@@ -4603,6 +4739,17 @@ function renderMessage(m, idx) {
   if (m.role === 'system') return `<div class="msg system">${esc(m.content)}</div>`;
   if (m.role === 'preview-event') return `<div class="msg preview-event">${esc(m.content)}</div>`;
   if (m.role === 'thinking') return `<div class="msg thinking">${esc(m.content || t('chat.thinking'))}</div>`;
+  if (m.role === 'agent-run') return renderAgentRunMessage(m.runState);
+  if (m.role === 'tool') {
+    const tool = toolUiFromStoredMessage(m);
+    return renderAgentRunMessage({
+      ...createAgentRunUiState({ runId: m.runId, sessionId: m.sessionId }),
+      status: tool.status === 'succeeded' ? 'completed' : tool.status === 'cancelled' ? 'cancelled' : 'failed',
+      statusText: '历史工具结果',
+      latestRevision: tool.result?.revision ?? tool.result?.currentRevision ?? null,
+      tools: [tool],
+    }, { persisted: true });
+  }
   if (m.role === 'export-done') {
     const path = m.content || '';
     const fname = path.split('/').pop() || 'output.mp4';
@@ -6096,8 +6243,7 @@ async function refreshAfterPreviewReady({ frameCount = 0, focusedFrame = '' } = 
   await refreshTextFields();
 
   if (isElectronicAlbumProject()) {
-    const maxPage = Math.max(0, (Number(state.albumPageCount) || 1) - 1);
-    state.activeAlbumPage = Math.min(keepAlbumPage, maxPage);
+    state.activeAlbumPage = preserveActivePageIndex(keepAlbumPage, state.albumPageCount);
     state.albumPageTextEditActive = keepAlbumEditing && state.albumPageCount > 0;
     updateAlbumPageTabActive();
     updateAlbumPageEditControls();
@@ -8205,12 +8351,12 @@ function currentAgentViewStateSnapshot({ bumpRevision = false } = {}) {
   const activePageIndex = pageCount > 0
     ? Math.max(0, Math.min(pageCount - 1, Number(state.activeAlbumPage) || 0))
     : null;
-  return {
+  return buildAgentViewStateSnapshot({
     activePageIndex,
     pageCount,
-    previewRevision: Math.max(0, Number(state.previewRevision) || 0),
-    clientRevision: Math.max(0, Number(state.agentViewClientRevision) || 0),
-  };
+    previewRevision: state.previewRevision,
+    clientRevision: state.agentViewClientRevision,
+  });
 }
 
 function queueAgentViewStateSync() {
@@ -8235,7 +8381,7 @@ function queueAgentViewStateSync() {
     const snapshot = currentAgentViewStateSnapshot({ bumpRevision: true });
     if (!projectId || !snapshot) return;
     try {
-      const response = await api.putAgentViewState(projectId, snapshot);
+      const response = await API.putAgentViewState(projectId, snapshot);
       if (!response.ok && response.status === 409) {
         const serverRevision = Number(response.view_state?.clientRevision) || 0;
         state.agentViewClientRevision = Math.max(state.agentViewClientRevision, serverRevision + 1);
@@ -8245,6 +8391,153 @@ function queueAgentViewStateSync() {
       state.agentViewLastSyncKey = '';
     }
   }, 120);
+}
+
+function agentRunStorageKey(projectId) {
+  const userId = state.currentUser?.user_id || state.currentUser?.id || 'anonymous';
+  return `html-video:agent-run:v1:${userId}:${projectId}`;
+}
+
+function persistAgentRunUi(projectId, runState) {
+  const serialized = serializeAgentRunUiState(runState);
+  if (!projectId || !serialized) return;
+  try { localStorage.setItem(agentRunStorageKey(projectId), serialized); } catch { /* storage is best effort */ }
+}
+
+function restoredAgentRunUi(projectId) {
+  if (!projectId) return null;
+  try { return restoreAgentRunUiState(localStorage.getItem(agentRunStorageKey(projectId))); }
+  catch { return null; }
+}
+
+async function applyAgentRunEvent(event, context) {
+  const runMessage = state.messages[context.runMessageIndex];
+  if (!runMessage || runMessage.role !== 'agent-run') return;
+  const reduced = reduceAgentRunUiEvent(runMessage.runState, event);
+  if (reduced.state === runMessage.runState && reduced.effects.length === 0) return;
+
+  runMessage.runState = reduced.state;
+  state.agentRunUi = reduced.state;
+  persistAgentRunUi(context.projectId, reduced.state);
+
+  if (event.type === 'assistant.delta' && !context.hasPersistedAssistant) {
+    if (context.assistantIdx === -1 || !state.messages[context.assistantIdx]) {
+      state.messages.push({
+        role: 'assistant',
+        agent: 'AI助手',
+        content: '',
+        runId: reduced.state.runId,
+        sessionId: reduced.state.sessionId,
+        ts: Date.now(),
+      });
+      context.assistantIdx = state.messages.length - 1;
+    }
+    state.messages[context.assistantIdx].content += String(event.data?.text || '');
+  } else if (event.type === 'assistant.completed' && !context.hasPersistedAssistant) {
+    const completedText = String(event.data?.text || '');
+    if (context.assistantIdx === -1 && completedText) {
+      state.messages.push({
+        role: 'assistant',
+        agent: 'AI助手',
+        content: completedText,
+        runId: reduced.state.runId,
+        sessionId: reduced.state.sessionId,
+        ts: Date.now(),
+      });
+      context.assistantIdx = state.messages.length - 1;
+    } else if (context.assistantIdx !== -1 && !state.messages[context.assistantIdx].content) {
+      state.messages[context.assistantIdx].content = completedText;
+    }
+  }
+
+  renderChatLog();
+
+  for (const effect of reduced.effects) {
+    if (effect.type === 'preview_ready' && state.selectedId === context.projectId) {
+      const preview = effect.preview || {};
+      setGenerationProgress('预览已生成，正在刷新页面和缩略图…', context.runMessageIndex);
+      await refreshAfterPreviewReady();
+      queueAgentViewStateSync();
+    } else if (effect.type === 'terminal' && state.selectedId === context.projectId) {
+      stopGenerationProgressTicker(
+        effect.status === 'completed'
+          ? (hasProjectPreview(state.selected) ? '已生成，可预览和调整' : '本轮处理完成')
+          : effect.status === 'cancelled'
+            ? '本轮已取消'
+            : '本轮执行失败',
+      );
+    }
+  }
+}
+
+async function consumeAgentRunReplay(response, context) {
+  if (!response.ok || !response.body) throw new Error(`run recovery failed (${response.status})`);
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (state.selectedId !== context.projectId) {
+      try { await reader.cancel(); } catch { /* navigation cancelled the local replay */ }
+      break;
+    }
+    buffer += decoder.decode(value, { stream: true });
+    const chunks = buffer.split('\n\n');
+    buffer = chunks.pop() || '';
+    for (const chunk of chunks) {
+      const dataLine = chunk.split('\n').find((line) => line.startsWith('data: '));
+      if (!dataLine) continue;
+      try {
+        const event = JSON.parse(dataLine.slice(6));
+        if (event?.version === 1) await applyAgentRunEvent(event, context);
+      } catch { /* ignore malformed or partial replay events */ }
+    }
+  }
+}
+
+async function resumeAgentRun(projectId, runMessageIndex) {
+  if (state.resumingAgentRun) return;
+  const runState = state.messages[runMessageIndex]?.runState;
+  if (!runState?.runId || runState.status !== 'running') return;
+  state.resumingAgentRun = true;
+  const existingAssistant = state.messages.findIndex(
+    (message) => message.role === 'assistant' && message.runId === runState.runId,
+  );
+  const context = {
+    projectId,
+    runMessageIndex,
+    assistantIdx: existingAssistant,
+    hasPersistedAssistant: existingAssistant !== -1,
+  };
+  try {
+    const response = await fetch(
+      `/api/agent-runs/${encodeURIComponent(runState.runId)}/events?after=${runState.lastSequence || 0}`,
+    );
+    await consumeAgentRunReplay(response, context);
+  } catch (error) {
+    if (state.selectedId === projectId) {
+      const message = state.messages[runMessageIndex];
+      if (message?.role === 'agent-run' && message.runState?.status === 'running') {
+        message.runState = {
+          ...message.runState,
+          status: 'failed',
+          statusText: '运行状态恢复失败',
+          error: { code: 'RUN_RECOVERY_UNAVAILABLE', message: String(error?.message || error) },
+        };
+        state.agentRunUi = message.runState;
+        persistAgentRunUi(projectId, message.runState);
+        renderChatLog();
+      }
+    }
+  } finally {
+    state.resumingAgentRun = false;
+    if (state.selectedId === projectId) {
+      state.composing = false;
+      renderComposer();
+      updateGenerationControls();
+    }
+  }
 }
 
 async function sendMessage() {
@@ -8306,12 +8599,21 @@ async function sendMessage() {
     ...(focusFrame ? { focusFrameId: focusFrame } : {}),
     ...(albumPageFocus ? { albumPageIndex: albumPageFocus.index } : {}),
   });
-  state.messages.push({ role: 'thinking', content: t('chat.thinking'), ts: Date.now() });
+  const initialRunState = createAgentRunUiState();
+  initialRunState.statusText = '正在连接 Agent';
+  state.agentRunUi = initialRunState;
+  state.messages.push({ role: 'agent-run', runState: initialRunState, ts: Date.now() });
   const thinkingIdx = state.messages.length - 1;
   startGenerationProgressTicker(thinkingIdx);
   renderChatLog();
 
   let assistantIdx = -1;
+  const agentRunContext = {
+    projectId: genProjectId,
+    runMessageIndex: thinkingIdx,
+    assistantIdx: -1,
+    hasPersistedAssistant: false,
+  };
 
   try {
     let res;
@@ -8359,6 +8661,18 @@ async function sendMessage() {
       if (hasAttachments) {
         refreshProjectAssets(genProjectId);
       }
+      const responseRunId = res.headers.get('x-agent-run-id') || '';
+      const responseSessionId = res.headers.get('x-agent-session-id') || '';
+      if (responseRunId && state.messages[thinkingIdx]?.role === 'agent-run') {
+        state.messages[thinkingIdx].runState = {
+          ...state.messages[thinkingIdx].runState,
+          runId: responseRunId,
+          sessionId: responseSessionId,
+          status: 'running',
+        };
+        state.agentRunUi = state.messages[thinkingIdx].runState;
+        persistAgentRunUi(genProjectId, state.agentRunUi);
+      }
       const reader = res.body.getReader();
       const decoder = new TextDecoder();
       let buf = '';
@@ -8378,23 +8692,8 @@ async function sendMessage() {
           let ev;
           try { ev = JSON.parse(dataLine.slice(6)); } catch { continue; }
           if (ev?.version === 1) {
-            if (ev.type === 'assistant.delta') {
-              ev = { type: 'text', chunk: ev.data?.text ?? '' };
-            } else if (ev.type === 'run.started') {
-              ev = { type: 'progress', stage: 'agent_started', message: 'AI 助手正在思考…' };
-            } else if (ev.type === 'tool.call.started') {
-              ev = { type: 'progress', stage: 'tool_started', message: 'AI 助手正在调用工具…' };
-            } else if (ev.type === 'album.changed') {
-              ev = { type: 'progress', stage: 'album_saved', message: '相册已保存，正在刷新预览…' };
-            } else if (ev.type === 'preview.ready') {
-              ev = { type: 'preview_ready', preview_url: ev.data?.previewUrl, revision: ev.data?.revision };
-            } else if (ev.type === 'run.failed') {
-              ev = { type: 'error', message: ev.data?.message ?? 'Agent failed' };
-            } else if (ev.type === 'run.cancelled') {
-              ev = { type: 'error', message: ev.data?.message ?? 'Agent run cancelled' };
-            } else {
-              continue;
-            }
+            await applyAgentRunEvent(ev, agentRunContext);
+            continue;
           }
           if (ev.type === 'text') {
             setGenerationProgress('模型正在输出内容，正在整理生成结果…', thinkingIdx);
@@ -8455,17 +8754,39 @@ async function sendMessage() {
     // send — otherwise it's just the user having navigated away.
     if (state.selectedId === genProjectId) {
       stopGenerationProgressTicker('生成失败，请查看错误信息。');
-      state.messages[thinkingIdx] = { role: 'system', content: '⚠️ ' + (e.message ?? e), ts: Date.now() };
+      if (state.messages[thinkingIdx]?.role === 'agent-run') {
+        state.messages[thinkingIdx].runState = {
+          ...state.messages[thinkingIdx].runState,
+          statusText: '连接中断，刷新页面可尝试恢复',
+          error: { code: 'RUN_STREAM_INTERRUPTED', message: String(e.message ?? e) },
+        };
+        state.agentRunUi = state.messages[thinkingIdx].runState;
+        persistAgentRunUi(genProjectId, state.agentRunUi);
+      } else {
+        state.messages[thinkingIdx] = { role: 'system', content: '⚠️ ' + (e.message ?? e), ts: Date.now() };
+      }
       renderChatLog();
     }
   }
   // Don't clobber composing if the user already switched to another project
   // (which may have its own generation running).
   if (state.selectedId === genProjectId) {
-    state.composing = false;
+    const finalRunState = state.messages[thinkingIdx]?.role === 'agent-run'
+      ? state.messages[thinkingIdx].runState
+      : null;
+    state.composing = finalRunState?.status === 'running';
     state.expectingInitialGeneration = false;
     state.backendGenerating = false;
-    stopGenerationProgressTicker(hasProjectPreview(state.selected) ? '已生成，可预览和调整' : '');
+    const finalProgress = finalRunState?.status === 'failed'
+      ? '本轮执行失败'
+      : finalRunState?.status === 'cancelled'
+        ? '本轮已取消'
+        : finalRunState?.status === 'completed'
+          ? (finalRunState.preview ? '已生成，可预览和调整' : '本轮处理完成')
+          : hasProjectPreview(state.selected)
+            ? 'Agent 仍在运行，刷新页面可恢复状态'
+            : '';
+    stopGenerationProgressTicker(finalProgress);
     renderComposer();
     renderFooter();
     updateGenerationControls();

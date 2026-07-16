@@ -23,7 +23,7 @@ import { runOssGarbageCollector } from './oss-garbage-collector.js';
 import { migrateLegacyProjects } from './commands/migrate-legacy-projects.js';
 import { loadEnvFile } from './load-env.js';
 
-// Load root .env before any command resolves Pi Agent / DashScope credentials.
+// Load config/agent.env (+ local / legacy .env) before Pi Agent / DashScope credentials resolve.
 loadEnvFile(process.cwd());
 
 // cac is a CJS default export; ESM interop sometimes wraps it in `.default`

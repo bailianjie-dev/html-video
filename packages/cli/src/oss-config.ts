@@ -1,10 +1,10 @@
 import { createHmac } from 'node:crypto';
-import { createReadStream, existsSync, readFileSync } from 'node:fs';
+import { createReadStream } from 'node:fs';
 import { stat } from 'node:fs/promises';
 import { request as httpRequest } from 'node:http';
 import { request as httpsRequest } from 'node:https';
-import { join } from 'node:path';
 import type { Readable } from 'node:stream';
+import { resolveTomlConfig } from './config-files.js';
 
 export interface OssConfig {
   enabled: boolean;
@@ -54,15 +54,11 @@ export interface OssDownloadResult {
 }
 
 export function loadOssConfig(projectRoot: string): OssConfig | null {
-  const candidates = [
-    join(projectRoot, '.html-video', 'oss.toml'),
-    join(projectRoot, 'oss.toml'),
-  ];
-  const sourcePath = candidates.find((path) => existsSync(path));
-  if (!sourcePath) return null;
-  const parsed = parseOssToml(readFileSync(sourcePath, 'utf8'));
+  const resolved = resolveTomlConfig(projectRoot, 'oss');
+  if (!resolved) return null;
+  const parsed = parseOssToml(resolved.content);
   if (!parsed) return null;
-  return { ...parsed, sourcePath };
+  return { ...parsed, sourcePath: resolved.sourcePath };
 }
 
 export function maskedOssConfig(config: OssConfig): Record<string, unknown> {

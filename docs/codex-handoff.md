@@ -127,7 +127,7 @@ PostgreSQL 模式已使用 `ai_album_chat_sessions` 和 `ai_album_chat_messages`
 
 ### 2.7 临时认证和请求上下文
 
-临时账号固定为 `admin`，密码从 `.html-video/auth.toml` 读取，不使用数据库用户表。
+临时账号固定为 `admin`（或 `config/auth.local.toml` 中配置的用户），密码从本地 auth 配置读取，不使用数据库用户表。
 
 接口：
 
@@ -145,30 +145,34 @@ PostgreSQL 模式已使用 `ai_album_chat_sessions` 和 `ai_album_chat_messages`
 
 ## 3. 配置方式
 
-真实配置文件均位于 `.html-video/`，不要提交真实密钥。
+配置统一在 `config/`：基本配置可提交，本地配置（`*.local.toml` / `agent.local.env`）gitignore，不要提交真实密钥。详见 `config/README.md`。
 
 ### PostgreSQL
 
-- 模板：`.html-video/database.example.toml`
-- 实际配置：`.html-video/database.toml`
+- 基本：`config/database.toml`
+- 本地：`config/database.local.toml`
 - 开关：`[database].enabled`
 
 `enabled = true` 使用 PostgreSQL；关闭或无有效配置时使用 `FileProjectPersistence`。
 
 ### OSS
 
-- 模板：`.html-video/oss.example.toml`
-- 实际配置：`.html-video/oss.toml`
+- 基本：`config/oss.toml`
+- 本地：`config/oss.local.toml`
 - 开关：`[oss].enabled`
 
 当前只支持阿里云 OSS。正式素材上传到 OSS 需要数据库和 OSS 两个开关同时启用。
 
 ### 临时登录
 
-- 模板：`.html-video/auth.example.toml`
-- 实际配置：`.html-video/auth.toml`
-- 用户名：固定为 `admin`
-- 密码：只写在实际配置文件中，不应写死在前端或提交到仓库
+- 基本：`config/auth.toml`（占位密码，不会生效）
+- 本地：`config/auth.local.toml`（真实密码）
+- 密码：只写在本地配置中，不应写死在前端或提交到仓库
+
+### Pi Agent
+
+- 基本：`config/agent.env`
+- 本地：`config/agent.local.env`
 
 ## 4. 关键文件
 
