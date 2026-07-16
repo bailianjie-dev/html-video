@@ -1141,6 +1141,8 @@ function hasProjectPreview(project) {
   return !!(
     project?.lastPreviewHtmlPath
     || project?.last_preview_html_path
+    || project?.lastPreviewHtmlUrl
+    || project?.last_preview_html_url
     || (project?.frames?.length ?? 0) > 0
   );
 }
@@ -1855,7 +1857,7 @@ function renderGenerationPage() {
     : hasPreview
       ? `${meta.title || '电子相册'} · 已生成，可预览和调整`
       : `${meta.title || '电子相册'} · 需要重新生成`;
-  const canExportHtml = !!state.selected?.lastPreviewHtmlPath;
+  const canExportHtml = hasProjectPreview(state.selected);
   const canExportMp4 = !!state.selected && hasPreview && !state.exporting;
   const previewEmptyHtml = needsRegenerate
     ? generationRecoverEmptyHtml()
@@ -2045,7 +2047,7 @@ function wireGenerationPage() {
   const exportHtmlBtn = document.getElementById('btn-generation-export-html');
   if (exportHtmlBtn) {
     exportHtmlBtn.onclick = () => {
-      if (!state.selected || !state.selected.lastPreviewHtmlPath) return;
+      if (!state.selected || !hasProjectPreview(state.selected)) return;
       window.location.href = `/api/projects/${state.selected.id}/export-html`;
     };
   }
@@ -2514,7 +2516,7 @@ function updateGenerationControls() {
   const styleBtn = document.getElementById('btn-generation-style');
   if (styleBtn) styleBtn.disabled = !state.selected || !!state.composing;
   const htmlBtn = document.getElementById('btn-generation-export-html');
-  if (htmlBtn) htmlBtn.disabled = !state.selected?.lastPreviewHtmlPath;
+  if (htmlBtn) htmlBtn.disabled = !hasProjectPreview(state.selected);
   const mp4Btn = document.getElementById('btn-generation-export-mp4');
   if (mp4Btn) {
     const canExport = !!(state.selected && hasProjectPreview(state.selected));
@@ -3480,9 +3482,9 @@ function renderToolbar() {
     exportBtn.textContent = t('toolbar.export_mp4');
   }
   if (exportHtmlBtn) {
-    exportHtmlBtn.disabled = !p || !p.lastPreviewHtmlPath;
+    exportHtmlBtn.disabled = !p || !hasProjectPreview(p);
     exportHtmlBtn.textContent = t('toolbar.export_html');
-    exportHtmlBtn.title = p?.lastPreviewHtmlPath
+    exportHtmlBtn.title = hasProjectPreview(p)
       ? t('toolbar.export_html_title_ready')
       : t('toolbar.export_html_title_disabled');
   }
@@ -3668,7 +3670,7 @@ function wireToolbar() {
   const exportHtmlBtn = document.getElementById('btn-export-html');
   if (exportHtmlBtn) {
     exportHtmlBtn.onclick = () => {
-      if (!state.selected || !state.selected.lastPreviewHtmlPath) return;
+      if (!state.selected || !hasProjectPreview(state.selected)) return;
       window.location.href = `/api/projects/${state.selected.id}/export-html`;
     };
   }
@@ -3716,7 +3718,7 @@ function renderMain() {
       renderFramesStrip();
       renderTextFields();
       refreshTextFields();
-      if (state.selected.lastPreviewHtmlPath || (state.selected.frames?.length ?? 0) > 0) {
+      if (hasProjectPreview(state.selected)) {
         renderPreview();
       }
       const textToggle = document.getElementById('btn-textfields-toggle');

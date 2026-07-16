@@ -2428,12 +2428,24 @@ export async function startStudioServer(
         const frameMatch = sub.match(/^\/frame\/([a-z0-9_-]+)$/i);
         if (frameMatch && frameMatch[1]) {
           const nodeId = frameMatch[1];
+          const frameHtml = await ctx.orchestrator.readFrameHtml(projId, nodeId).catch(() => null);
+          if (frameHtml) {
+            const albumPage = frameAlbumPage(project, nodeId);
+            return servePreviewHtmlString(frameHtml, url, albumPage, res);
+          }
           const frame = (project.frames ?? []).find((f) => f.graphNodeId === nodeId);
           if (frame && existsSync(frame.htmlPath)) {
             return serveFile(frame.htmlPath, res);
           }
           res.writeHead(404);
           return res.end('Frame not found');
+        }
+
+        if (sub === '/preview.html' || sub === '/') {
+          const html = await ctx.orchestrator.readRawHtml(projId).catch(() => null);
+          if (html) {
+            return servePreviewHtmlString(html, url, undefined, res);
+          }
         }
 
         const baseDir = project.lastPreviewHtmlPath
@@ -2972,6 +2984,29 @@ function serveHtml(html: string, res: ServerResponse): void {
     pragma: 'no-cache',
   });
   res.end(html);
+}
+
+function servePreviewHtmlString(
+  html: string,
+  url: URL,
+  albumPageHint: number | undefined,
+  res: ServerResponse,
+): void {
+  const albumPage = Number(url.searchParams.get('albumPage') || albumPageHint || 0);
+  if (
+    url.searchParams.get('thumb') === '1'
+    && Number.isFinite(albumPage)
+    && albumPage > 0
+  ) {
+    return serveHtml(injectAlbumPageThumbMode(html, albumPage - 1), res);
+  }
+  return serveHtml(html, res);
+}
+
+function frameAlbumPage(project: Project, nodeId: string): number | undefined {
+  const frames = [...(project.frames ?? [])].sort((a, b) => a.order - b.order);
+  const index = frames.findIndex((frame) => frame.graphNodeId === nodeId);
+  return index >= 0 ? index + 1 : undefined;
 }
 
 function injectAlbumPageThumbMode(html: string, pageIndex: number): string {

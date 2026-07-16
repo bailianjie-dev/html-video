@@ -20,6 +20,7 @@ import {
 } from './commands/project.js';
 import { startStudioServer } from './studio-server.js';
 import { runOssGarbageCollector } from './oss-garbage-collector.js';
+import { migrateLegacyProjects } from './commands/migrate-legacy-projects.js';
 
 // cac is a CJS default export; ESM interop sometimes wraps it in `.default`
 // biome-ignore lint/suspicious/noExplicitAny: cac's types don't expose this shape
@@ -205,6 +206,30 @@ cli
       ok(result);
     } catch (error) {
       fail('oss-gc-failed', error instanceof Error ? error.message : String(error));
+    } finally {
+      await ctx.database?.handle?.close().catch(() => {});
+    }
+  });
+
+cli
+  .command('migrate-legacy-projects', 'Migrate .html-video/projects history into PostgreSQL + OSS')
+  .option('--execute', 'Write database rows and upload files; without this flag this is a dry run')
+  .option('--user <userId>', 'Target user_id for root-level legacy projects')
+  .option('--project <projectId>', 'Migrate only one project id')
+  .option('--limit <n>', 'Maximum legacy projects to inspect')
+  .action(async (opts: any) => {
+    setJsonMode(!!opts.json);
+    const ctx = await bootstrap({ cwd: opts.cwd });
+    try {
+      const result = await migrateLegacyProjects(ctx, {
+        execute: !!opts.execute,
+        userId: opts.user,
+        projectId: opts.project,
+        ...(opts.limit !== undefined && { limit: Number(opts.limit) }),
+      });
+      ok(result);
+    } catch (error) {
+      fail('legacy-migration-failed', error instanceof Error ? error.message : String(error));
     } finally {
       await ctx.database?.handle?.close().catch(() => {});
     }
