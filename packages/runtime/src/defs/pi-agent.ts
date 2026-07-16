@@ -11,6 +11,8 @@
  *             default https://dashscope.aliyuncs.com/compatible-mode/v1
  *   Model:    context.model | HV_PI_MODEL | DASHSCOPE_MODEL | OPENAI_MODEL
  *             default qwen3.7-plus
+ *   Max tokens (output): HV_PI_MAX_TOKENS | DASHSCOPE_MAX_TOKENS | OPENAI_MAX_TOKENS
+ *             default 16384
  */
 import type { Model } from '@mariozechner/pi-ai';
 import {
@@ -28,11 +30,24 @@ import type { AgentDef, AgentEvent } from '../types.js';
 const PROVIDER_ID = 'dashscope';
 const DEFAULT_BASE = 'https://dashscope.aliyuncs.com/compatible-mode/v1';
 const DEFAULT_MODEL = 'qwen3.7-plus';
+export const DEFAULT_PI_MAX_TOKENS = 16_384;
 
 export interface PiAgentResolvedConfig {
   apiKey: string;
   baseUrl: string;
   model: string;
+  /** Max completion tokens sent as `max_tokens` to the provider. */
+  maxTokens: number;
+}
+
+/** Parse a positive integer env value; invalid / missing → fallback. */
+export function parsePositiveIntEnv(raw: string | undefined, fallback: number): number {
+  if (raw === undefined) return fallback;
+  const trimmed = raw.trim();
+  if (!trimmed) return fallback;
+  const n = Number(trimmed);
+  if (!Number.isFinite(n) || !Number.isInteger(n) || n < 1) return fallback;
+  return n;
 }
 
 export function resolvePiAgentConfig(modelOverride?: string): PiAgentResolvedConfig | null {
@@ -56,10 +71,20 @@ export function resolvePiAgentConfig(modelOverride?: string): PiAgentResolvedCon
     || process.env.OPENAI_MODEL
     || DEFAULT_MODEL
   ).trim();
-  return { apiKey, baseUrl, model };
+  const maxTokens = parsePositiveIntEnv(
+    process.env.HV_PI_MAX_TOKENS
+    || process.env.DASHSCOPE_MAX_TOKENS
+    || process.env.OPENAI_MAX_TOKENS,
+    DEFAULT_PI_MAX_TOKENS,
+  );
+  return { apiKey, baseUrl, model, maxTokens };
 }
 
-function buildDashScopeModel(baseUrl: string, modelId: string): Model<'openai-completions'> {
+function buildDashScopeModel(
+  baseUrl: string,
+  modelId: string,
+  maxTokens: number,
+): Model<'openai-completions'> {
   return {
     id: modelId,
     name: modelId,
@@ -70,7 +95,7 @@ function buildDashScopeModel(baseUrl: string, modelId: string): Model<'openai-co
     input: ['text'],
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
     contextWindow: 128_000,
-    maxTokens: 16_384,
+    maxTokens,
     compat: {
       supportsDeveloperRole: false,
       supportsReasoningEffort: false,
@@ -108,7 +133,7 @@ async function runPiSdkSession(opts: {
   });
   await resourceLoader.reload();
 
-  const model = buildDashScopeModel(config.baseUrl, config.model);
+  const model = buildDashScopeModel(config.baseUrl, config.model, config.maxTokens);
   const { session } = await createAgentSession({
     cwd,
     model,
@@ -203,7 +228,7 @@ export const piAgent: AgentDef = {
     if (!cfg) {
       return {
         available: false,
-        hint: 'Set HV_PI_API_KEY (or DASHSCOPE_API_KEY / OPENAI_API_KEY). Optional: HV_PI_BASE_URL, HV_PI_MODEL.',
+        hint: 'Set HV_PI_API_KEY (or DASHSCOPE_API_KEY / OPENAI_API_KEY). Optional: HV_PI_BASE_URL, HV_PI_MODEL, HV_PI_MAX_TOKENS.',
       };
     }
     let host = cfg.baseUrl;

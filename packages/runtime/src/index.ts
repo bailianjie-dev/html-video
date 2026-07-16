@@ -5,7 +5,11 @@ export { spawnAgent } from './spawn.js';
 export type { SpawnOptions } from './spawn.js';
 export { listAmrModels } from './defs/amr.js';
 export type { AmrModel } from './defs/amr.js';
-export { resolvePiAgentConfig } from './defs/pi-agent.js';
+export {
+  resolvePiAgentConfig,
+  parsePositiveIntEnv,
+  DEFAULT_PI_MAX_TOKENS,
+} from './defs/pi-agent.js';
 export type { PiAgentResolvedConfig } from './defs/pi-agent.js';
 export { AgentRunEventLog, runAgentTurn } from './agent-run.js';
 export type {

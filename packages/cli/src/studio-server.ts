@@ -18,6 +18,7 @@ import {
   AssetStore,
   ChatMessageRepository,
   ChatSessionRepository,
+  HtmlVideoError,
   generateTts,
   generateMusic,
   PostgresAssetPersistence,
@@ -27,6 +28,8 @@ import {
   type Asset,
   type AssetRow,
   type ChatMessageRow,
+  type ChatSessionRow,
+  type ChatSessionStatus,
   type DbAssetType,
   type ExportJobRow,
   type JsonObject,
@@ -96,6 +99,7 @@ import {
   type UpdateAlbumPageToolInput,
   type UpdateAlbumToolInput,
 } from './album-agent-tools.js';
+import { isLocalAgentSessionId, LocalAgentSessionStore } from './local-agent-session-store.js';
 
 interface StudioHandle {
   url: string;
@@ -170,7 +174,7 @@ export async function startStudioServer(
         const authConfig = loadAuthConfig(ctx.projectRoot);
         if (!authConfig) {
           return json(res, 503, {
-            error: 'Temporary login is not configured. Copy config/auth.toml to config/auth.local.toml and set a real password.',
+            error: 'Temporary login is not configured. Copy config/config.toml.example to config/config.local.toml and set a real [auth] password.',
           });
         }
         const username = typeof body.username === 'string'
@@ -227,7 +231,7 @@ export async function startStudioServer(
         if (!cfg) {
           return json(res, 500, {
             ok: false,
-            error: 'Database config not found or invalid. Use config/database.toml + config/database.local.toml with a [database] section.',
+            error: 'Database config not found or invalid. Use config/config.toml (+ config.local.toml) with a [database] section.',
           });
         }
         if (!cfg.enabled) {
@@ -297,7 +301,7 @@ export async function startStudioServer(
         if (!cfg) {
           return json(res, 500, {
             ok: false,
-            error: 'Database config not found or invalid. Use config/database.toml + config/database.local.toml with a [database] section.',
+            error: 'Database config not found or invalid. Use config/config.toml (+ config.local.toml) with a [database] section.',
           });
         }
         if (!cfg.enabled) {
@@ -467,7 +471,7 @@ export async function startStudioServer(
         if (!dbCfg) {
           return json(res, 500, {
             ok: false,
-            error: 'Database config not found or invalid. Use config/database.toml + config/database.local.toml with a [database] section.',
+            error: 'Database config not found or invalid. Use config/config.toml (+ config.local.toml) with a [database] section.',
           });
         }
         if (!dbCfg.enabled) {
@@ -483,7 +487,7 @@ export async function startStudioServer(
         if (!ossCfg) {
           return json(res, 500, {
             ok: false,
-            error: 'OSS config not found or invalid. Use config/oss.toml + config/oss.local.toml with an [oss] section.',
+            error: 'OSS config not found or invalid. Use config/config.toml (+ config.local.toml) with an [oss] section.',
           });
         }
         if (!ossCfg.enabled) {
@@ -576,7 +580,7 @@ export async function startStudioServer(
         if (!cfg) {
           return json(res, 500, {
             ok: false,
-            error: 'Database config not found or invalid. Use config/database.toml + config/database.local.toml with a [database] section.',
+            error: 'Database config not found or invalid. Use config/config.toml (+ config.local.toml) with a [database] section.',
           });
         }
         if (!cfg.enabled) {
@@ -764,7 +768,7 @@ export async function startStudioServer(
         }
         if (m === 'DELETE') {
           await ctx.orchestrator.remove(id);
-          MESSAGES.delete(id);
+          clearProjectAgentSessionCaches(ctx, id);
           return json(res, 200, { ok: true });
         }
       }
@@ -1576,7 +1580,129 @@ export async function startStudioServer(
         });
       }
 
-      // Messages: GET history (lazy-loads from messages.json on first hit)
+      const sessionAgentRunMatch = url.pathname.match(
+        /^\/api\/projects\/([^/]+)\/agent-sessions\/([^/]+)\/agent-runs\/([^/]+)(\/events)?$/,
+      );
+      if (sessionAgentRunMatch?.[1] && sessionAgentRunMatch[2] && sessionAgentRunMatch[3]) {
+        const projectId = sessionAgentRunMatch[1];
+        const sessionId = sessionAgentRunMatch[2];
+        const runId = sessionAgentRunMatch[3];
+        const eventsResource = Boolean(sessionAgentRunMatch[4]);
+        await ctx.orchestrator.load(projectId);
+        await getAlbumAgentSession(ctx, projectId, sessionId);
+        const run = AGENT_RUNS.get(runId);
+        if (
+          !run
+          || run.projectKey !== runtimeProjectKey(ctx, projectId)
+          || run.projectId !== projectId
+          || run.sessionId !== sessionId
+        ) {
+          return json(res, 404, { error: 'Agent run not found' });
+        }
+        if (eventsResource && m === 'GET') {
+          return streamRegisteredAgentRun(res, run, agentRunAfterSequence(req, url));
+        }
+        if (!eventsResource && m === 'DELETE') {
+          run.abortController.abort();
+          return json(res, 202, { ok: true, run_id: runId, session_id: sessionId });
+        }
+      }
+
+      const agentSessionsMatch = url.pathname.match(
+        /^\/api\/projects\/([^/]+)\/agent-sessions(?:\/([^/]+))?(?:\/(messages|view-state))?$/,
+      );
+      if (agentSessionsMatch?.[1]) {
+        const projectId = agentSessionsMatch[1];
+        const sessionId = agentSessionsMatch[2];
+        const childResource = agentSessionsMatch[3];
+        await ctx.orchestrator.load(projectId);
+        const defaultModel = findAgent(REQUIRED_AGENT_ID)?.defaultModel ?? null;
+
+        if (!sessionId && !childResource && m === 'GET') {
+          const status = parseAgentSessionStatusFilter(url.searchParams.get('status'));
+          const sessions = await listAlbumAgentSessions(ctx, projectId, status);
+          const projectKey = runtimeProjectKey(ctx, projectId);
+          return json(res, 200, {
+            sessions: sessions.map((session) => publicAlbumAgentSession(
+              session,
+              AGENT_RUNS.getActiveForSession(projectKey, session.id),
+            )),
+          });
+        }
+        if (!sessionId && !childResource && m === 'POST') {
+          const body = await readBody(req).catch(() => ({} as Record<string, unknown>));
+          const session = await createAlbumAgentSession(ctx, projectId, {
+            title: parseOptionalSessionTitle(body.title),
+            model: parseOptionalSessionModel(body.model, defaultModel),
+          });
+          return json(res, 201, { session: publicAlbumAgentSession(session) });
+        }
+        if (sessionId && !childResource && m === 'GET') {
+          const session = await getAlbumAgentSession(ctx, projectId, sessionId);
+          return json(res, 200, {
+            session: publicAlbumAgentSession(
+              session,
+              AGENT_RUNS.getActiveForSession(runtimeProjectKey(ctx, projectId), session.id),
+            ),
+          });
+        }
+        if (sessionId && !childResource && m === 'PATCH') {
+          const body = await readBody(req).catch(() => ({} as Record<string, unknown>));
+          const session = await patchAlbumAgentSession(ctx, projectId, sessionId, body);
+          return json(res, 200, {
+            session: publicAlbumAgentSession(
+              session,
+              AGENT_RUNS.getActiveForSession(runtimeProjectKey(ctx, projectId), session.id),
+            ),
+          });
+        }
+        if (sessionId && !childResource && m === 'DELETE') {
+          const activeRun = AGENT_RUNS.getActiveForSession(runtimeProjectKey(ctx, projectId), sessionId);
+          if (activeRun) return agentSessionRunConflict(res, activeRun);
+          const session = await archiveAlbumAgentSession(ctx, projectId, sessionId);
+          return json(res, 200, { session: publicAlbumAgentSession(session) });
+        }
+        if (sessionId && childResource === 'messages' && m === 'GET') {
+          const messages = await loadMessagesForSession(ctx, projectId, sessionId);
+          return json(res, 200, { session_id: sessionId, messages });
+        }
+        if (sessionId && childResource === 'messages' && m === 'POST') {
+          await getActiveAlbumAgentSession(ctx, projectId, sessionId);
+          const activeRun = AGENT_RUNS.getActiveForSession(runtimeProjectKey(ctx, projectId), sessionId);
+          if (activeRun) return agentSessionRunConflict(res, activeRun);
+          const input = await readAlbumAgentMessageRequest(ctx, req, projectId);
+          await attachExternalSources(ctx, projectId, input.userText, input.attachments);
+          return handleAlbumAgentV1Message({
+            ctx,
+            res,
+            projectId,
+            sessionId,
+            userText: input.userText,
+            attachments: input.attachments,
+            viewStateInput: input.viewStateInput,
+          });
+        }
+        if (sessionId && childResource === 'view-state' && (m === 'GET' || m === 'PUT')) {
+          if (m === 'GET') {
+            const session = await getAlbumAgentSession(ctx, projectId, sessionId);
+            return json(res, 200, { session_id: session.id, view_state: session.viewState });
+          }
+          const body = await readBody(req);
+          const update = await updateAlbumAgentViewStateForSession(
+            ctx,
+            projectId,
+            sessionId,
+            body.view_state ?? body,
+          );
+          return json(res, update.accepted ? 200 : 409, {
+            session_id: update.session.id,
+            accepted: update.accepted,
+            view_state: update.session.viewState,
+          });
+        }
+      }
+
+      // Messages: GET history for the compatibility default Session.
       const msgsMatch = url.pathname.match(/^\/api\/projects\/([^/]+)\/messages$/);
       if (msgsMatch && msgsMatch[1] && m === 'GET') {
         const arr = await loadMessages(ctx, msgsMatch[1]);
@@ -1589,65 +1715,27 @@ export async function startStudioServer(
       // they retain the local AssetStore compatibility behavior.
       if (msgsMatch && msgsMatch[1] && m === 'POST') {
         const id = msgsMatch[1];
-        const ct = req.headers['content-type'] ?? '';
-        let userText = '';
-        let agentViewStateInput: unknown;
-        const attachments: Attachment[] = [];
-
         await ctx.orchestrator.load(id);
-        if (ct.startsWith('multipart/form-data')) {
-          const parts = await receiveMultipart(req, ct);
-          for (const p of parts) {
-            if (p.kind === 'field' && p.name === 'content') {
-              userText = p.value;
-            } else if (p.kind === 'field' && p.name === 'agent_view_state') {
-              try { agentViewStateInput = JSON.parse(p.value); } catch { agentViewStateInput = undefined; }
-            } else if (p.kind === 'file') {
-              const updatedProject = shouldPersistUploadedAssetsToOss(ctx)
-                ? await addFileAssetToOss(ctx, id, p.tmpPath, p.filename)
-                : await ctx.orchestrator.addFileAsset(id, p.tmpPath);
-              const newAsset = updatedProject.assets[updatedProject.assets.length - 1];
-              if (newAsset) {
-                const att: Attachment = {
-                  assetId: newAsset.id,
-                  path: newAsset.path ?? p.tmpPath,
-                  kind: newAsset.type as Attachment['kind'],
-                  filename: p.filename,
-                  size: newAsset.metadata.sizeBytes ?? 0,
-                  ...((newAsset.type === 'image' || newAsset.type === 'video' || newAsset.type === 'audio') && newAsset.id
-                    ? { browserUrl: projectAssetBrowserUrl(id, newAsset.id) }
-                    : {}),
-                };
-                // Inline small text/data uploads so the agent (incl. HTTP ones)
-                // actually sees the content, not just a local path.
-                if (newAsset.type === 'text' || newAsset.type === 'data') {
-                  try {
-                    const txt = await readFile(p.tmpPath, 'utf8');
-                    if (txt.length <= 20_000) att.inlineText = txt;
-                  } catch { /* fall back to path-only */ }
-                }
-                attachments.push(att);
-              }
-            }
-          }
-        } else {
-          const body = await readBody(req);
-          userText = (body.content as string) ?? '';
-          agentViewStateInput = body.agent_view_state;
-        }
-
-        if (!userText && attachments.length === 0) {
-          return json(res, 400, { error: 'content or attachments required' });
-        }
-
-        await attachExternalSources(ctx, id, userText, attachments);
+        const defaultSession = await ensureAlbumAgentSession(
+          ctx,
+          id,
+          findAgent(REQUIRED_AGENT_ID)?.defaultModel ?? null,
+        );
+        const activeRun = AGENT_RUNS.getActiveForSession(
+          runtimeProjectKey(ctx, id),
+          defaultSession.id,
+        );
+        if (activeRun) return agentSessionRunConflict(res, activeRun);
+        const input = await readAlbumAgentMessageRequest(ctx, req, id);
+        await attachExternalSources(ctx, id, input.userText, input.attachments);
         return handleAlbumAgentV1Message({
           ctx,
           res,
           projectId: id,
-          userText,
-          attachments,
-          viewStateInput: agentViewStateInput,
+          sessionId: defaultSession.id,
+          userText: input.userText,
+          attachments: input.attachments,
+          viewStateInput: input.viewStateInput,
         });
       }
 
@@ -1683,14 +1771,7 @@ export async function startStudioServer(
         if (!run || run.projectKey !== runtimeProjectKey(ctx, run.projectId)) {
           return json(res, 404, { error: 'Agent run not found' });
         }
-        const headerSequence = Number(req.headers['last-event-id'] ?? 0);
-        const querySequence = Number(url.searchParams.get('after') ?? 0);
-        const afterSequence = Number.isInteger(querySequence) && querySequence > 0
-          ? querySequence
-          : Number.isInteger(headerSequence) && headerSequence > 0
-            ? headerSequence
-            : 0;
-        return streamRegisteredAgentRun(res, run, afterSequence);
+        return streamRegisteredAgentRun(res, run, agentRunAfterSequence(req, url));
       }
 
       const cancelAgentRunMatch = url.pathname.match(/^\/api\/agent-runs\/([^/]+)$/);
@@ -2023,7 +2104,12 @@ export async function startStudioServer(
 // ---------------------------------------------------------------------------
 
 function httpStatusForErrorCode(code: string): number {
-  if (code === 'project-not-found' || code === 'asset-not-found' || code === 'template-not-found') {
+  if (
+    code === 'project-not-found'
+    || code === 'asset-not-found'
+    || code === 'template-not-found'
+    || code === 'chat-session-not-found'
+  ) {
     return 404;
   }
   if (code === 'invalid-input') return 400;
@@ -2900,7 +2986,7 @@ void AssetStore;
 
 // ---------------------------------------------------------------------------
 // Message history. PostgreSQL mode uses normalized session/message/selection
-// tables; file mode keeps the legacy in-memory cache + messages.json behavior.
+// tables; file mode keeps per-Session in-memory caches + JSON files.
 // ---------------------------------------------------------------------------
 
 interface ChatMessage {
@@ -2933,6 +3019,93 @@ const TERMINAL_AGENT_RUN_EVENTS = new Set([
 function runtimeProjectKey(ctx: CliContext, projectId: string): string {
   if (ctx.database?.mode !== 'postgres') return projectId;
   return `${ctx.requestContexts.getRequiredUser().userId}\0${projectId}`;
+}
+
+function runtimeSessionKey(ctx: CliContext, projectId: string, sessionId: string): string {
+  return `${runtimeProjectKey(ctx, projectId)}\0${sessionId}`;
+}
+
+function agentSessionRunConflict(res: ServerResponse, run: RegisteredAgentRun): void {
+  json(res, 409, {
+    status: 409,
+    code: 'SESSION_HAS_ACTIVE_RUN',
+    error: `Agent session ${run.sessionId} already has an active run`,
+    project_id: run.projectId,
+    session_id: run.sessionId,
+    active_run_id: run.log.runId,
+    events_url: sessionAgentRunEventsPath(run.projectId, run.sessionId, run.log.runId),
+  });
+}
+
+function clearProjectAgentSessionCaches(ctx: CliContext, projectId: string): void {
+  const prefix = `${runtimeProjectKey(ctx, projectId)}\0`;
+  for (const key of MESSAGES.keys()) {
+    if (key.startsWith(prefix)) MESSAGES.delete(key);
+  }
+  for (const key of AGENT_SESSIONS.keys()) {
+    if (key.startsWith(prefix)) AGENT_SESSIONS.delete(key);
+  }
+}
+
+interface AlbumAgentMessageRequest {
+  userText: string;
+  viewStateInput?: unknown;
+  attachments: Attachment[];
+}
+
+async function readAlbumAgentMessageRequest(
+  ctx: CliContext,
+  req: IncomingMessage,
+  projectId: string,
+): Promise<AlbumAgentMessageRequest> {
+  const contentType = req.headers['content-type'] ?? '';
+  let userText = '';
+  let viewStateInput: unknown;
+  const attachments: Attachment[] = [];
+
+  if (contentType.startsWith('multipart/form-data')) {
+    const parts = await receiveMultipart(req, contentType);
+    for (const part of parts) {
+      if (part.kind === 'field' && part.name === 'content') {
+        userText = part.value;
+      } else if (part.kind === 'field' && part.name === 'agent_view_state') {
+        try { viewStateInput = JSON.parse(part.value); } catch { viewStateInput = undefined; }
+      } else if (part.kind === 'file') {
+        const updatedProject = shouldPersistUploadedAssetsToOss(ctx)
+          ? await addFileAssetToOss(ctx, projectId, part.tmpPath, part.filename)
+          : await ctx.orchestrator.addFileAsset(projectId, part.tmpPath);
+        const newAsset = updatedProject.assets[updatedProject.assets.length - 1];
+        if (!newAsset) continue;
+        const attachment: Attachment = {
+          assetId: newAsset.id,
+          path: newAsset.path ?? part.tmpPath,
+          kind: newAsset.type as Attachment['kind'],
+          filename: part.filename,
+          size: newAsset.metadata.sizeBytes ?? 0,
+          ...((newAsset.type === 'image' || newAsset.type === 'video' || newAsset.type === 'audio') && newAsset.id
+            ? { browserUrl: projectAssetBrowserUrl(projectId, newAsset.id) }
+            : {}),
+        };
+        // Inline small text/data uploads so HTTP-backed agents see the content.
+        if (newAsset.type === 'text' || newAsset.type === 'data') {
+          try {
+            const text = await readFile(part.tmpPath, 'utf8');
+            if (text.length <= 20_000) attachment.inlineText = text;
+          } catch { /* fall back to path-only */ }
+        }
+        attachments.push(attachment);
+      }
+    }
+  } else {
+    const body = await readBody(req);
+    userText = typeof body.content === 'string' ? body.content : '';
+    viewStateInput = body.agent_view_state;
+  }
+
+  if (!userText && attachments.length === 0) {
+    throw new HtmlVideoError('invalid-input', 'content or attachments required');
+  }
+  return { userText, viewStateInput, attachments };
 }
 
 async function attachExternalSources(
@@ -2977,11 +3150,12 @@ async function handleAlbumAgentV1Message(args: {
   ctx: CliContext;
   res: ServerResponse;
   projectId: string;
+  sessionId?: string;
   userText: string;
   attachments: Attachment[];
   viewStateInput?: unknown;
 }): Promise<void> {
-  const { ctx, res, projectId, userText, attachments, viewStateInput } = args;
+  const { ctx, res, projectId, sessionId, userText, attachments, viewStateInput } = args;
   const project = await ctx.orchestrator.load(projectId);
   const agentDef = findAgent(REQUIRED_AGENT_ID);
   if (!agentDef) {
@@ -2991,17 +3165,45 @@ async function handleAlbumAgentV1Message(args: {
     await ctx.orchestrator.setAgent(projectId, REQUIRED_AGENT_ID, null).catch(() => {});
   }
 
-  let session = await ensureAlbumAgentSession(ctx, projectId, agentDef.defaultModel ?? null);
+  let session = sessionId
+    ? await getActiveAlbumAgentSession(ctx, projectId, sessionId)
+    : await ensureAlbumAgentSession(ctx, projectId, agentDef.defaultModel ?? null);
   if (viewStateInput !== undefined) {
-    session = (await updateAlbumAgentViewState(
+    session = (await updateAlbumAgentViewStateForSession(
       ctx,
       projectId,
+      session.id,
       viewStateInput,
-      agentDef.defaultModel ?? null,
     )).session;
   }
   const runId = randomUUID();
-  const history = await loadMessages(ctx, projectId);
+  const log = new AgentRunEventLog(runId, session.id);
+  const abortController = new AbortController();
+  const registeredRun: RegisteredAgentRun = {
+    projectKey: runtimeProjectKey(ctx, projectId),
+    projectId,
+    sessionId: session.id,
+    log,
+    abortController,
+    createdAt: Date.now(),
+  };
+  if (!AGENT_RUNS.tryAdd(runId, registeredRun)) {
+    const activeRun = AGENT_RUNS.getActiveForSession(registeredRun.projectKey, session.id);
+    if (activeRun) return agentSessionRunConflict(res, activeRun);
+    return json(res, 409, {
+      status: 409,
+      code: 'SESSION_HAS_ACTIVE_RUN',
+      error: `Agent session ${session.id} could not reserve a run`,
+      project_id: projectId,
+      session_id: session.id,
+    });
+  }
+  let unsubscribe = () => {};
+  let streamStarted = false;
+  let runOutcome: AgentRunOutcome = 'failed';
+
+  try {
+  const history = await loadMessagesForSession(ctx, projectId, session.id);
   const attachmentSummary = attachments.length > 0
     ? `\n\nAttachments: ${attachments.map((attachment) => attachment.filename).join(', ')}`
     : '';
@@ -3037,14 +3239,13 @@ async function handleAlbumAgentV1Message(args: {
   });
   const readTools = createAlbumReadTools({
     getAlbumState: () => readAlbumModel(ctx, projectId),
-    getViewState: async () => (
-      await ensureAlbumAgentSession(ctx, projectId, agentDef.defaultModel ?? null)
-    ).viewState,
+    getViewState: async () => (await getAlbumAgentSession(ctx, projectId, session.id)).viewState,
   });
   const generateTool = createAlbumGenerateTool({
     executeGenerate: (toolCallId, input, signal) => executeAlbumGenerationTool({
       ctx,
       projectId,
+      sessionId: session.id,
       projectDir,
       agentDef,
       toolCallId,
@@ -3057,6 +3258,7 @@ async function handleAlbumAgentV1Message(args: {
     executePageUpdate: (toolCallId, input, signal) => executeAlbumUpdateTool({
       ctx,
       projectId,
+      sessionId: session.id,
       projectDir,
       agentDef,
       toolCallId,
@@ -3068,6 +3270,7 @@ async function handleAlbumAgentV1Message(args: {
     executeAlbumUpdate: (toolCallId, input, signal) => executeAlbumUpdateTool({
       ctx,
       projectId,
+      sessionId: session.id,
       projectDir,
       agentDef,
       toolCallId,
@@ -3081,6 +3284,7 @@ async function handleAlbumAgentV1Message(args: {
     executeAssetReplacement: (toolCallId, input, signal) => executeAlbumAssetReplacementTool({
       ctx,
       projectId,
+      sessionId: session.id,
       agentDef,
       toolCallId,
       input,
@@ -3088,28 +3292,17 @@ async function handleAlbumAgentV1Message(args: {
     }),
   });
   const customTools = [...readTools, generateTool, ...updateTools, ...assetTools];
-  const log = new AgentRunEventLog(runId, session.id);
-  const abortController = new AbortController();
-  const registeredRun: RegisteredAgentRun = {
-    projectKey: runtimeProjectKey(ctx, projectId),
-    projectId,
-    log,
-    abortController,
-    createdAt: Date.now(),
-  };
-  AGENT_RUNS.add(runId, registeredRun);
-
   res.writeHead(200, {
     'content-type': 'text/event-stream; charset=utf-8',
     'cache-control': 'no-cache',
     connection: 'keep-alive',
     'x-agent-run-id': runId,
     'x-agent-session-id': session.id,
+    'x-agent-events-url': sessionAgentRunEventsPath(projectId, session.id, runId),
   });
-  const unsubscribe = log.subscribe((event) => writeAgentRunSse(res, event));
-  let runOutcome: AgentRunOutcome = 'failed';
+  streamStarted = true;
+  unsubscribe = log.subscribe((event) => writeAgentRunSse(res, event));
 
-  try {
     const result = await runAgentTurn({
       def: agentDef,
       prompt,
@@ -3174,7 +3367,7 @@ async function handleAlbumAgentV1Message(args: {
     process.stderr.write(`[studio:agent-metrics] ${JSON.stringify(metrics)}\n`);
     AGENT_RUNS.markCompleted(runId);
     unsubscribe();
-    if (!res.writableEnded) res.end();
+    if (streamStarted && !res.writableEnded) res.end();
   }
 }
 
@@ -3190,63 +3383,21 @@ async function ensureAlbumAgentSession(
       system_prompt_version: ALBUM_AGENT_PROMPT_VERSION,
       toolset_version: ALBUM_AGENT_TOOLSET_VERSION,
     });
-    return {
-      id: row.id,
-      projectId,
-      status: 'active',
-      model,
-      systemPromptVersion: ALBUM_AGENT_PROMPT_VERSION,
-      toolsetVersion: ALBUM_AGENT_TOOLSET_VERSION,
-      viewState: parseStoredAlbumViewState(row.metadata.view_state),
-      pendingConfirmation: parseStoredPendingAlbumConfirmation(row.metadata.pending_album_confirmation),
-      completedToolCalls: parseStoredCompletedAlbumToolCalls(row.metadata.completed_album_tool_calls),
-      createdAt: new Date(row.created_time).toISOString(),
-      updatedAt: new Date(row.updated_time).toISOString(),
-    };
+    return albumAgentSessionFromRow(projectId, row, model);
   }
 
-  const key = runtimeProjectKey(ctx, projectId);
-  const cached = AGENT_SESSIONS.get(key);
-  if (cached) return cached;
-  const projectDir = await ctx.projects.ensureDir(projectId);
-  const sessionPath = join(projectDir, 'agent-session.json');
-  if (existsSync(sessionPath)) {
-    try {
-      const parsed = JSON.parse(await readFile(sessionPath, 'utf8')) as AlbumAgentSessionRecord;
-      if (parsed.id && parsed.projectId === projectId && parsed.status === 'active') {
-        const restored: AlbumAgentSessionRecord = {
-          ...parsed,
-          model: model ?? parsed.model ?? null,
-          systemPromptVersion: ALBUM_AGENT_PROMPT_VERSION,
-          toolsetVersion: ALBUM_AGENT_TOOLSET_VERSION,
-          viewState: parseStoredAlbumViewState(parsed.viewState),
-          pendingConfirmation: parseStoredPendingAlbumConfirmation(parsed.pendingConfirmation),
-          completedToolCalls: parseStoredCompletedAlbumToolCalls(parsed.completedToolCalls),
-        };
-        AGENT_SESSIONS.set(key, restored);
-        return restored;
-      }
-    } catch {
-      // Ignore an invalid local session file and create a fresh session record.
-    }
+  const sessions = await listAlbumAgentSessions(ctx, projectId, 'active');
+  const existing = sessions
+    .slice()
+    .sort((left, right) => left.createdAt.localeCompare(right.createdAt) || left.id.localeCompare(right.id))[0];
+  if (existing) {
+    const restored = model && model !== existing.model
+      ? { ...existing, model, updatedAt: new Date().toISOString() }
+      : existing;
+    if (restored !== existing) await persistAlbumAgentSession(ctx, restored);
+    return restored;
   }
-  const now = new Date().toISOString();
-  const created: AlbumAgentSessionRecord = {
-    id: randomUUID(),
-    projectId,
-    status: 'active',
-    model,
-    systemPromptVersion: ALBUM_AGENT_PROMPT_VERSION,
-    toolsetVersion: ALBUM_AGENT_TOOLSET_VERSION,
-    viewState: null,
-    pendingConfirmation: null,
-    completedToolCalls: {},
-    createdAt: now,
-    updatedAt: now,
-  };
-  await writeFile(sessionPath, JSON.stringify(created, null, 2), 'utf8');
-  AGENT_SESSIONS.set(key, created);
-  return created;
+  return createAlbumAgentSession(ctx, projectId, { title: null, model });
 }
 
 async function updateAlbumAgentViewState(
@@ -3256,6 +3407,17 @@ async function updateAlbumAgentViewState(
   model: string | null,
 ): Promise<{ accepted: boolean; session: AlbumAgentSessionRecord }> {
   const session = await ensureAlbumAgentSession(ctx, projectId, model);
+  return updateAlbumAgentViewStateForSession(ctx, projectId, session.id, input);
+}
+
+async function updateAlbumAgentViewStateForSession(
+  ctx: CliContext,
+  projectId: string,
+  sessionId: string,
+  input: unknown,
+): Promise<{ accepted: boolean; session: AlbumAgentSessionRecord }> {
+  const session = await getAlbumAgentSession(ctx, projectId, sessionId);
+  if (session.status !== 'active') return { accepted: false, session };
   const album = await readAlbumModel(ctx, projectId);
   const normalized = normalizeAlbumViewStateInput({
     input,
@@ -3282,7 +3444,10 @@ async function persistAlbumAgentSession(
   session: AlbumAgentSessionRecord,
 ): Promise<void> {
   if (ctx.database?.mode === 'postgres' && ctx.database.handle) {
-    await projectChatPersistence(ctx).getOrCreateSessionForProject(session.projectId, {
+    await projectChatPersistence(ctx).mergeSessionMetadataForProject(session.projectId, session.id, {
+      model: session.model,
+      system_prompt_version: session.systemPromptVersion,
+      toolset_version: session.toolsetVersion,
       view_state: session.viewState
         ? jsonObject(session.viewState as unknown as Record<string, unknown>)
         : null,
@@ -3295,10 +3460,291 @@ async function persistAlbumAgentSession(
     });
     return;
   }
-  const key = runtimeProjectKey(ctx, session.projectId);
   const projectDir = await ctx.projects.ensureDir(session.projectId);
-  await writeFile(join(projectDir, 'agent-session.json'), JSON.stringify(session, null, 2), 'utf8');
-  AGENT_SESSIONS.set(key, session);
+  await new LocalAgentSessionStore(projectDir, session.projectId).writeSession(session.id, session);
+  AGENT_SESSIONS.set(runtimeSessionKey(ctx, session.projectId, session.id), session);
+}
+
+interface CreateAlbumAgentSessionInput {
+  title?: string | null;
+  model: string | null;
+}
+
+async function createAlbumAgentSession(
+  ctx: CliContext,
+  projectId: string,
+  input: CreateAlbumAgentSessionInput,
+): Promise<AlbumAgentSessionRecord> {
+  if (ctx.database?.mode === 'postgres' && ctx.database.handle) {
+    const row = await projectChatPersistence(ctx).createSessionForProject(projectId, {
+      title: input.title,
+      metadata: {
+        source: 'studio',
+        model: input.model,
+        system_prompt_version: ALBUM_AGENT_PROMPT_VERSION,
+        toolset_version: ALBUM_AGENT_TOOLSET_VERSION,
+      },
+    });
+    return albumAgentSessionFromRow(projectId, row, input.model);
+  }
+  const now = new Date().toISOString();
+  const session: AlbumAgentSessionRecord = {
+    id: randomUUID(),
+    projectId,
+    title: input.title ?? null,
+    status: 'active',
+    model: input.model,
+    systemPromptVersion: ALBUM_AGENT_PROMPT_VERSION,
+    toolsetVersion: ALBUM_AGENT_TOOLSET_VERSION,
+    viewState: null,
+    pendingConfirmation: null,
+    completedToolCalls: {},
+    createdAt: now,
+    updatedAt: now,
+  };
+  await persistAlbumAgentSession(ctx, session);
+  return session;
+}
+
+async function listAlbumAgentSessions(
+  ctx: CliContext,
+  projectId: string,
+  status?: ChatSessionStatus,
+): Promise<AlbumAgentSessionRecord[]> {
+  if (ctx.database?.mode === 'postgres' && ctx.database.handle) {
+    const rows = await projectChatPersistence(ctx).listSessionsForProject(projectId, status);
+    return rows.map((row) => albumAgentSessionFromRow(projectId, row));
+  }
+  const projectDir = await ctx.projects.ensureDir(projectId);
+  const store = new LocalAgentSessionStore(projectDir, projectId);
+  await store.migrateLegacySession();
+  const sessions = (await Promise.all((await store.listSessionIds()).map(async (sessionId) => {
+    const cached = AGENT_SESSIONS.get(runtimeSessionKey(ctx, projectId, sessionId));
+    if (cached) return cached;
+    const raw = await store.readSession<Partial<AlbumAgentSessionRecord>>(sessionId);
+    const restored = normalizeLocalAlbumAgentSession(projectId, sessionId, raw);
+    if (restored) AGENT_SESSIONS.set(runtimeSessionKey(ctx, projectId, sessionId), restored);
+    return restored;
+  }))).filter((session): session is AlbumAgentSessionRecord => Boolean(session));
+  return sessions
+    .filter((session) => !status || session.status === status)
+    .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt) || right.id.localeCompare(left.id));
+}
+
+async function getAlbumAgentSession(
+  ctx: CliContext,
+  projectId: string,
+  sessionId: string,
+): Promise<AlbumAgentSessionRecord> {
+  if (ctx.database?.mode === 'postgres' && ctx.database.handle) {
+    const row = await projectChatPersistence(ctx).getSessionForProject(projectId, sessionId);
+    return albumAgentSessionFromRow(projectId, row);
+  }
+  if (!isLocalAgentSessionId(sessionId)) throw albumAgentSessionNotFound(projectId, sessionId);
+  const projectDir = await ctx.projects.ensureDir(projectId);
+  const store = new LocalAgentSessionStore(projectDir, projectId);
+  await store.migrateLegacySession();
+  const key = runtimeSessionKey(ctx, projectId, sessionId);
+  const cached = AGENT_SESSIONS.get(key);
+  if (cached) return cached;
+  const raw = await store.readSession<Partial<AlbumAgentSessionRecord>>(sessionId);
+  const restored = normalizeLocalAlbumAgentSession(projectId, sessionId, raw);
+  if (!restored) throw albumAgentSessionNotFound(projectId, sessionId);
+  AGENT_SESSIONS.set(key, restored);
+  return restored;
+}
+
+async function getActiveAlbumAgentSession(
+  ctx: CliContext,
+  projectId: string,
+  sessionId: string,
+): Promise<AlbumAgentSessionRecord> {
+  const session = await getAlbumAgentSession(ctx, projectId, sessionId);
+  if (session.status !== 'active') {
+    throw new HtmlVideoError(
+      'invalid-input',
+      `Agent session ${sessionId} is ${session.status}`,
+      false,
+      { projectId, sessionId, status: session.status },
+    );
+  }
+  return session;
+}
+
+async function patchAlbumAgentSession(
+  ctx: CliContext,
+  projectId: string,
+  sessionId: string,
+  body: Record<string, unknown>,
+): Promise<AlbumAgentSessionRecord> {
+  const hasTitle = Object.hasOwn(body, 'title');
+  const hasModel = Object.hasOwn(body, 'model');
+  if (!hasTitle && !hasModel) {
+    throw new HtmlVideoError('invalid-input', 'PATCH requires title or model');
+  }
+  const title = hasTitle ? parseOptionalSessionTitle(body.title) : undefined;
+  const model = hasModel ? parseOptionalSessionModel(body.model, null) : undefined;
+  if (ctx.database?.mode === 'postgres' && ctx.database.handle) {
+    const persistence = projectChatPersistence(ctx);
+    let row = await persistence.getSessionForProject(projectId, sessionId);
+    if (hasTitle) row = await persistence.updateSessionTitleForProject(projectId, sessionId, title ?? null);
+    if (hasModel) {
+      row = await persistence.mergeSessionMetadataForProject(projectId, sessionId, { model: model ?? null });
+    }
+    return albumAgentSessionFromRow(projectId, row);
+  }
+  const current = await getAlbumAgentSession(ctx, projectId, sessionId);
+  const updated: AlbumAgentSessionRecord = {
+    ...current,
+    ...(hasTitle && { title: title ?? null }),
+    ...(hasModel && { model: model ?? null }),
+    updatedAt: new Date().toISOString(),
+  };
+  await persistAlbumAgentSession(ctx, updated);
+  return updated;
+}
+
+async function archiveAlbumAgentSession(
+  ctx: CliContext,
+  projectId: string,
+  sessionId: string,
+): Promise<AlbumAgentSessionRecord> {
+  if (ctx.database?.mode === 'postgres' && ctx.database.handle) {
+    const row = await projectChatPersistence(ctx).updateSessionStatusForProject(
+      projectId,
+      sessionId,
+      'archived',
+    );
+    return albumAgentSessionFromRow(projectId, row);
+  }
+  const current = await getAlbumAgentSession(ctx, projectId, sessionId);
+  if (current.status === 'archived') return current;
+  const updated: AlbumAgentSessionRecord = {
+    ...current,
+    status: 'archived',
+    updatedAt: new Date().toISOString(),
+  };
+  await persistAlbumAgentSession(ctx, updated);
+  return updated;
+}
+
+function albumAgentSessionFromRow(
+  projectId: string,
+  row: ChatSessionRow,
+  fallbackModel: string | null = null,
+): AlbumAgentSessionRecord {
+  return {
+    id: row.id,
+    projectId,
+    title: row.title,
+    status: row.status,
+    model: typeof row.metadata.model === 'string' ? row.metadata.model : fallbackModel,
+    systemPromptVersion: typeof row.metadata.system_prompt_version === 'string'
+      ? row.metadata.system_prompt_version
+      : ALBUM_AGENT_PROMPT_VERSION,
+    toolsetVersion: typeof row.metadata.toolset_version === 'string'
+      ? row.metadata.toolset_version
+      : ALBUM_AGENT_TOOLSET_VERSION,
+    viewState: parseStoredAlbumViewState(row.metadata.view_state),
+    pendingConfirmation: parseStoredPendingAlbumConfirmation(row.metadata.pending_album_confirmation),
+    completedToolCalls: parseStoredCompletedAlbumToolCalls(row.metadata.completed_album_tool_calls),
+    createdAt: new Date(row.created_time).toISOString(),
+    updatedAt: new Date(row.updated_time).toISOString(),
+  };
+}
+
+function normalizeLocalAlbumAgentSession(
+  projectId: string,
+  sessionId: string,
+  raw: Partial<AlbumAgentSessionRecord> | null,
+): AlbumAgentSessionRecord | null {
+  if (!raw || raw.id !== sessionId || raw.projectId !== projectId) return null;
+  const status = raw.status === 'archived' || raw.status === 'closed' ? raw.status : 'active';
+  const createdAt = typeof raw.createdAt === 'string' ? raw.createdAt : new Date().toISOString();
+  return {
+    id: sessionId,
+    projectId,
+    title: typeof raw.title === 'string' ? raw.title : null,
+    status,
+    model: typeof raw.model === 'string' ? raw.model : null,
+    systemPromptVersion: ALBUM_AGENT_PROMPT_VERSION,
+    toolsetVersion: ALBUM_AGENT_TOOLSET_VERSION,
+    viewState: parseStoredAlbumViewState(raw.viewState),
+    pendingConfirmation: parseStoredPendingAlbumConfirmation(raw.pendingConfirmation),
+    completedToolCalls: parseStoredCompletedAlbumToolCalls(raw.completedToolCalls),
+    createdAt,
+    updatedAt: typeof raw.updatedAt === 'string' ? raw.updatedAt : createdAt,
+  };
+}
+
+function publicAlbumAgentSession(
+  session: AlbumAgentSessionRecord,
+  activeRun?: RegisteredAgentRun,
+): Record<string, unknown> {
+  const activeEvents = activeRun?.log.list() ?? [];
+  return {
+    id: session.id,
+    project_id: session.projectId,
+    title: session.title,
+    status: session.status,
+    model: session.model,
+    system_prompt_version: session.systemPromptVersion,
+    toolset_version: session.toolsetVersion,
+    view_state: session.viewState,
+    has_pending_confirmation: Boolean(session.pendingConfirmation),
+    pending_confirmation: session.pendingConfirmation
+      ? {
+          action_id: session.pendingConfirmation.actionId,
+          kind: session.pendingConfirmation.kind,
+          summary: session.pendingConfirmation.summary,
+          expected_revision: session.pendingConfirmation.expectedRevision,
+          created_at: session.pendingConfirmation.createdAt,
+          expires_at: session.pendingConfirmation.expiresAt,
+        }
+      : null,
+    active_run: activeRun
+      ? {
+          run_id: activeRun.log.runId,
+          last_sequence: activeEvents.at(-1)?.sequence ?? 0,
+          created_at: new Date(activeRun.createdAt).toISOString(),
+        }
+      : null,
+    created_at: session.createdAt,
+    updated_at: session.updatedAt,
+  };
+}
+
+function parseAgentSessionStatusFilter(value: string | null): ChatSessionStatus | undefined {
+  if (value === null || value === '') return undefined;
+  if (value === 'active' || value === 'closed' || value === 'archived') return value;
+  throw new HtmlVideoError('invalid-input', `Unsupported session status: ${value}`);
+}
+
+function parseOptionalSessionTitle(value: unknown): string | null | undefined {
+  if (value === undefined) return undefined;
+  if (value === null) return null;
+  if (typeof value !== 'string') throw new HtmlVideoError('invalid-input', 'Session title must be a string or null');
+  const title = value.trim();
+  if (title.length > 200) throw new HtmlVideoError('invalid-input', 'Session title must be 200 characters or fewer');
+  return title || null;
+}
+
+function parseOptionalSessionModel(value: unknown, fallback: string | null): string | null {
+  if (value === undefined) return fallback;
+  if (value === null) return null;
+  if (typeof value !== 'string') throw new HtmlVideoError('invalid-input', 'Session model must be a string or null');
+  const model = value.trim();
+  if (!model || model.length > 200) throw new HtmlVideoError('invalid-input', 'Session model must contain 1 to 200 characters');
+  return model;
+}
+
+function albumAgentSessionNotFound(projectId: string, sessionId: string): HtmlVideoError {
+  return new HtmlVideoError(
+    'chat-session-not-found',
+    `Agent session ${sessionId} was not found for project ${projectId}`,
+    false,
+    { projectId, sessionId },
+  );
 }
 
 function parseStoredAlbumViewState(value: unknown): AlbumViewState | null {
@@ -3384,6 +3830,7 @@ function parseStoredCompletedAlbumToolCalls(value: unknown): Record<string, Comp
 interface ExecuteAlbumGenerationToolArgs {
   ctx: CliContext;
   projectId: string;
+  sessionId: string;
   projectDir: string;
   agentDef: import('@html-video/runtime').AgentDef;
   toolCallId: string;
@@ -3397,10 +3844,10 @@ async function executeAlbumGenerationTool(
 ): Promise<Record<string, unknown>> {
   const key = runtimeProjectKey(args.ctx, args.projectId);
   return withAlbumWriteQueue(key, async () => {
-    let session = await ensureAlbumAgentSession(
+    let session = await getActiveAlbumAgentSession(
       args.ctx,
       args.projectId,
-      args.agentDef.defaultModel ?? null,
+      args.sessionId,
     );
     const replay = session.completedToolCalls[`tool:${args.toolCallId}`];
     if (replay) return replayAlbumToolResult(replay.result);
@@ -3469,10 +3916,10 @@ async function executeAlbumGenerationTool(
         input: pending.generationInput,
         expectedRevision: pending.expectedRevision,
       });
-      session = await ensureAlbumAgentSession(
+      session = await getAlbumAgentSession(
         args.ctx,
         args.projectId,
-        args.agentDef.defaultModel ?? null,
+        args.sessionId,
       );
       if (generated.ok === true) session = updateSessionAfterAlbumGeneration(session, generated);
       session = { ...session, pendingConfirmation: null };
@@ -3524,10 +3971,10 @@ async function executeAlbumGenerationTool(
       input: normalizedInput,
       expectedRevision: currentRevision,
     });
-    session = await ensureAlbumAgentSession(
+    session = await getAlbumAgentSession(
       args.ctx,
       args.projectId,
-      args.agentDef.defaultModel ?? null,
+      args.sessionId,
     );
     if (generated.ok === true) session = updateSessionAfterAlbumGeneration(session, generated);
     return rememberAndPersistAlbumToolResult(args, session, generated);
@@ -3662,6 +4109,7 @@ function updateSessionAfterAlbumGeneration(
 interface ExecuteAlbumUpdateToolArgs {
   ctx: CliContext;
   projectId: string;
+  sessionId: string;
   projectDir: string;
   agentDef: import('@html-video/runtime').AgentDef;
   toolCallId: string;
@@ -3674,6 +4122,7 @@ interface ExecuteAlbumUpdateToolArgs {
 interface ExecuteAlbumAssetReplacementToolArgs {
   ctx: CliContext;
   projectId: string;
+  sessionId: string;
   agentDef: import('@html-video/runtime').AgentDef;
   toolCallId: string;
   input: ReplaceAlbumAssetsToolInput;
@@ -3933,10 +4382,10 @@ async function executeAlbumUpdateTool(
 ): Promise<Record<string, unknown>> {
   const key = runtimeProjectKey(args.ctx, args.projectId);
   return withAlbumWriteQueue(key, async () => {
-    let session = await ensureAlbumAgentSession(
+    let session = await getActiveAlbumAgentSession(
       args.ctx,
       args.projectId,
-      args.agentDef.defaultModel ?? null,
+      args.sessionId,
     );
     const replay = session.completedToolCalls[`tool:${args.toolCallId}`];
     if (replay) return replayAlbumToolResult(replay.result);
@@ -4072,10 +4521,10 @@ async function executeAlbumUpdateTool(
     if (saved.ok !== true) {
       return rememberAndPersistAlbumToolResult(args, session, saved);
     }
-    session = await ensureAlbumAgentSession(
+    session = await getAlbumAgentSession(
       args.ctx,
       args.projectId,
-      args.agentDef.defaultModel ?? null,
+      args.sessionId,
     );
     session = updateSessionAfterAlbumUpdate(session, saved, pageIndex);
     const result = { ...saved, update_strategy: updateStrategy };
@@ -4088,10 +4537,10 @@ async function executeAlbumAssetReplacementTool(
 ): Promise<Record<string, unknown>> {
   const key = runtimeProjectKey(args.ctx, args.projectId);
   return withAlbumWriteQueue(key, async () => {
-    let session = await ensureAlbumAgentSession(
+    let session = await getActiveAlbumAgentSession(
       args.ctx,
       args.projectId,
-      args.agentDef.defaultModel ?? null,
+      args.sessionId,
     );
     const replay = session.completedToolCalls[`tool:${args.toolCallId}`];
     if (replay) return replayAlbumToolResult(replay.result);
@@ -4177,6 +4626,7 @@ async function executeAlbumAssetReplacementTool(
     const saved = await persistAlbumUpdate({
       ctx: args.ctx,
       projectId: args.projectId,
+      sessionId: args.sessionId,
       projectDir: await args.ctx.projects.ensureDir(args.projectId),
       agentDef: args.agentDef,
       toolCallId: args.toolCallId,
@@ -4199,10 +4649,10 @@ async function executeAlbumAssetReplacementTool(
       return rememberAndPersistAlbumToolResult(args, session, saved);
     }
 
-    session = await ensureAlbumAgentSession(
+    session = await getAlbumAgentSession(
       args.ctx,
       args.projectId,
-      args.agentDef.defaultModel ?? null,
+      args.sessionId,
     );
     session = updateSessionAfterAlbumUpdate(session, saved, args.input.page_number - 1);
     return rememberAndPersistAlbumToolResult(args, session, {
@@ -4846,6 +5296,20 @@ function safeToolResultText(output: unknown): string {
   catch { return String(output).slice(0, 20_000); }
 }
 
+function sessionAgentRunEventsPath(projectId: string, sessionId: string, runId: string): string {
+  return `/api/projects/${encodeURIComponent(projectId)}/agent-sessions/${encodeURIComponent(sessionId)}/agent-runs/${encodeURIComponent(runId)}/events`;
+}
+
+function agentRunAfterSequence(req: IncomingMessage, url: URL): number {
+  const headerSequence = Number(req.headers['last-event-id'] ?? 0);
+  const querySequence = Number(url.searchParams.get('after') ?? 0);
+  return Number.isInteger(querySequence) && querySequence > 0
+    ? querySequence
+    : Number.isInteger(headerSequence) && headerSequence > 0
+      ? headerSequence
+      : 0;
+}
+
 function writeAgentRunSse(res: ServerResponse, event: AgentRunEvent): void {
   try {
     if (!res.writableEnded) {
@@ -4867,6 +5331,7 @@ async function streamRegisteredAgentRun(
     connection: 'keep-alive',
     'x-agent-run-id': run.log.runId,
     'x-agent-session-id': run.log.sessionId,
+    'x-agent-events-url': sessionAgentRunEventsPath(run.projectId, run.sessionId, run.log.runId),
   });
   const existing = run.log.list(afterSequence);
   for (const event of existing) writeAgentRunSse(res, event);
@@ -4897,29 +5362,43 @@ async function streamRegisteredAgentRun(
 }
 
 async function loadMessages(ctx: CliContext, projectId: string): Promise<ChatMessage[]> {
+  const model = findAgent(REQUIRED_AGENT_ID)?.defaultModel ?? null;
+  const session = await ensureAlbumAgentSession(ctx, projectId, model);
+  return loadMessagesForSession(ctx, projectId, session.id);
+}
+
+async function loadMessagesForSession(
+  ctx: CliContext,
+  projectId: string,
+  sessionId: string,
+): Promise<ChatMessage[]> {
   if (ctx.database?.mode === 'postgres' && ctx.database.handle) {
-    const rows = await projectChatPersistence(ctx).listForProject(projectId);
+    const rows = await projectChatPersistence(ctx).listForSession(projectId, sessionId);
     return rows.map(chatRowToMessage);
   }
-  const cached = MESSAGES.get(projectId);
+  await getAlbumAgentSession(ctx, projectId, sessionId);
+  const key = runtimeSessionKey(ctx, projectId, sessionId);
+  const cached = MESSAGES.get(key);
   if (cached) return cached;
   const projectDir = await ctx.projects.ensureDir(projectId);
-  const filePath = join(projectDir, 'messages.json');
+  const store = new LocalAgentSessionStore(projectDir, projectId);
+  await store.migrateLegacySession();
+  const filePath = join(projectDir, 'agent-sessions', sessionId, 'messages.json');
   if (!existsSync(filePath)) {
-    MESSAGES.set(projectId, []);
-    return MESSAGES.get(projectId)!;
+    MESSAGES.set(key, []);
+    return MESSAGES.get(key)!;
   }
   try {
     const raw = await readFile(filePath, 'utf8');
     const parsed = JSON.parse(raw);
     const arr = Array.isArray(parsed) ? (parsed as ChatMessage[]) : [];
-    MESSAGES.set(projectId, arr);
+    MESSAGES.set(key, arr);
     return arr;
   } catch {
     // Corrupt file — start fresh in memory but don't overwrite the file
     // until the next save (gives the user a chance to recover by hand).
-    MESSAGES.set(projectId, []);
-    return MESSAGES.get(projectId)!;
+    MESSAGES.set(key, []);
+    return MESSAGES.get(key)!;
   }
 }
 
@@ -4927,17 +5406,18 @@ async function appendMessage(
   ctx: CliContext,
   projectId: string,
   messages: ChatMessage[],
-  message: ChatMessage,
+  message: ChatMessage & { sessionId: string },
 ): Promise<void> {
+  const sessionId = message.sessionId;
   if (ctx.database?.mode === 'postgres' && ctx.database.handle) {
-    await projectChatPersistence(ctx).appendForProject(projectId, {
+    await projectChatPersistence(ctx).appendForSession(projectId, sessionId, {
       role: message.role,
       content: message.content,
       ...(message.agent && { agent: message.agent }),
       ...(message.tool && { tool: message.tool }),
       payload: jsonObject({
         ...(message.output !== undefined && { output: message.output }),
-        ...(message.sessionId && { session_id: message.sessionId }),
+        session_id: sessionId,
         ...(message.runId && { run_id: message.runId }),
       }),
       occurredAt: new Date(message.ts),
@@ -4946,11 +5426,9 @@ async function appendMessage(
     return;
   }
   messages.push(message);
-  MESSAGES.set(projectId, messages);
+  MESSAGES.set(runtimeSessionKey(ctx, projectId, sessionId), messages);
   const projectDir = await ctx.projects.ensureDir(projectId);
-  const filePath = join(projectDir, 'messages.json');
-  const fs = await import('node:fs/promises');
-  await fs.writeFile(filePath, JSON.stringify(messages, null, 2), 'utf8');
+  await new LocalAgentSessionStore(projectDir, projectId).writeMessages(sessionId, messages);
 }
 
 function projectChatPersistence(ctx: CliContext): PostgresChatPersistence {
@@ -4969,7 +5447,7 @@ function projectChatPersistence(ctx: CliContext): PostgresChatPersistence {
 
 function chatRowToMessage(row: ChatMessageRow): ChatMessage {
   const output = row.payload.output;
-  const sessionId = typeof row.payload.session_id === 'string' ? row.payload.session_id : undefined;
+  const sessionId = typeof row.payload.session_id === 'string' ? row.payload.session_id : row.session_id;
   const runId = typeof row.payload.run_id === 'string' ? row.payload.run_id : undefined;
   return {
     role: row.role,
@@ -6037,6 +6515,168 @@ function hardenAlbumHtml(html: string): string {
 </script>`;
     if (/<\/body>/i.test(out)) out = out.replace(/<\/body>/i, `${script}\n</body>`);
     else out = `${out}\n${script}`;
+  }
+
+  // Fixed-canvas albums (e.g. #album { width:1080px; height:1920px }) only show a
+  // corner when opened in a smaller browser window. Scale the canvas to fit.
+  // Responsive albums (100vh / 100% width) are left alone. At native export size
+  // (Playwright 1080×1920) scale stays 1 — video export is unchanged.
+  if (!out.includes('id="hv-album-canvas-fit"') && !out.includes("id='hv-album-canvas-fit'")) {
+    const fit = `
+<style id="hv-album-canvas-fit-css">
+html.hv-album-canvas-fit, html.hv-album-canvas-fit body {
+  width: 100% !important;
+  height: 100% !important;
+  margin: 0 !important;
+  overflow: hidden !important;
+  background: #0d0d0d;
+}
+#hv-album-fit-stage {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  background: inherit;
+}
+#hv-album-fit-clip {
+  position: relative;
+  overflow: hidden;
+  flex: 0 0 auto;
+}
+#hv-album-fit-clip > #album,
+#hv-album-fit-clip > .album,
+#hv-album-fit-clip > [data-album] {
+  position: absolute;
+  top: 0;
+  left: 0;
+  transform-origin: top left;
+}
+</style>
+<script id="hv-album-canvas-fit">
+(function () {
+  if (window.__hvAlbumCanvasFit) return;
+  window.__hvAlbumCanvasFit = true;
+
+  function px(n) {
+    var v = parseFloat(n);
+    return Number.isFinite(v) ? v : 0;
+  }
+
+  function parseDesignFromStyles() {
+    var chunks = [];
+    var nodes = document.querySelectorAll('style');
+    for (var i = 0; i < nodes.length; i++) chunks.push(nodes[i].textContent || '');
+    var css = chunks.join('\\n');
+    var blocks = [
+      /#album\\s*\\{([^}]*)\\}/i.exec(css),
+      /\\.album-page\\s*\\{([^}]*)\\}/i.exec(css),
+      /\\.album\\s*\\{([^}]*)\\}/i.exec(css),
+    ];
+    for (var b = 0; b < blocks.length; b++) {
+      var body = blocks[b] && blocks[b][1];
+      if (!body) continue;
+      var wm = /width\\s*:\\s*(\\d+)px/i.exec(body);
+      var hm = /height\\s*:\\s*(\\d+)px/i.exec(body);
+      if (wm && hm) {
+        var w = Number(wm[1]);
+        var h = Number(hm[1]);
+        if (w >= 720 && h >= 720) return { w: w, h: h };
+      }
+    }
+    // Meta width alone is ambiguous for landscape vs portrait — only use it when
+    // CSS lacked explicit px sizes and width looks like a phone portrait canvas.
+    var meta = document.querySelector('meta[name="viewport"]');
+    var content = (meta && meta.getAttribute('content')) || '';
+    var mw = /width\\s*=\\s*(\\d+)/i.exec(content);
+    if (mw && Number(mw[1]) >= 720 && Number(mw[1]) <= 1200) {
+      var width = Number(mw[1]);
+      return { w: width, h: Math.round(width * 16 / 9) };
+    }
+    return null;
+  }
+
+  function albumRoot() {
+    return document.getElementById('album')
+      || document.querySelector('.album, [data-album]');
+  }
+
+  function unwrap() {
+    document.documentElement.classList.remove('hv-album-canvas-fit');
+    var clip = document.getElementById('hv-album-fit-clip');
+    var stage = document.getElementById('hv-album-fit-stage');
+    var album = (clip && clip.firstElementChild) || albumRoot();
+    if (album) {
+      album.style.transform = '';
+      album.style.position = '';
+      album.style.top = '';
+      album.style.left = '';
+    }
+    if (clip && album && clip.parentNode) {
+      var host = stage && stage.parentNode ? stage.parentNode : clip.parentNode;
+      host.insertBefore(album, stage || clip);
+    }
+    if (clip) clip.remove();
+    if (stage) stage.remove();
+  }
+
+  function apply() {
+    var design = parseDesignFromStyles();
+    var album = albumRoot();
+    if (!design || !album) {
+      unwrap();
+      return;
+    }
+    var dw = design.w;
+    var dh = design.h;
+    var vw = Math.max(1, window.innerWidth || document.documentElement.clientWidth || dw);
+    var vh = Math.max(1, window.innerHeight || document.documentElement.clientHeight || dh);
+    var scale = Math.min(vw / dw, vh / dh, 1);
+    if (scale >= 0.999) {
+      unwrap();
+      return;
+    }
+    document.documentElement.classList.add('hv-album-canvas-fit');
+    var stage = document.getElementById('hv-album-fit-stage');
+    var clip = document.getElementById('hv-album-fit-clip');
+    if (!stage) {
+      stage = document.createElement('div');
+      stage.id = 'hv-album-fit-stage';
+      album.parentNode.insertBefore(stage, album);
+    }
+    if (!clip) {
+      clip = document.createElement('div');
+      clip.id = 'hv-album-fit-clip';
+      stage.appendChild(clip);
+    }
+    if (album.parentNode !== clip) clip.appendChild(album);
+    clip.style.width = Math.round(dw * scale) + 'px';
+    clip.style.height = Math.round(dh * scale) + 'px';
+    album.style.width = dw + 'px';
+    album.style.height = dh + 'px';
+    album.style.transform = 'scale(' + scale + ')';
+    album.style.transformOrigin = 'top left';
+    album.style.position = 'absolute';
+    album.style.top = '0';
+    album.style.left = '0';
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', apply);
+  } else {
+    apply();
+  }
+  window.addEventListener('resize', apply);
+})();
+</script>`;
+    if (/<\/head>/i.test(out)) {
+      out = out.replace(/<\/head>/i, `${fit}\n</head>`);
+    } else if (/<\/body>/i.test(out)) {
+      out = out.replace(/<\/body>/i, `${fit}\n</body>`);
+    } else {
+      out = `${out}\n${fit}`;
+    }
   }
 
   return out;

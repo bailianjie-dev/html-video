@@ -13,6 +13,7 @@ export type ErrorCode =
   | 'disk-full'
   | 'cancelled'
   | 'asset-not-found'
+  | 'chat-session-not-found'
   | 'project-not-found'
   | 'invalid-input';
 

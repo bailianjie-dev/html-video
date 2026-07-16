@@ -39,6 +39,7 @@ export type {
   PostgresAssetPersistenceOptions,
 } from './services/postgres-asset-persistence.js';
 export type {
+  CreateProjectChatSessionInput,
   PersistedChatMessageInput,
   PostgresChatPersistenceOptions,
 } from './services/postgres-chat-persistence.js';

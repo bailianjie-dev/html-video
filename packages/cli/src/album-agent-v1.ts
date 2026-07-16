@@ -71,7 +71,8 @@ export interface CompletedAlbumToolCall {
 export interface AlbumAgentSessionRecord {
   id: string;
   projectId: string;
-  status: 'active';
+  title: string | null;
+  status: 'active' | 'closed' | 'archived';
   model: string | null;
   systemPromptVersion: string;
   toolsetVersion: string;
@@ -102,6 +103,7 @@ export interface AlbumAgentProjectContextInput {
 export interface RegisteredAgentRun {
   projectKey: string;
   projectId: string;
+  sessionId: string;
   log: AgentRunEventLog;
   abortController: AbortController;
   createdAt: number;
@@ -209,19 +211,47 @@ export function buildAlbumAgentPrompt(args: {
 
 export class AgentRunRegistry {
   private readonly runs = new Map<string, RegisteredAgentRun>();
+  private readonly activeBySession = new Map<string, string>();
 
-  add(runId: string, run: RegisteredAgentRun): void {
+  tryAdd(runId: string, run: RegisteredAgentRun): boolean {
+    if (this.runs.has(runId)) return false;
+    const sessionKey = agentRunSessionKey(run.projectKey, run.sessionId);
+    const activeRunId = this.activeBySession.get(sessionKey);
+    if (activeRunId) {
+      const activeRun = this.runs.get(activeRunId);
+      if (activeRun && activeRun.completedAt === undefined) return false;
+      this.activeBySession.delete(sessionKey);
+    }
     this.runs.set(runId, run);
+    this.activeBySession.set(sessionKey, runId);
     this.prune();
+    return true;
   }
 
   get(runId: string): RegisteredAgentRun | undefined {
     return this.runs.get(runId);
   }
 
+  getActiveForSession(projectKey: string, sessionId: string): RegisteredAgentRun | undefined {
+    const sessionKey = agentRunSessionKey(projectKey, sessionId);
+    const runId = this.activeBySession.get(sessionKey);
+    if (!runId) return undefined;
+    const run = this.runs.get(runId);
+    if (!run || run.completedAt !== undefined) {
+      this.activeBySession.delete(sessionKey);
+      return undefined;
+    }
+    return run;
+  }
+
   markCompleted(runId: string): void {
     const run = this.runs.get(runId);
-    if (run) run.completedAt = Date.now();
+    if (!run) return;
+    run.completedAt = Date.now();
+    const sessionKey = agentRunSessionKey(run.projectKey, run.sessionId);
+    if (this.activeBySession.get(sessionKey) === runId) {
+      this.activeBySession.delete(sessionKey);
+    }
   }
 
   private prune(): void {
@@ -233,4 +263,8 @@ export class AgentRunRegistry {
       this.runs.delete(runId);
     }
   }
+}
+
+function agentRunSessionKey(projectKey: string, sessionId: string): string {
+  return `${projectKey}\0${sessionId}`;
 }

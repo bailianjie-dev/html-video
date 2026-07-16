@@ -10,6 +10,13 @@ import {
   serializeAgentRunUiState,
   toolUiFromStoredMessage,
 } from './agent-run-ui.js';
+import {
+  agentRunSessionStorageKey,
+  chooseAgentSession,
+  normalizedAgentViewState,
+  selectedAgentSessionStorageKey,
+  sessionDisplayTitle,
+} from './agent-session-ui.js';
 
 // Re-render whole UI on language change.
 document.addEventListener('hv-locale-change', () => {
@@ -64,15 +71,55 @@ const API = {
   setTemplate: (id, tid) => fetch(`/api/projects/${id}/template`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ template_id: tid }) }).then(r => r.json()),
   setAgent: (id, aid, model) => fetch(`/api/projects/${id}/agent`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ agent_id: aid, ...(model !== undefined && { agent_model: model }) }) }).then(r => r.json()),
   exportMp4: id => fetch(`/api/projects/${id}/export`, { method: 'POST' }).then(r => r.json()),
-  getMessages: id => fetch(`/api/projects/${id}/messages`).then(r => r.json()),
+  agentSessions: (id, status = 'active') => fetch(
+    `/api/projects/${encodeURIComponent(id)}/agent-sessions?status=${encodeURIComponent(status)}`,
+  ).then(r => r.json()),
+  createAgentSession: (id, body = {}) => fetch(`/api/projects/${encodeURIComponent(id)}/agent-sessions`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  }).then(async r => ({ ok: r.ok, status: r.status, ...(await r.json().catch(() => ({}))) })),
+  patchAgentSession: (id, sessionId, body) => fetch(
+    `/api/projects/${encodeURIComponent(id)}/agent-sessions/${encodeURIComponent(sessionId)}`,
+    {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    },
+  ).then(async r => ({ ok: r.ok, status: r.status, ...(await r.json().catch(() => ({}))) })),
+  archiveAgentSession: (id, sessionId) => fetch(
+    `/api/projects/${encodeURIComponent(id)}/agent-sessions/${encodeURIComponent(sessionId)}`,
+    { method: 'DELETE' },
+  ).then(async r => ({ ok: r.ok, status: r.status, ...(await r.json().catch(() => ({}))) })),
+  getAgentSessionMessages: (id, sessionId) => fetch(
+    `/api/projects/${encodeURIComponent(id)}/agent-sessions/${encodeURIComponent(sessionId)}/messages`,
+  ).then(async r => {
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(data.error || `messages failed (${r.status})`);
+    return data;
+  }),
+  getAgentSessionViewState: (id, sessionId) => fetch(
+    `/api/projects/${encodeURIComponent(id)}/agent-sessions/${encodeURIComponent(sessionId)}/view-state`,
+  ).then(async r => {
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(data.error || `view-state failed (${r.status})`);
+    return data;
+  }),
   getAssets: id => fetch(`/api/projects/${id}/assets`).then(r => r.ok ? r.json() : Promise.reject(new Error(`${r.status}`))),
   rawHtml: id => fetch(`/api/projects/${id}/raw-html`).then(r => r.ok ? r.text() : null),
   putRawHtml: (id, html) => fetch(`/api/projects/${id}/raw-html`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ html }) }).then(r => r.json()),
-  putAgentViewState: (id, viewState) => fetch(`/api/projects/${id}/agent-session/view-state`, {
-    method: 'PUT',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ view_state: viewState }),
-  }).then(async (r) => ({ ok: r.ok, status: r.status, ...(await r.json().catch(() => ({}))) })),
+  putAgentSessionViewState: (id, sessionId, viewState) => fetch(
+    `/api/projects/${encodeURIComponent(id)}/agent-sessions/${encodeURIComponent(sessionId)}/view-state`,
+    {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ view_state: viewState }),
+    },
+  ).then(async (r) => ({ ok: r.ok, status: r.status, ...(await r.json().catch(() => ({}))) })),
+  cancelAgentRun: (id, sessionId, runId) => fetch(
+    `/api/projects/${encodeURIComponent(id)}/agent-sessions/${encodeURIComponent(sessionId)}/agent-runs/${encodeURIComponent(runId)}`,
+    { method: 'DELETE' },
+  ).then(async r => ({ ok: r.ok, status: r.status, ...(await r.json().catch(() => ({}))) })),
   contentGraph: id => fetch(`/api/projects/${id}/content-graph`).then(r => r.ok ? r.json() : null),
   unenhanceFrame: (id, nodeId) => fetch(`/api/projects/${id}/frames/${encodeURIComponent(nodeId)}/unenhance`, { method: 'POST' }).then(r => r.json()),
   testAgent: id => fetch(`/api/agents/${encodeURIComponent(id)}/test`, { method: 'POST' }).then(r => r.json()),
@@ -88,6 +135,10 @@ const state = {
   selectedId: null,
   selected: null,
   messages: [],
+  agentSessions: [],
+  activeAgentSessionId: null,
+  agentSessionsLoading: false,
+  agentSessionLoadToken: 0,
   projectAssets: [],
   projectAssetsLoading: false,
   projectAssetsError: '',
@@ -124,6 +175,7 @@ const state = {
   agentViewSyncTimer: null,
   agentRunUi: null,
   resumingAgentRun: false,
+  resumingAgentRunKey: '',
   albumPageTextEditActive: false, // 电子相册：点「编辑本页」后右侧只显示当前页字段
   // Phase C: per-frame native Remotion enhancement
   albumPageActionBusy: false,
@@ -360,6 +412,10 @@ function clearSessionState() {
   state.selectedId = null;
   state.selected = null;
   state.messages = [];
+  state.agentSessions = [];
+  state.activeAgentSessionId = null;
+  state.agentSessionsLoading = false;
+  state.agentSessionLoadToken += 1;
   state.projectAssets = [];
   state.projectAssetsLoading = false;
   state.projectAssetsError = '';
@@ -381,6 +437,11 @@ function clearSessionState() {
   state.activeAlbumPage = 0;
   state.activeAlbumPage = 0;
   state.albumPageTextEditActive = false;
+  state.agentRunUi = null;
+  state.resumingAgentRun = false;
+  state.resumingAgentRunKey = '';
+  state.agentViewLastSyncKey = '';
+  clearTimeout(state.agentViewSyncTimer);
   state.albumPageActionBusy = false;
   state.activeFrameId = null;
   state.iterateFocusFrameId = null;
@@ -500,7 +561,7 @@ function wireAuthForm() {
       });
       if (!result.ok || !result.data?.user?.authenticated) {
         error.textContent = result.status === 503
-          ? '临时登录尚未配置，请先复制 config/auth.toml 为 config/auth.local.toml 并设置真实密码'
+          ? '临时登录尚未配置，请先复制 config/config.toml.example 为 config/config.local.toml 并设置真实密码'
           : '用户名或密码错误';
         passwordInput.select();
         return;
@@ -811,13 +872,344 @@ async function refreshProjects() {
   if (state.activePage === 'history') renderProjectHistory();
 }
 
+function currentStorageUserId() {
+  return state.currentUser?.user_id || state.currentUser?.id || 'anonymous';
+}
+
+function rememberedAgentSessionId(projectId) {
+  if (!projectId) return '';
+  try {
+    return localStorage.getItem(selectedAgentSessionStorageKey(currentStorageUserId(), projectId)) || '';
+  } catch {
+    return '';
+  }
+}
+
+function rememberAgentSession(projectId, sessionId) {
+  if (!projectId || !sessionId) return;
+  try {
+    localStorage.setItem(
+      selectedAgentSessionStorageKey(currentStorageUserId(), projectId),
+      sessionId,
+    );
+  } catch { /* storage is best effort */ }
+}
+
+function activeAgentSession() {
+  return state.agentSessions.find((session) => session.id === state.activeAgentSessionId) ?? null;
+}
+
+function isActiveAgentSessionContext(projectId, sessionId) {
+  return state.selectedId === projectId && state.activeAgentSessionId === sessionId;
+}
+
+async function refreshAgentSessions(projectId) {
+  const response = await API.agentSessions(projectId, 'active');
+  if (!Array.isArray(response?.sessions)) {
+    throw new Error(response?.error || 'Session 列表加载失败');
+  }
+  if (state.selectedId === projectId) state.agentSessions = response.sessions;
+  return response.sessions;
+}
+
+async function ensureProjectAgentSession(projectId) {
+  let sessions = await refreshAgentSessions(projectId);
+  let selected = chooseAgentSession(sessions, rememberedAgentSessionId(projectId));
+  if (!selected) {
+    const created = await API.createAgentSession(projectId);
+    if (!created.ok || !created.session) {
+      throw new Error(created.error || `Session 创建失败 (${created.status})`);
+    }
+    sessions = [created.session];
+    if (state.selectedId === projectId) state.agentSessions = sessions;
+    selected = created.session;
+  }
+  rememberAgentSession(projectId, selected.id);
+  return selected;
+}
+
+function applyAgentSessionViewState(rawViewState) {
+  const viewState = normalizedAgentViewState(rawViewState);
+  state.agentViewLastSyncKey = '';
+  if (!viewState) {
+    state.albumPageCount = 0;
+    state.activeAlbumPage = 0;
+    state.agentViewClientRevision = Date.now();
+    return;
+  }
+  state.albumPageCount = viewState.pageCount;
+  state.activeAlbumPage = viewState.activePageIndex;
+  state.previewRevision = Math.max(state.previewRevision, viewState.previewRevision);
+  state.agentViewClientRevision = Math.max(Date.now(), viewState.clientRevision + 1);
+}
+
+function pendingConfirmationRunState(session) {
+  const pending = session?.pending_confirmation;
+  if (!pending?.action_id) return null;
+  return {
+    ...createAgentRunUiState({ sessionId: session.id }),
+    status: 'completed',
+    statusText: '等待用户确认后继续',
+    latestRevision: pending.expected_revision ?? null,
+    confirmation: {
+      actionId: pending.action_id,
+      summary: pending.summary || '',
+      expectedRevision: pending.expected_revision ?? null,
+      expiresAt: pending.expires_at || '',
+    },
+    tools: [{
+      callId: `pending-${pending.action_id}`,
+      name: 'generate_album',
+      status: 'confirmation_required',
+      argumentSummary: ['等待确认'],
+      result: {
+        ok: false,
+        code: 'OVERWRITE_CONFIRMATION_REQUIRED',
+        confirmationRequired: true,
+        actionId: pending.action_id,
+        confirmationSummary: pending.summary || '',
+        expectedRevision: pending.expected_revision ?? null,
+        expiresAt: pending.expires_at || '',
+      },
+    }],
+  };
+}
+
+function messagesContainPendingConfirmation(messages, actionId) {
+  return messages.some((message) => {
+    if (message?.role !== 'tool') return false;
+    try { return toolUiFromStoredMessage(message)?.result?.actionId === actionId; }
+    catch { return false; }
+  });
+}
+
+async function loadAgentSession(projectId, session, options = {}) {
+  const sessionId = session?.id;
+  if (!projectId || !sessionId) return { restoredRunMessageIndex: -1 };
+  const token = ++state.agentSessionLoadToken;
+  state.activeAgentSessionId = sessionId;
+  rememberAgentSession(projectId, sessionId);
+  state.messages = [];
+  state.agentRunUi = null;
+  state.resumingAgentRun = false;
+  state.resumingAgentRunKey = '';
+  state.albumPageTextEditActive = false;
+  state.agentViewLastSyncKey = '';
+  clearTimeout(state.agentViewSyncTimer);
+  if (!options.preserveComposing) {
+    state.composing = false;
+    stopGenerationProgressTicker();
+    state.generationProgressText = '';
+  }
+
+  const [messagesResult, viewStateResult] = await Promise.all([
+    API.getAgentSessionMessages(projectId, sessionId),
+    API.getAgentSessionViewState(projectId, sessionId),
+  ]);
+  if (token !== state.agentSessionLoadToken || !isActiveAgentSessionContext(projectId, sessionId)) {
+    return { restoredRunMessageIndex: -1 };
+  }
+  state.messages = messagesResult.messages ?? [];
+  applyAgentSessionViewState(viewStateResult);
+
+  let restoredRunMessageIndex = -1;
+  let restoredRun = restoredAgentRunUi(projectId, sessionId, options.allowLegacyRun === true);
+  if (restoredRun?.sessionId && restoredRun.sessionId !== sessionId) restoredRun = null;
+  if (restoredRun?.status !== 'running' && session.active_run?.run_id) {
+    restoredRun = {
+      ...createAgentRunUiState({ runId: session.active_run.run_id, sessionId }),
+      status: 'running',
+      statusText: '正在恢复 Agent 运行状态',
+    };
+  }
+  if (restoredRun?.status === 'running') {
+    if (!restoredRun.sessionId) restoredRun.sessionId = sessionId;
+    state.agentRunUi = restoredRun;
+    state.messages.push({ role: 'agent-run', runState: restoredRun, ts: Date.now(), recovered: true });
+    restoredRunMessageIndex = state.messages.length - 1;
+    state.composing = true;
+    state.generationProgressText = '正在恢复 Agent 运行状态…';
+    persistAgentRunUi(projectId, sessionId, restoredRun);
+  } else {
+    const pendingRun = pendingConfirmationRunState(session);
+    if (pendingRun) {
+      state.agentRunUi = pendingRun;
+      if (!messagesContainPendingConfirmation(state.messages, pendingRun.confirmation.actionId)) {
+        state.messages.push({ role: 'agent-run', runState: pendingRun, ts: Date.now(), recovered: true });
+      }
+    }
+  }
+
+  if (options.render !== false) {
+    renderMain();
+    await refreshTextFields();
+  }
+  if (restoredRunMessageIndex !== -1 && isActiveAgentSessionContext(projectId, sessionId)) {
+    void resumeAgentRun(projectId, sessionId, restoredRunMessageIndex);
+  }
+  return { restoredRunMessageIndex };
+}
+
+async function switchAgentSession(sessionId) {
+  const projectId = state.selectedId;
+  if (!projectId || !sessionId || sessionId === state.activeAgentSessionId) return;
+  await flushAgentViewStateSync();
+  state.pendingAttachments = [];
+  state.backendGenerating = false;
+  state.expectingInitialGeneration = false;
+  try {
+    const sessions = await refreshAgentSessions(projectId);
+    const session = sessions.find((item) => item.id === sessionId && item.status === 'active');
+    if (!session) throw new Error('该 Session 已归档或不存在');
+    await loadAgentSession(projectId, session);
+  } catch (error) {
+    toast(`Session 切换失败：${error?.message || error}`, 'error');
+    renderAgentSessionBar();
+  }
+}
+
+function agentSessionBarHtml() {
+  const ordered = [...state.agentSessions].sort((left, right) => {
+    const created = String(left.created_at || '').localeCompare(String(right.created_at || ''));
+    return created || String(left.id).localeCompare(String(right.id));
+  });
+  const options = ordered.map((session) => {
+    const indicators = [
+      session.active_run ? '运行中' : '',
+      session.has_pending_confirmation ? '待确认' : '',
+    ].filter(Boolean);
+    const label = sessionDisplayTitle(session, state.agentSessions);
+    const text = indicators.length ? `${label} · ${indicators.join(' · ')}` : label;
+    return `<option value="${esc(session.id)}"${session.id === state.activeAgentSessionId ? ' selected' : ''}>${esc(text)}</option>`;
+  }).join('');
+  return `<div class="agent-session-bar" id="agent-session-bar">
+    <label class="agent-session-picker">
+      <span>Session</span>
+      <select id="agent-session-select" aria-label="切换 Agent Session"${state.agentSessionsLoading ? ' disabled' : ''}>
+        ${options || '<option value="">正在准备 Session…</option>'}
+      </select>
+    </label>
+    <div class="agent-session-actions">
+      <button type="button" id="btn-agent-session-new" title="创建 Session" aria-label="创建 Session">＋</button>
+      <button type="button" id="btn-agent-session-rename" title="重命名当前 Session">重命名</button>
+      <button type="button" id="btn-agent-session-archive" title="归档当前 Session">归档</button>
+    </div>
+  </div>`;
+}
+
+function renderAgentSessionBar() {
+  const target = document.getElementById('agent-session-bar');
+  if (!target) return;
+  const wrapper = document.createElement('div');
+  wrapper.innerHTML = agentSessionBarHtml();
+  target.replaceWith(wrapper.firstElementChild);
+  wireAgentSessionBar();
+}
+
+function wireAgentSessionBar() {
+  const select = document.getElementById('agent-session-select');
+  if (select) select.onchange = () => void switchAgentSession(select.value);
+  const createButton = document.getElementById('btn-agent-session-new');
+  if (createButton) createButton.onclick = () => void createAgentSessionFromUi();
+  const renameButton = document.getElementById('btn-agent-session-rename');
+  if (renameButton) renameButton.onclick = () => void renameActiveAgentSession();
+  const archiveButton = document.getElementById('btn-agent-session-archive');
+  if (archiveButton) archiveButton.onclick = () => void archiveActiveAgentSession();
+}
+
+async function createAgentSessionFromUi() {
+  const projectId = state.selectedId;
+  if (!projectId || state.agentSessionsLoading) return;
+  await flushAgentViewStateSync();
+  state.agentSessionsLoading = true;
+  renderAgentSessionBar();
+  try {
+    const created = await API.createAgentSession(projectId);
+    if (!created.ok || !created.session) throw new Error(created.error || `创建失败 (${created.status})`);
+    state.agentSessions = [...state.agentSessions, created.session];
+    await loadAgentSession(projectId, created.session);
+  } catch (error) {
+    toast(`Session 创建失败：${error?.message || error}`, 'error');
+  } finally {
+    if (state.selectedId === projectId) {
+      state.agentSessionsLoading = false;
+      renderAgentSessionBar();
+    }
+  }
+}
+
+async function renameActiveAgentSession() {
+  const projectId = state.selectedId;
+  const session = activeAgentSession();
+  if (!projectId || !session || state.agentSessionsLoading) return;
+  const currentTitle = session.title || sessionDisplayTitle(session, state.agentSessions);
+  const title = window.prompt('重命名 Session', currentTitle);
+  if (title === null) return;
+  const normalized = title.trim();
+  if (!normalized) {
+    toast('Session 名称不能为空', 'warn');
+    return;
+  }
+  state.agentSessionsLoading = true;
+  renderAgentSessionBar();
+  try {
+    const updated = await API.patchAgentSession(projectId, session.id, { title: normalized });
+    if (!updated.ok || !updated.session) throw new Error(updated.error || `重命名失败 (${updated.status})`);
+    state.agentSessions = state.agentSessions.map((item) => item.id === session.id ? updated.session : item);
+  } catch (error) {
+    toast(`Session 重命名失败：${error?.message || error}`, 'error');
+  } finally {
+    if (isActiveAgentSessionContext(projectId, session.id)) {
+      state.agentSessionsLoading = false;
+      renderAgentSessionBar();
+    }
+  }
+}
+
+async function archiveActiveAgentSession() {
+  const projectId = state.selectedId;
+  const session = activeAgentSession();
+  if (!projectId || !session || state.agentSessionsLoading) return;
+  const label = sessionDisplayTitle(session, state.agentSessions);
+  if (!window.confirm(`归档「${label}」？对话记录会保留，但不会继续显示在活动 Session 列表中。`)) return;
+  await flushAgentViewStateSync();
+  state.agentSessionsLoading = true;
+  renderAgentSessionBar();
+  try {
+    const archived = await API.archiveAgentSession(projectId, session.id);
+    if (!archived.ok) throw new Error(archived.error || `归档失败 (${archived.status})`);
+    state.agentSessions = state.agentSessions.filter((item) => item.id !== session.id);
+    let next = chooseAgentSession(state.agentSessions);
+    if (!next) {
+      const created = await API.createAgentSession(projectId);
+      if (!created.ok || !created.session) throw new Error(created.error || '无法创建替代 Session');
+      state.agentSessions = [created.session];
+      next = created.session;
+    }
+    await loadAgentSession(projectId, next);
+  } catch (error) {
+    toast(`Session 归档失败：${error?.message || error}`, 'error');
+    try { await refreshAgentSessions(projectId); } catch { /* keep current UI */ }
+  } finally {
+    if (state.selectedId === projectId) {
+      state.agentSessionsLoading = false;
+      renderAgentSessionBar();
+    }
+  }
+}
+
 async function selectProject(id, options = {}) {
+  const preserveInitialGeneration = state.expectingInitialGeneration;
+  if (state.selectedId && state.activeAgentSessionId) {
+    await flushAgentViewStateSync();
+  }
   state.activePage = options.page || 'workspace';
   state.selectedId = id;
   if (options.updateUrl !== false) {
     updateProjectStudioRoute(id, { replace: !!options.replaceUrl });
   }
   state.selected = (await API.getProject(id)).project;
+  if (state.selectedId !== id) return;
   state.selected = await syncProjectResolutionFromMeta(state.selected);
   state.projectAssets = [];
   state.projectAssetsError = '';
@@ -827,11 +1219,15 @@ async function selectProject(id, options = {}) {
   state.albumPageCount = 0;
   state.albumPageSummaries = [];
   state.activeAlbumPage = 0;
-  state.activeAlbumPage = 0;
+  state.agentSessions = [];
+  state.activeAgentSessionId = null;
+  state.agentSessionsLoading = true;
+  state.agentSessionLoadToken += 1;
   state.albumPageTextEditActive = false;
   state.enhancing = null;
   state.agentRunUi = null;
   state.resumingAgentRun = false;
+  state.resumingAgentRunKey = '';
   // Phase C: map graph node id → kind so the strip can show the "⚡ Enhance"
   // toggle only on data frames. One fetch per project switch.
   state.frameKinds = {};
@@ -844,7 +1240,7 @@ async function selectProject(id, options = {}) {
   // (its result persists); just release the composer so this project is usable.
   // The in-flight SSE loop self-stops once it sees selectedId changed.
   // Keep composing if we just arrived from create-page with a pending job.
-  if (state.expectingInitialGeneration && id === state.selectedId) {
+  if (preserveInitialGeneration && id === state.selectedId) {
     state.composing = true;
     if (!state.generationProgressText) {
       state.generationProgressText = '已提交需求，正在连接 AI 助手…';
@@ -857,29 +1253,19 @@ async function selectProject(id, options = {}) {
   }
   state.backendGenerating = false;
   state.generationComposerOpen = true;
-  try { state.messages = (await API.getMessages(id)).messages ?? []; }
-  catch { state.messages = []; }
-  let restoredRunMessageIndex = -1;
-  const restoredRun = restoredAgentRunUi(id);
-  if (restoredRun?.status === 'running') {
-    state.agentRunUi = restoredRun;
-    state.messages.push({ role: 'agent-run', runState: restoredRun, ts: Date.now(), recovered: true });
-    restoredRunMessageIndex = state.messages.length - 1;
-    state.composing = true;
-    state.generationProgressText = '正在恢复 Agent 运行状态…';
-  }
-  // Do not inject export-done into the AI chat — MP4 export uses toast +
-  // automatic download from the export button, not a dialogue card.
-  // If a generation is still running on the backend for this project, surface a
-  // live "still generating" line (the in-memory progress lines were lost on the
-  // switch; the result will appear in messages once it finishes — reload to see).
   try {
-    const g = await fetch(`/api/projects/${id}/generating`).then((r) => r.json());
-    if (g?.generating && id === state.selectedId) {
-      state.messages.push({ role: 'preview-event', content: t('chat.still_generating'), ts: Date.now() });
-      if (!hasProjectPreview(state.selected)) state.backendGenerating = true;
-    }
-  } catch { /* non-fatal */ }
+    const session = await ensureProjectAgentSession(id);
+    if (state.selectedId !== id) return;
+    await loadAgentSession(id, session, {
+      render: false,
+      preserveComposing: preserveInitialGeneration,
+      allowLegacyRun: chooseAgentSession(state.agentSessions)?.id === session.id,
+    });
+  } catch (error) {
+    state.messages = [{ role: 'system', content: `⚠️ ${error?.message || error}`, ts: Date.now() }];
+  } finally {
+    if (state.selectedId === id) state.agentSessionsLoading = false;
+  }
   renderSidebar();
   renderToolbar();   // <-- bug fix: toolbar buttons (template / agent / export) must
                      //     be re-enabled after a project is selected
@@ -887,9 +1273,6 @@ async function selectProject(id, options = {}) {
   if (await enrichFrameLabelsFromHtml(id)) renderFramesStrip();
   await refreshProjectAssets(id);
   await refreshTextFields();
-  if (restoredRunMessageIndex !== -1 && id === state.selectedId) {
-    void resumeAgentRun(id, restoredRunMessageIndex);
-  }
 }
 
 const NAV_ITEMS = [
@@ -1976,6 +2359,7 @@ ${previewEmptyHtml}
 
             <div class="generation-side-panel" data-side-panel="assistant" id="generation-panel-assistant">
               <div class="generation-assistant-body">
+                ${agentSessionBarHtml()}
                 <div class="generation-progress">
                   <span>执行进度</span>
                   <b>${esc(progressText)}</b>
@@ -2815,39 +3199,13 @@ function phonePreviewDeviceTitle(project = state.selected) {
 
 /**
  * Iframe CSS viewport for album device preview.
- * Always keeps the project's export aspect (16:9 stays landscape) so text is
- * never crushed into a portrait column. Phone = smaller same-ratio window;
- * PC = larger same-ratio window + desktop chrome.
+ * Always uses the project's export canvas (e.g. 1080×1920), matching left-rail
+ * thumbnails. Phone/PC shells are visual chrome only — the iframe is scaled into
+ * them via --preview-scale. Shrinking the CSS viewport to ~390px clipped
+ * fixed-canvas agent HTML (absolute px layouts) to a top-left fragment.
  */
 function projectPreviewViewport(project = state.selected) {
-  const base = projectPreviewResolution(project);
-  if (!shouldUsePreviewDeviceModes(project)) return base;
-  const ratio = projectAspectRatioValue(project);
-  const portrait = ratio < 0.92;
-  const square = Math.abs(ratio - 1) < 0.06;
-  if (state.previewDevice === 'desktop') {
-    // Prefer full export canvas for landscape PC (1920×1080) so layouts match
-    // generation; only downscale when the stage is too small via --preview-scale.
-    if (portrait) {
-      const width = 900;
-      return { width, height: Math.max(1, Math.round(width / ratio)) };
-    }
-    if (square) return { width: 1080, height: 1080 };
-    const base = projectPreviewResolution(project);
-    const width = Math.max(1280, Number(base.width) || 1920);
-    return { width, height: Math.max(1, Math.round(width / ratio)) };
-  }
-  // Phone: preserve aspect. Landscape → landscape handset (not tall portrait).
-  if (portrait) {
-    const width = 390;
-    return { width, height: Math.max(1, Math.round(width / ratio)) };
-  }
-  if (square) {
-    const width = 430;
-    return { width, height: width };
-  }
-  const height = 390;
-  return { width: Math.max(1, Math.round(height * ratio)), height };
+  return projectPreviewResolution(project);
 }
 
 /** Outer device chrome sized to match phone/PC + project orientation. */
@@ -2883,9 +3241,9 @@ function applyStudioDevicePreview(iframe) {
     style.id = 'hv-studio-device-preview';
     (doc.head || doc.documentElement).appendChild(style);
   }
-  // Landscape phone must NOT force single-column crush; content already matches aspect.
-  // Phone preview: hide classic OS scrollbar track (white strip on dark albums).
-  // Scroll/snap still works; real handsets use overlay scrollbars that don't reserve a gutter.
+  // Phone shell is chrome-only (iframe stays at export canvas). Do not reflow
+  // grids to a single column — that crushed fixed-canvas / two-column layouts.
+  // Hide classic OS scrollbar track (white strip on dark albums).
   style.textContent = phone ? `
 html.hv-studio-phone {
   writing-mode: horizontal-tb !important;
@@ -2937,22 +3295,6 @@ html.hv-studio-phone button[aria-label*="上一页"],
 html.hv-studio-phone button[aria-label*="下一页"] {
   display: none !important;
 }
-${landscapePhone ? '' : `
-html.hv-studio-phone .page-inner,
-html.hv-studio-phone .album-page > .inner,
-html.hv-studio-phone .page-content {
-  grid-template-columns: 1fr !important;
-  flex-direction: column !important;
-}
-html.hv-studio-phone .dots {
-  left: 50% !important;
-  right: auto !important;
-  top: auto !important;
-  bottom: max(12px, env(safe-area-inset-bottom)) !important;
-  transform: translateX(-50%) !important;
-  flex-direction: row !important;
-}
-`}
 ` : `
 html.hv-studio-desktop .album-controls,
 html.hv-studio-desktop nav.album-controls,
@@ -3765,6 +4107,7 @@ function renderMain() {
     body.innerHTML = renderGenerationPage();
     wireGenerationPage();
     if (state.selected) {
+      wireAgentSessionBar();
       renderChatLog();
       renderComposer();
       renderFooter();
@@ -3833,6 +4176,7 @@ function renderMain() {
     ${state.selected
       ? `
         <section class="chat-pane">
+          ${agentSessionBarHtml()}
           <div class="chat-log" id="chat-log"></div>
           <div class="composer">
             <div class="composer-shell" id="composer-shell">
@@ -3893,6 +4237,7 @@ function renderMain() {
   const textToggle = document.getElementById('btn-textfields-toggle');
   if (textToggle) textToggle.onclick = () => document.body.classList.toggle('textfields-collapsed');
   if (state.selected) {
+    wireAgentSessionBar();
     renderChatLog();
     renderComposer();
     renderPreview();
@@ -4356,6 +4701,9 @@ function renderChatLog() {
     return;
   }
   log.innerHTML = state.messages.map((m, i) => renderMessage(m, i)).join('');
+  log.querySelectorAll('[data-cancel-agent-run]').forEach((button) => {
+    button.onclick = () => void cancelActiveAgentRun(button.dataset.cancelAgentRun, button);
+  });
   log.querySelectorAll('button.opt[data-opt-msg]').forEach((btn) => {
     btn.onclick = () => {
       const msgIdx = Number(btn.dataset.optMsg);
@@ -4687,7 +5035,9 @@ function renderAgentTool(tool) {
 
 function renderAgentRunMessage(runState, { persisted = false } = {}) {
   const run = runState || createAgentRunUiState();
-  const statusIcon = run.status === 'completed'
+  const statusIcon = run.confirmation
+    ? 'alert'
+    : run.status === 'completed'
     ? 'check'
     : run.status === 'failed' || run.status === 'cancelled'
       ? 'alert'
@@ -4698,6 +5048,7 @@ function renderAgentRunMessage(runState, { persisted = false } = {}) {
       <span class="agent-run-icon">${navIcon(statusIcon)}</span>
       <span class="agent-run-status">${esc(run.statusText || 'Agent 处理中')}</span>
       ${run.latestRevision !== null && run.latestRevision !== undefined ? `<span class="agent-run-revision">revision ${esc(run.latestRevision)}</span>` : ''}
+      ${!persisted && run.status === 'running' && run.runId ? `<button type="button" class="agent-run-cancel" data-cancel-agent-run="${esc(run.runId)}">取消</button>` : ''}
     </div>
     ${meta ? `<div class="agent-run-meta">${esc(meta)}</div>` : ''}
     ${run.tools?.length ? `<div class="agent-tools">${run.tools.map(renderAgentTool).join('')}</div>` : '<div class="agent-run-thinking">正在分析请求并选择下一步</div>'}
@@ -5110,9 +5461,8 @@ function renderPreview({ refreshFramesStrip = true } = {}) {
   const stamp = sortedFrames.length > 0 && state.activeFrameId
     ? state.activeFrameId
     : (p.templateId || '');
-  // Prefer project resolution, but on album generation page use phone/PC
-  // device shells with real device CSS viewports (so layouts can diverge).
-  // Shell always follows create-page display device — no manual toggle.
+  // Export-resolution iframe + phone/PC chrome (scaled). Shell follows
+  // create-page display device — no manual toggle.
   syncPreviewDeviceFromProject(p);
   const res = projectPreviewViewport(p);
   const vw = res.width || 1920, vh = res.height || 1080;
@@ -5525,6 +5875,7 @@ async function startAlbumPageTextEdit(pageIndex) {
   if (!state.selected || !isElectronicAlbumProject()) return;
   if (typeof pageIndex === 'number' && !Number.isNaN(pageIndex)) {
     state.activeAlbumPage = Math.max(0, Math.min((state.albumPageCount || 1) - 1, pageIndex));
+    queueAgentViewStateSync();
     updateAlbumPageTabActive();
     scrollPreviewToAlbumPage(state.activeAlbumPage, 'auto', { mode: 'browse' });
   }
@@ -5548,6 +5899,7 @@ async function selectAlbumPage(pageIndex, { startEdit = false } = {}) {
   const pageChanged = safeIndex !== state.activeAlbumPage;
   if (pageChanged) await flushTextEditsIfNeeded();
   state.activeAlbumPage = safeIndex;
+  queueAgentViewStateSync();
   updateAlbumPageTabActive();
   // Rail / toolbar navigation: keep centre preview in browse mode so wheel
   // and scroll-snap can still move between pages.
@@ -5666,6 +6018,7 @@ function wireAlbumPageScrollSync(iframe) {
       if (bestIndex !== state.activeAlbumPage) {
         const wasEditing = state.albumPageTextEditActive;
         state.activeAlbumPage = bestIndex;
+        queueAgentViewStateSync();
         updateAlbumPageTabActive();
         // 滑动换页视为浏览，不继续改字 → 自动收起编辑栏
         if (wasEditing) collapsePageTextEdit();
@@ -5839,9 +6192,11 @@ html.hv-album-preview-focus [data-hv-preview-page].hv-preview-page-active {
   inset: auto !important;
   transform: none !important;
   width: 100% !important;
-  min-height: 100vh !important;
-  height: 100vh !important;
-  max-height: 100vh !important;
+  /* Honor authored page size (e.g. height:1920px). Forcing 100vh clipped
+     fixed-canvas pages when the iframe viewport was smaller than the design. */
+  min-height: 100% !important;
+  height: auto !important;
+  max-height: none !important;
   overflow: hidden !important;
 }
 html.hv-album-preview-focus [data-hv-preview-page].hv-preview-page-active,
@@ -8394,7 +8749,7 @@ function cssEscape(s) {
 
 // ============== send message ==============
 function currentAgentViewStateSnapshot({ bumpRevision = false } = {}) {
-  if (!state.selectedId) return null;
+  if (!state.selectedId || !state.activeAgentSessionId) return null;
   if (bumpRevision) {
     state.agentViewClientRevision = Math.max(
       Date.now(),
@@ -8416,7 +8771,7 @@ function currentAgentViewStateSnapshot({ bumpRevision = false } = {}) {
 }
 
 function queueAgentViewStateSync() {
-  if (!state.selectedId) return;
+  if (!state.selectedId || !state.activeAgentSessionId) return;
   const pageCount = isElectronicAlbumProject()
     ? Math.max(0, Number(state.albumPageCount) || 0)
     : 0;
@@ -8425,6 +8780,7 @@ function queueAgentViewStateSync() {
     : null;
   const syncKey = JSON.stringify({
     projectId: state.selectedId,
+    sessionId: state.activeAgentSessionId,
     activePageIndex,
     pageCount,
     previewRevision: Math.max(0, Number(state.previewRevision) || 0),
@@ -8433,40 +8789,62 @@ function queueAgentViewStateSync() {
   state.agentViewLastSyncKey = syncKey;
   clearTimeout(state.agentViewSyncTimer);
   state.agentViewSyncTimer = setTimeout(async () => {
-    const projectId = state.selectedId;
-    const snapshot = currentAgentViewStateSnapshot({ bumpRevision: true });
-    if (!projectId || !snapshot) return;
-    try {
-      const response = await API.putAgentViewState(projectId, snapshot);
-      if (!response.ok && response.status === 409) {
-        const serverRevision = Number(response.view_state?.clientRevision) || 0;
-        state.agentViewClientRevision = Math.max(state.agentViewClientRevision, serverRevision + 1);
-        state.agentViewLastSyncKey = '';
-      }
-    } catch {
-      state.agentViewLastSyncKey = '';
-    }
+    await flushAgentViewStateSync();
   }, 120);
 }
 
-function agentRunStorageKey(projectId) {
-  const userId = state.currentUser?.user_id || state.currentUser?.id || 'anonymous';
-  return `html-video:agent-run:v1:${userId}:${projectId}`;
+async function flushAgentViewStateSync() {
+  clearTimeout(state.agentViewSyncTimer);
+  state.agentViewSyncTimer = null;
+  const projectId = state.selectedId;
+  const sessionId = state.activeAgentSessionId;
+  const snapshot = currentAgentViewStateSnapshot({ bumpRevision: true });
+  if (!projectId || !sessionId || !snapshot) return;
+  try {
+    const response = await API.putAgentSessionViewState(projectId, sessionId, snapshot);
+    if (!isActiveAgentSessionContext(projectId, sessionId)) return;
+    if (!response.ok && response.status === 409) {
+      const serverRevision = Number(response.view_state?.clientRevision) || 0;
+      state.agentViewClientRevision = Math.max(state.agentViewClientRevision, serverRevision + 1);
+      state.agentViewLastSyncKey = '';
+    }
+  } catch {
+    if (isActiveAgentSessionContext(projectId, sessionId)) state.agentViewLastSyncKey = '';
+  }
 }
 
-function persistAgentRunUi(projectId, runState) {
+function legacyAgentRunStorageKey(projectId) {
+  return `html-video:agent-run:v1:${currentStorageUserId()}:${projectId}`;
+}
+
+function agentRunStorageKey(projectId, sessionId) {
+  return agentRunSessionStorageKey(currentStorageUserId(), projectId, sessionId);
+}
+
+function persistAgentRunUi(projectId, sessionId, runState) {
   const serialized = serializeAgentRunUiState(runState);
-  if (!projectId || !serialized) return;
-  try { localStorage.setItem(agentRunStorageKey(projectId), serialized); } catch { /* storage is best effort */ }
+  if (!projectId || !sessionId || !serialized) return;
+  try { localStorage.setItem(agentRunStorageKey(projectId, sessionId), serialized); } catch { /* storage is best effort */ }
 }
 
-function restoredAgentRunUi(projectId) {
-  if (!projectId) return null;
-  try { return restoreAgentRunUiState(localStorage.getItem(agentRunStorageKey(projectId))); }
-  catch { return null; }
+function restoredAgentRunUi(projectId, sessionId, allowLegacy = false) {
+  if (!projectId || !sessionId) return null;
+  try {
+    const restored = restoreAgentRunUiState(localStorage.getItem(agentRunStorageKey(projectId, sessionId)));
+    if (restored) return restored;
+    if (!allowLegacy) return null;
+    const legacy = restoreAgentRunUiState(localStorage.getItem(legacyAgentRunStorageKey(projectId)));
+    if (!legacy || (legacy.sessionId && legacy.sessionId !== sessionId)) return null;
+    legacy.sessionId = sessionId;
+    persistAgentRunUi(projectId, sessionId, legacy);
+    return legacy;
+  } catch {
+    return null;
+  }
 }
 
 async function applyAgentRunEvent(event, context) {
+  if (!isActiveAgentSessionContext(context.projectId, context.sessionId)) return;
   const runMessage = state.messages[context.runMessageIndex];
   if (!runMessage || runMessage.role !== 'agent-run') return;
   const reduced = reduceAgentRunUiEvent(runMessage.runState, event);
@@ -8474,7 +8852,7 @@ async function applyAgentRunEvent(event, context) {
 
   runMessage.runState = reduced.state;
   state.agentRunUi = reduced.state;
-  persistAgentRunUi(context.projectId, reduced.state);
+  persistAgentRunUi(context.projectId, context.sessionId, reduced.state);
 
   if (event.type === 'assistant.delta' && !context.hasPersistedAssistant) {
     if (context.assistantIdx === -1 || !state.messages[context.assistantIdx]) {
@@ -8509,12 +8887,12 @@ async function applyAgentRunEvent(event, context) {
   renderChatLog();
 
   for (const effect of reduced.effects) {
-    if (effect.type === 'preview_ready' && state.selectedId === context.projectId) {
+    if (effect.type === 'preview_ready' && isActiveAgentSessionContext(context.projectId, context.sessionId)) {
       const preview = effect.preview || {};
       setGenerationProgress('预览已生成，正在刷新页面和缩略图…', context.runMessageIndex);
       await refreshAfterPreviewReady();
       queueAgentViewStateSync();
-    } else if (effect.type === 'terminal' && state.selectedId === context.projectId) {
+    } else if (effect.type === 'terminal' && isActiveAgentSessionContext(context.projectId, context.sessionId)) {
       stopGenerationProgressTicker(
         effect.status === 'completed'
           ? (hasProjectPreview(state.selected) ? '已生成，可预览和调整' : '本轮处理完成')
@@ -8522,6 +8900,10 @@ async function applyAgentRunEvent(event, context) {
             ? '本轮已取消'
             : '本轮执行失败',
       );
+      try {
+        await refreshAgentSessions(context.projectId);
+        if (isActiveAgentSessionContext(context.projectId, context.sessionId)) renderAgentSessionBar();
+      } catch { /* run result is already rendered; Session badge refresh is best effort */ }
     }
   }
 }
@@ -8534,7 +8916,7 @@ async function consumeAgentRunReplay(response, context) {
   while (true) {
     const { done, value } = await reader.read();
     if (done) break;
-    if (state.selectedId !== context.projectId) {
+    if (!isActiveAgentSessionContext(context.projectId, context.sessionId)) {
       try { await reader.cancel(); } catch { /* navigation cancelled the local replay */ }
       break;
     }
@@ -8552,27 +8934,56 @@ async function consumeAgentRunReplay(response, context) {
   }
 }
 
-async function resumeAgentRun(projectId, runMessageIndex) {
-  if (state.resumingAgentRun) return;
+async function cancelActiveAgentRun(runId, button) {
+  const projectId = state.selectedId;
+  const sessionId = state.activeAgentSessionId;
+  const runMessage = state.messages.find(
+    (message) => message.role === 'agent-run' && message.runState?.runId === runId,
+  );
+  if (!projectId || !sessionId || !runId || !runMessage || runMessage.runState.status !== 'running') return;
+  if (button) button.disabled = true;
+  runMessage.runState = { ...runMessage.runState, statusText: '正在取消 Agent…' };
+  state.agentRunUi = runMessage.runState;
+  persistAgentRunUi(projectId, sessionId, runMessage.runState);
+  renderChatLog();
+  try {
+    const response = await API.cancelAgentRun(projectId, sessionId, runId);
+    if (!response.ok) throw new Error(response.error || `取消失败 (${response.status})`);
+  } catch (error) {
+    if (isActiveAgentSessionContext(projectId, sessionId)) {
+      runMessage.runState = { ...runMessage.runState, statusText: '取消失败，Agent 仍在运行' };
+      state.agentRunUi = runMessage.runState;
+      persistAgentRunUi(projectId, sessionId, runMessage.runState);
+      renderChatLog();
+      toast(`取消 Agent 失败：${error?.message || error}`, 'error');
+    }
+  }
+}
+
+async function resumeAgentRun(projectId, sessionId, runMessageIndex) {
   const runState = state.messages[runMessageIndex]?.runState;
-  if (!runState?.runId || runState.status !== 'running') return;
+  if (!runState?.runId || runState.status !== 'running' || !sessionId) return;
+  const resumeKey = `${projectId}:${sessionId}:${runState.runId}`;
+  if (state.resumingAgentRunKey === resumeKey) return;
   state.resumingAgentRun = true;
+  state.resumingAgentRunKey = resumeKey;
   const existingAssistant = state.messages.findIndex(
     (message) => message.role === 'assistant' && message.runId === runState.runId,
   );
   const context = {
     projectId,
+    sessionId,
     runMessageIndex,
     assistantIdx: existingAssistant,
     hasPersistedAssistant: existingAssistant !== -1,
   };
   try {
     const response = await fetch(
-      `/api/agent-runs/${encodeURIComponent(runState.runId)}/events?after=${runState.lastSequence || 0}`,
+      `/api/projects/${encodeURIComponent(projectId)}/agent-sessions/${encodeURIComponent(sessionId)}/agent-runs/${encodeURIComponent(runState.runId)}/events?after=${runState.lastSequence || 0}`,
     );
     await consumeAgentRunReplay(response, context);
   } catch (error) {
-    if (state.selectedId === projectId) {
+    if (isActiveAgentSessionContext(projectId, sessionId)) {
       const message = state.messages[runMessageIndex];
       if (message?.role === 'agent-run' && message.runState?.status === 'running') {
         message.runState = {
@@ -8582,13 +8993,16 @@ async function resumeAgentRun(projectId, runMessageIndex) {
           error: { code: 'RUN_RECOVERY_UNAVAILABLE', message: String(error?.message || error) },
         };
         state.agentRunUi = message.runState;
-        persistAgentRunUi(projectId, message.runState);
+        persistAgentRunUi(projectId, sessionId, message.runState);
         renderChatLog();
       }
     }
   } finally {
-    state.resumingAgentRun = false;
-    if (state.selectedId === projectId) {
+    if (state.resumingAgentRunKey === resumeKey) {
+      state.resumingAgentRun = false;
+      state.resumingAgentRunKey = '';
+    }
+    if (isActiveAgentSessionContext(projectId, sessionId)) {
       state.composing = false;
       renderComposer();
       updateGenerationControls();
@@ -8597,7 +9011,7 @@ async function resumeAgentRun(projectId, runMessageIndex) {
 }
 
 async function sendMessage() {
-  if (state.composing || !state.selected) return;
+  if (state.composing || !state.selected || !state.activeAgentSessionId) return;
   const ta = document.getElementById('composer-input');
   const text = ta.value.trim();
   const hasAttachments = state.pendingAttachments.length > 0;
@@ -8629,6 +9043,7 @@ async function sendMessage() {
   // The project this send belongs to — used to ignore late events / not clobber
   // a different project if the user switches away mid-generation.
   const genProjectId = state.selectedId;
+  const genSessionId = state.activeAgentSessionId;
   renderComposer();
   updateGenerationControls();
   syncGenerationEmptyPreview();
@@ -8644,7 +9059,7 @@ async function sendMessage() {
     content: text + attSummary,
     ts: Date.now(),
   });
-  const initialRunState = createAgentRunUiState();
+  const initialRunState = createAgentRunUiState({ sessionId: genSessionId });
   initialRunState.statusText = '正在连接 Agent';
   state.agentRunUi = initialRunState;
   state.messages.push({ role: 'agent-run', runState: initialRunState, ts: Date.now() });
@@ -8654,6 +9069,7 @@ async function sendMessage() {
 
   const agentRunContext = {
     projectId: genProjectId,
+    sessionId: genSessionId,
     runMessageIndex: thinkingIdx,
     assistantIdx: -1,
     hasPersistedAssistant: false,
@@ -8670,12 +9086,12 @@ async function sendMessage() {
       state.pendingAttachments = [];
       renderAttachments();
       renderGenerationAdjustAttachmentCount();
-      res = await fetch(`/api/projects/${state.selected.id}/messages`, {
+      res = await fetch(`/api/projects/${encodeURIComponent(genProjectId)}/agent-sessions/${encodeURIComponent(genSessionId)}/messages`, {
         method: 'POST',
         body: fd,
       });
     } else {
-      res = await fetch(`/api/projects/${state.selected.id}/messages`, {
+      res = await fetch(`/api/projects/${encodeURIComponent(genProjectId)}/agent-sessions/${encodeURIComponent(genSessionId)}/messages`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({
@@ -8695,15 +9111,18 @@ async function sendMessage() {
       }
       const responseRunId = res.headers.get('x-agent-run-id') || '';
       const responseSessionId = res.headers.get('x-agent-session-id') || '';
+      if (responseSessionId && responseSessionId !== genSessionId) {
+        throw new Error('Agent 响应绑定到了错误的 Session');
+      }
       if (responseRunId && state.messages[thinkingIdx]?.role === 'agent-run') {
         state.messages[thinkingIdx].runState = {
           ...state.messages[thinkingIdx].runState,
           runId: responseRunId,
-          sessionId: responseSessionId,
+          sessionId: genSessionId,
           status: 'running',
         };
         state.agentRunUi = state.messages[thinkingIdx].runState;
-        persistAgentRunUi(genProjectId, state.agentRunUi);
+        persistAgentRunUi(genProjectId, genSessionId, state.agentRunUi);
       }
       const reader = res.body.getReader();
       const decoder = new TextDecoder();
@@ -8714,7 +9133,7 @@ async function sendMessage() {
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
-        if (state.selectedId !== genProjectId) { try { await reader.cancel(); } catch {} break; }
+        if (!isActiveAgentSessionContext(genProjectId, genSessionId)) { try { await reader.cancel(); } catch {} break; }
         buf += decoder.decode(value, { stream: true });
         const lines = buf.split('\n\n');
         buf = lines.pop() ?? '';
@@ -8731,7 +9150,7 @@ async function sendMessage() {
   } catch (e) {
     // Only surface the error if we're still on the project that started this
     // send — otherwise it's just the user having navigated away.
-    if (state.selectedId === genProjectId) {
+    if (isActiveAgentSessionContext(genProjectId, genSessionId)) {
       stopGenerationProgressTicker('生成失败，请查看错误信息。');
       if (state.messages[thinkingIdx]?.role === 'agent-run') {
         state.messages[thinkingIdx].runState = {
@@ -8740,7 +9159,7 @@ async function sendMessage() {
           error: { code: 'RUN_STREAM_INTERRUPTED', message: String(e.message ?? e) },
         };
         state.agentRunUi = state.messages[thinkingIdx].runState;
-        persistAgentRunUi(genProjectId, state.agentRunUi);
+        persistAgentRunUi(genProjectId, genSessionId, state.agentRunUi);
       } else {
         state.messages[thinkingIdx] = { role: 'system', content: '⚠️ ' + (e.message ?? e), ts: Date.now() };
       }
@@ -8749,7 +9168,7 @@ async function sendMessage() {
   }
   // Don't clobber composing if the user already switched to another project
   // (which may have its own generation running).
-  if (state.selectedId === genProjectId) {
+  if (isActiveAgentSessionContext(genProjectId, genSessionId)) {
     const finalRunState = state.messages[thinkingIdx]?.role === 'agent-run'
       ? state.messages[thinkingIdx].runState
       : null;

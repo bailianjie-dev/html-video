@@ -2531,7 +2531,7 @@
     min-height: 0;
     flex: 1;
     display: grid;
-    grid-template-rows: auto 1fr auto;
+    grid-template-rows: auto auto 1fr auto;
     overflow: hidden;
   }
   .generation-text-pane {
@@ -3022,8 +3022,62 @@
   }
 
   /* ===== Chat pane ===== */
-  .chat-pane { display: grid; grid-template-rows: 1fr auto; min-width: 0;
+  .chat-pane { display: grid; grid-template-rows: auto 1fr auto; min-width: 0;
     background: var(--bg-panel); border-right: 1px solid var(--border); }
+
+  .agent-session-bar {
+    min-width: 0;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 10px;
+    border-bottom: 1px solid var(--border);
+    background: color-mix(in srgb, var(--bg-panel) 94%, var(--bg-subtle));
+  }
+  .agent-session-picker {
+    min-width: 0;
+    flex: 1;
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr);
+    align-items: center;
+    gap: 7px;
+  }
+  .agent-session-picker > span {
+    color: var(--text-faint);
+    font: 600 10px/1 var(--font-mono);
+    letter-spacing: .08em;
+    text-transform: uppercase;
+  }
+  .agent-session-picker select {
+    min-width: 0;
+    height: 30px;
+    padding: 0 26px 0 9px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--bg-panel);
+    color: var(--text);
+    font: 600 12px/1.2 inherit;
+  }
+  .agent-session-actions { display: flex; align-items: center; gap: 4px; }
+  .agent-session-actions button,
+  .agent-run-cancel {
+    height: 28px;
+    padding: 0 8px;
+    border: 1px solid var(--border);
+    border-radius: 7px;
+    background: var(--bg-panel);
+    color: var(--text-muted);
+    font: 600 11px/1 inherit;
+    cursor: pointer;
+  }
+  .agent-session-actions button:hover,
+  .agent-run-cancel:hover:not(:disabled) {
+    border-color: var(--border-strong);
+    color: var(--text);
+    background: var(--bg-subtle);
+  }
+  .agent-session-actions button:disabled,
+  .agent-run-cancel:disabled { opacity: .5; cursor: wait; }
 
   .chat-log { overflow-y: auto; padding: 18px 22px; display: flex;
     flex-direction: column; gap: 14px; }
@@ -3282,6 +3336,8 @@
     font-size: 10.5px;
     white-space: nowrap;
   }
+  .agent-run-cancel { margin-left: auto; flex: 0 0 auto; }
+  .agent-run-revision + .agent-run-cancel { margin-left: 0; }
   .agent-run-meta {
     margin: 3px 0 0 22px;
     color: var(--text-faint);

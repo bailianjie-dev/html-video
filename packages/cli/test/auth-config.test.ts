@@ -12,7 +12,14 @@ import {
 } from '../dist/auth-config.js';
 import { loadDatabaseConfig } from '../dist/database-config.js';
 import { loadOssConfig } from '../dist/oss-config.js';
-import { mergeSimpleToml, resolveTomlConfig } from '../dist/config-files.js';
+import {
+  mergeSimpleToml,
+  mergeUnifiedToml,
+  resolveAppTomlConfig,
+  resolveTomlConfig,
+  tomlFileHasContent,
+} from '../dist/config-files.js';
+import { parseAgentTomlSection } from '../dist/load-env.js';
 
 test('loads legacy single-admin auth.toml under .html-video', () => {
   const root = mkdtempSync(join(tmpdir(), 'html-video-auth-'));
@@ -41,17 +48,17 @@ test('loads legacy single-admin auth.toml under .html-video', () => {
   }
 });
 
-test('loads multi-user auth from config/auth.local.toml', () => {
+test('loads multi-user auth from unified config.local.toml', () => {
   const root = mkdtempSync(join(tmpdir(), 'html-video-auth-'));
   try {
     mkdirSync(join(root, 'config'));
     writeFileSync(
-      join(root, 'config', 'auth.toml'),
+      join(root, 'config', 'config.toml'),
       '[auth]\npassword = "CHANGE_ME"\n',
       'utf8',
     );
     writeFileSync(
-      join(root, 'config', 'auth.local.toml'),
+      join(root, 'config', 'config.local.toml'),
       `
 [auth]
 password = "shared-password"
@@ -94,19 +101,19 @@ test('rejects missing and placeholder passwords', () => {
   try {
     mkdirSync(join(root, 'config'));
     assert.equal(loadAuthConfig(root), null);
-    writeFileSync(join(root, 'config', 'auth.toml'), '[auth]\npassword = "CHANGE_ME"\n', 'utf8');
+    writeFileSync(join(root, 'config', 'config.toml'), '[auth]\npassword = "CHANGE_ME"\n', 'utf8');
     assert.equal(loadAuthConfig(root), null);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
 });
 
-test('merges database base + local toml', () => {
+test('merges database from unified config.toml + local', () => {
   const root = mkdtempSync(join(tmpdir(), 'html-video-db-'));
   try {
     mkdirSync(join(root, 'config'));
     writeFileSync(
-      join(root, 'config', 'database.toml'),
+      join(root, 'config', 'config.toml'),
       `
 [database]
 enabled = false
@@ -120,7 +127,7 @@ pool_max_size = 10
       'utf8',
     );
     writeFileSync(
-      join(root, 'config', 'database.local.toml'),
+      join(root, 'config', 'config.local.toml'),
       `
 [database]
 enabled = true
@@ -136,18 +143,18 @@ pool_max_size = 4
     assert.equal(config.host, '127.0.0.1');
     assert.equal(config.password, 'local-secret');
     assert.equal(config.poolMaxSize, 4);
-    assert.match(config.sourcePath.replace(/\\/g, '/'), /config\/database\.local\.toml$/);
+    assert.match(config.sourcePath.replace(/\\/g, '/'), /config\/config\.local\.toml$/);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
 });
 
-test('merges oss base + local toml', () => {
+test('merges oss from unified config.toml + local', () => {
   const root = mkdtempSync(join(tmpdir(), 'html-video-oss-'));
   try {
     mkdirSync(join(root, 'config'));
     writeFileSync(
-      join(root, 'config', 'oss.toml'),
+      join(root, 'config', 'config.toml'),
       `
 [oss]
 enabled = false
@@ -160,7 +167,7 @@ prefix = "html-video/dev"
       'utf8',
     );
     writeFileSync(
-      join(root, 'config', 'oss.local.toml'),
+      join(root, 'config', 'config.local.toml'),
       `
 [oss]
 enabled = true
@@ -176,6 +183,55 @@ access_key_secret = "LOCAL_SECRET"
     assert.equal(config.bucket, 'base-bucket');
     assert.equal(config.accessKeyId, 'LOCAL_ID');
     assert.equal(config.accessKeySecret, 'LOCAL_SECRET');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('empty local file is ignored; base config is used', () => {
+  const root = mkdtempSync(join(tmpdir(), 'html-video-empty-local-'));
+  try {
+    mkdirSync(join(root, 'config'));
+    writeFileSync(
+      join(root, 'config', 'config.toml'),
+      '[database]\nenabled = false\nhost = "base"\nname = "n"\nuser = "u"\npassword = "base"\n',
+      'utf8',
+    );
+    writeFileSync(
+      join(root, 'config', 'config.local.toml'),
+      '# only comments\n\n',
+      'utf8',
+    );
+    assert.equal(tomlFileHasContent('# only comments\n\n'), false);
+    const resolved = resolveAppTomlConfig(root);
+    assert.ok(resolved);
+    assert.match(resolved.sourcePath.replace(/\\/g, '/'), /config\.toml$/);
+    assert.doesNotMatch(resolved.sourcePath.replace(/\\/g, '/'), /\.local\.toml$/);
+    const config = loadDatabaseConfig(root);
+    assert.equal(config?.host, 'base');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('legacy split database.toml still works when unified is absent', () => {
+  const root = mkdtempSync(join(tmpdir(), 'html-video-legacy-split-'));
+  try {
+    mkdirSync(join(root, 'config'));
+    writeFileSync(
+      join(root, 'config', 'database.toml'),
+      '[database]\nenabled = false\nhost = "split"\nname = "n"\nuser = "u"\npassword = "p"\n',
+      'utf8',
+    );
+    writeFileSync(
+      join(root, 'config', 'database.local.toml'),
+      '[database]\nenabled = true\npassword = "local"\n',
+      'utf8',
+    );
+    const config = loadDatabaseConfig(root);
+    assert.equal(config?.host, 'split');
+    assert.equal(config?.password, 'local');
+    assert.equal(config?.enabled, true);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -245,4 +301,44 @@ test('mergeSimpleToml prefers local keys', () => {
   assert.match(merged, /enabled = true/);
   assert.match(merged, /password = "local"/);
   assert.doesNotMatch(merged, /password = "base"/);
+});
+
+test('mergeUnifiedToml replaces auth.users from local when present', () => {
+  const merged = mergeUnifiedToml(
+    `
+[auth]
+password = "base"
+
+[[auth.users]]
+user_id = "admin"
+display_name = "Base Admin"
+`.trim(),
+    `
+[auth]
+password = "local"
+
+[[auth.users]]
+user_id = "alice"
+display_name = "Alice"
+`.trim(),
+  );
+  assert.match(merged, /password = "local"/);
+  assert.match(merged, /user_id = "alice"/);
+  assert.doesNotMatch(merged, /user_id = "admin"/);
+});
+
+test('parseAgentTomlSection maps snake_case to HV_PI_*', () => {
+  const parsed = parseAgentTomlSection(`
+[agent]
+api_key = "sk-test"
+base_url = "https://example.com/v1"
+model = "qwen-test"
+max_tokens = 8192
+`);
+  assert.deepEqual(parsed, {
+    HV_PI_API_KEY: 'sk-test',
+    HV_PI_BASE_URL: 'https://example.com/v1',
+    HV_PI_MODEL: 'qwen-test',
+    HV_PI_MAX_TOKENS: '8192',
+  });
 });

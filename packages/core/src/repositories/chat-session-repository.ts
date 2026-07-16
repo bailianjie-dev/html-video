@@ -1,5 +1,5 @@
-import { firstRow, type DbClient } from '../db/client.js';
-import type { ChatSessionRow, CreateChatSessionInput } from '../db/types.js';
+import { type DbClient, firstRow } from '../db/client.js';
+import type { ChatSessionRow, ChatSessionStatus, CreateChatSessionInput } from '../db/types.js';
 
 export class ChatSessionRepository {
   constructor(private readonly db: DbClient) {}
@@ -25,16 +25,59 @@ export class ChatSessionRepository {
         input.updated_by,
       ],
     );
-    return result.rows[0]!;
+    const created = result.rows[0];
+    if (!created) throw new Error(`Failed to create chat session ${input.id}`);
+    return created;
+  }
+
+  async createForAlbum(input: CreateChatSessionInput): Promise<ChatSessionRow> {
+    return this.create(input);
+  }
+
+  async findById(
+    userId: string,
+    albumId: string,
+    sessionId: string,
+  ): Promise<ChatSessionRow | null> {
+    return firstRow(
+      await this.db.query<ChatSessionRow>(
+        `SELECT * FROM ai_album_chat_sessions
+       WHERE user_id = $1 AND album_id = $2 AND id = $3`,
+        [userId, albumId, sessionId],
+      ),
+    );
+  }
+
+  async listByAlbum(
+    userId: string,
+    albumId: string,
+    status?: ChatSessionStatus,
+  ): Promise<ChatSessionRow[]> {
+    const result = status
+      ? await this.db.query<ChatSessionRow>(
+          `SELECT * FROM ai_album_chat_sessions
+           WHERE user_id = $1 AND album_id = $2 AND status = $3
+           ORDER BY updated_time DESC, created_time DESC, id DESC`,
+          [userId, albumId, status],
+        )
+      : await this.db.query<ChatSessionRow>(
+          `SELECT * FROM ai_album_chat_sessions
+           WHERE user_id = $1 AND album_id = $2
+           ORDER BY updated_time DESC, created_time DESC, id DESC`,
+          [userId, albumId],
+        );
+    return result.rows;
   }
 
   async findActiveByAlbum(userId: string, albumId: string): Promise<ChatSessionRow | null> {
-    return firstRow(await this.db.query<ChatSessionRow>(
-      `SELECT * FROM ai_album_chat_sessions
+    return firstRow(
+      await this.db.query<ChatSessionRow>(
+        `SELECT * FROM ai_album_chat_sessions
        WHERE user_id = $1 AND album_id = $2 AND status = 'active'
-       ORDER BY created_time DESC LIMIT 1`,
-      [userId, albumId],
-    ));
+       ORDER BY created_time ASC, id ASC LIMIT 1`,
+        [userId, albumId],
+      ),
+    );
   }
 
   async mergeMetadata(
@@ -43,15 +86,57 @@ export class ChatSessionRepository {
     metadata: Record<string, unknown>,
     updatedBy: string,
   ): Promise<ChatSessionRow | null> {
-    return firstRow(await this.db.query<ChatSessionRow>(
-      `UPDATE ai_album_chat_sessions
+    return firstRow(
+      await this.db.query<ChatSessionRow>(
+        `UPDATE ai_album_chat_sessions
        SET metadata = metadata || $3::jsonb,
            updated_by = $4,
            updated_time = now()
        WHERE user_id = $1 AND id = $2
        RETURNING *`,
-      [userId, sessionId, metadata, updatedBy],
-    ));
+        [userId, sessionId, metadata, updatedBy],
+      ),
+    );
+  }
+
+  async updateTitle(
+    userId: string,
+    albumId: string,
+    sessionId: string,
+    title: string | null,
+    updatedBy: string,
+  ): Promise<ChatSessionRow | null> {
+    return firstRow(
+      await this.db.query<ChatSessionRow>(
+        `UPDATE ai_album_chat_sessions
+       SET title = $4,
+           updated_by = $5,
+           updated_time = now()
+       WHERE user_id = $1 AND album_id = $2 AND id = $3
+       RETURNING *`,
+        [userId, albumId, sessionId, title, updatedBy],
+      ),
+    );
+  }
+
+  async updateStatus(
+    userId: string,
+    albumId: string,
+    sessionId: string,
+    status: ChatSessionStatus,
+    updatedBy: string,
+  ): Promise<ChatSessionRow | null> {
+    return firstRow(
+      await this.db.query<ChatSessionRow>(
+        `UPDATE ai_album_chat_sessions
+       SET status = $4,
+           updated_by = $5,
+           updated_time = now()
+       WHERE user_id = $1 AND album_id = $2 AND id = $3
+       RETURNING *`,
+        [userId, albumId, sessionId, status, updatedBy],
+      ),
+    );
   }
 
   async nextMessageSequence(
@@ -59,15 +144,17 @@ export class ChatSessionRepository {
     sessionId: string,
     updatedBy: string,
   ): Promise<number | null> {
-    const row = firstRow(await this.db.query<Pick<ChatSessionRow, 'last_message_seq'>>(
-      `UPDATE ai_album_chat_sessions
+    const row = firstRow(
+      await this.db.query<Pick<ChatSessionRow, 'last_message_seq'>>(
+        `UPDATE ai_album_chat_sessions
        SET last_message_seq = last_message_seq + 1,
            updated_by = $3,
            updated_time = now()
        WHERE user_id = $1 AND id = $2
        RETURNING last_message_seq`,
-      [userId, sessionId, updatedBy],
-    ));
+        [userId, sessionId, updatedBy],
+      ),
+    );
     return row?.last_message_seq ?? null;
   }
 }
