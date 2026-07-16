@@ -25,6 +25,8 @@
     "typescript": "^5.7.2"
   },
   "dependencies": {
+    "@mariozechner/pi-ai": "0.73.1",
+    "@mariozechner/pi-coding-agent": "0.73.1",
     "@powerformer/vela-cli": "^0.0.16"
   }
 }

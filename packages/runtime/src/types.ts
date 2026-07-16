@@ -86,6 +86,10 @@ export interface AgentInvokeContext {
   /** Model override for agents that support selection (e.g. AMR). Falls back to
    *  the agent's defaultModel when unset. */
   model?: string;
+  /** Stable system policy for SDK-backed agents. */
+  systemPrompt?: string;
+  /** Host-scoped business tools. Built-in coding tools remain disabled. */
+  customTools?: ToolDefinition[];
 }
 
 export interface DetectedAgent {
@@ -112,3 +116,4 @@ export interface SpawnHandle {
   stop(): void;
   done: Promise<{ exitCode: number; signal: NodeJS.Signals | null }>;
 }
+import type { ToolDefinition } from '@mariozechner/pi-coding-agent';

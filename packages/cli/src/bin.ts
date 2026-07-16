@@ -21,6 +21,10 @@ import {
 import { startStudioServer } from './studio-server.js';
 import { runOssGarbageCollector } from './oss-garbage-collector.js';
 import { migrateLegacyProjects } from './commands/migrate-legacy-projects.js';
+import { loadEnvFile } from './load-env.js';
+
+// Load root .env before any command resolves Pi Agent / DashScope credentials.
+loadEnvFile(process.cwd());
 
 // cac is a CJS default export; ESM interop sometimes wraps it in `.default`
 // biome-ignore lint/suspicious/noExplicitAny: cac's types don't expose this shape

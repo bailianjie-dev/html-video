@@ -34,7 +34,14 @@ import {
 } from '@html-video/core';
 import type { ContentGraph } from '@html-video/content-graph';
 import { extractUrls, fetchSource } from './fetch-source.js';
-import { detectAll, findAgent, spawnAgent } from '@html-video/runtime';
+import {
+  AgentRunEventLog,
+  detectAll,
+  findAgent,
+  runAgentTurn,
+  spawnAgent,
+  type AgentRunEvent,
+} from '@html-video/runtime';
 import { createPgClient, loadDatabaseConfig, maskedDatabaseConfig } from './database-config.js';
 import {
   downloadFromAliyunOss,
@@ -62,6 +69,28 @@ import {
   type ExportJobHandle,
 } from './export-job-tracker.js';
 import { createHtmlOssPublisher } from './html-oss-publisher.js';
+import {
+  AgentRunRegistry,
+  ALBUM_AGENT_PROMPT_VERSION,
+  ALBUM_AGENT_TOOLSET_VERSION,
+  albumAgentSystemPrompt,
+  buildAlbumAgentPrompt,
+  useLegacyAlbumWorkflow,
+  type AlbumAgentSessionRecord,
+  type CompletedAlbumToolCall,
+  type PendingAlbumConfirmation,
+  type RegisteredAgentRun,
+} from './album-agent-v1.js';
+import {
+  createAlbumGenerateTool,
+  createAlbumReadTools,
+  normalizeAlbumViewStateInput,
+  shouldRequireAlbumOverwrite,
+  type AlbumPageReadModel,
+  type AlbumReadModel,
+  type AlbumViewState,
+  type GenerateAlbumToolInput,
+} from './album-agent-tools.js';
 
 interface StudioHandle {
   url: string;
@@ -1483,13 +1512,19 @@ export async function startStudioServer(
         });
       }
 
-      // Model selection is intentionally disabled. Pi uses its global default.
+      // Model selection UI is disabled; report the SDK-configured default for diagnostics.
       const modelsMatch = url.pathname.match(/^\/api\/agents\/([^/]+)\/models$/);
       if (modelsMatch && modelsMatch[1] && m === 'GET') {
         if (modelsMatch[1] !== REQUIRED_AGENT_ID) {
           return json(res, 404, { error: 'Agent not found' });
         }
-        return json(res, 200, { models: [], default: null });
+        const def = findAgent(REQUIRED_AGENT_ID);
+        const model = def?.defaultModel
+          || process.env.HV_PI_MODEL
+          || process.env.DASHSCOPE_MODEL
+          || process.env.OPENAI_MODEL
+          || 'qwen3.7-plus';
+        return json(res, 200, { models: [model], default: model });
       }
 
       // Agent login — currently AMR/vela only. Spawns `vela login`, which opens
@@ -1554,6 +1589,7 @@ export async function startStudioServer(
         let albumPageIndex: number | undefined;
         let albumPageCount: number | undefined;
         let albumPageSummary = '';
+        let agentViewStateInput: unknown;
         const attachments: Attachment[] = [];
 
         const project0 = await ctx.orchestrator.load(id);
@@ -1570,6 +1606,8 @@ export async function startStudioServer(
               albumPageCount = parseOptionalPositiveInt(p.value);
             } else if (p.kind === 'field' && p.name === 'album_page_summary') {
               albumPageSummary = p.value;
+            } else if (p.kind === 'field' && p.name === 'agent_view_state') {
+              try { agentViewStateInput = JSON.parse(p.value); } catch { agentViewStateInput = undefined; }
             } else if (p.kind === 'file') {
               const updatedProject = shouldPersistUploadedAssetsToOss(ctx)
                 ? await addFileAssetToOss(ctx, id, p.tmpPath, p.filename)
@@ -1604,10 +1642,22 @@ export async function startStudioServer(
           albumPageIndex = parseOptionalNonNegativeInt(body.album_page_index);
           albumPageCount = parseOptionalPositiveInt(body.album_page_count);
           albumPageSummary = typeof body.album_page_summary === 'string' ? body.album_page_summary : '';
+          agentViewStateInput = body.agent_view_state;
         }
 
         if (!userText && attachments.length === 0) {
           return json(res, 400, { error: 'content or attachments required' });
+        }
+
+        if (!useLegacyAlbumWorkflow()) {
+          return handleAlbumAgentV1Message({
+            ctx,
+            res,
+            projectId: id,
+            userText,
+            attachments,
+            viewStateInput: agentViewStateInput,
+          });
         }
 
         // External content sources: any URL (web article or GitHub repo) in the
@@ -1663,7 +1713,7 @@ export async function startStudioServer(
         if (!agentDef) {
           return json(res, 400, { error: `agent "${agentId}" not registered` });
         }
-        // Pi resolves the model from its global ~/.pi/agent/settings.json.
+        // Pi Agent SDK resolves model from HV_PI_MODEL / DASHSCOPE_MODEL (default qwen3.7-plus).
         const agentModel = undefined;
         const albumPageFocus = !focusFrameId
           ? resolveAlbumPageFocusFromRequest({
@@ -2338,6 +2388,58 @@ export async function startStudioServer(
         } finally {
           GENERATING.delete(generationKey);
         }
+      }
+
+      const agentViewStateMatch = url.pathname.match(/^\/api\/projects\/([^/]+)\/agent-session\/view-state$/);
+      if (agentViewStateMatch?.[1] && (m === 'GET' || m === 'PUT')) {
+        const projectId = agentViewStateMatch[1];
+        await ctx.orchestrator.load(projectId);
+        const model = findAgent(REQUIRED_AGENT_ID)?.defaultModel ?? null;
+        if (m === 'GET') {
+          const session = await ensureAlbumAgentSession(ctx, projectId, model);
+          return json(res, 200, {
+            session_id: session.id,
+            view_state: session.viewState,
+          });
+        }
+        const body = await readBody(req);
+        const update = await updateAlbumAgentViewState(
+          ctx,
+          projectId,
+          body.view_state ?? body,
+          model,
+        );
+        return json(res, update.accepted ? 200 : 409, {
+          session_id: update.session.id,
+          accepted: update.accepted,
+          view_state: update.session.viewState,
+        });
+      }
+
+      const agentRunMatch = url.pathname.match(/^\/api\/agent-runs\/([^/]+)\/events$/);
+      if (agentRunMatch?.[1] && m === 'GET') {
+        const run = AGENT_RUNS.get(agentRunMatch[1]);
+        if (!run || run.projectKey !== runtimeProjectKey(ctx, run.projectId)) {
+          return json(res, 404, { error: 'Agent run not found' });
+        }
+        const headerSequence = Number(req.headers['last-event-id'] ?? 0);
+        const querySequence = Number(url.searchParams.get('after') ?? 0);
+        const afterSequence = Number.isInteger(querySequence) && querySequence > 0
+          ? querySequence
+          : Number.isInteger(headerSequence) && headerSequence > 0
+            ? headerSequence
+            : 0;
+        return streamRegisteredAgentRun(res, run, afterSequence);
+      }
+
+      const cancelAgentRunMatch = url.pathname.match(/^\/api\/agent-runs\/([^/]+)$/);
+      if (cancelAgentRunMatch?.[1] && m === 'DELETE') {
+        const run = AGENT_RUNS.get(cancelAgentRunMatch[1]);
+        if (!run || run.projectKey !== runtimeProjectKey(ctx, run.projectId)) {
+          return json(res, 404, { error: 'Agent run not found' });
+        }
+        run.abortController.abort();
+        return json(res, 202, { ok: true, run_id: cancelAgentRunMatch[1] });
       }
 
       // Is a generation currently running for this project? Lets a returning
@@ -3546,19 +3648,1066 @@ interface ChatMessage {
   agent?: string;
   tool?: string;
   output?: unknown;
+  sessionId?: string;
+  runId?: string;
   ts: number;
 }
 
 const MESSAGES = new Map<string, ChatMessage[]>();
+const AGENT_SESSIONS = new Map<string, AlbumAgentSessionRecord>();
+const AGENT_RUNS = new AgentRunRegistry();
+const ALBUM_WRITE_QUEUES = new Map<string, Promise<unknown>>();
 
 /** Projects with a generation running right now (detached from any request).
  *  Lets a client that switched away and came back learn the task is still alive
  *  ("⏳ still generating…") instead of seeing the progress lines vanish. */
 const GENERATING = new Set<string>();
 
+const TERMINAL_AGENT_RUN_EVENTS = new Set([
+  'run.completed',
+  'run.failed',
+  'run.cancelled',
+]);
+
 function runtimeProjectKey(ctx: CliContext, projectId: string): string {
   if (ctx.database?.mode !== 'postgres') return projectId;
   return `${ctx.requestContexts.getRequiredUser().userId}\0${projectId}`;
+}
+
+async function handleAlbumAgentV1Message(args: {
+  ctx: CliContext;
+  res: ServerResponse;
+  projectId: string;
+  userText: string;
+  attachments: Attachment[];
+  viewStateInput?: unknown;
+}): Promise<void> {
+  const { ctx, res, projectId, userText, attachments, viewStateInput } = args;
+  const project = await ctx.orchestrator.load(projectId);
+  const agentDef = findAgent(REQUIRED_AGENT_ID);
+  if (!agentDef) {
+    return json(res, 400, { error: `agent "${REQUIRED_AGENT_ID}" not registered` });
+  }
+  if (project.agentId !== REQUIRED_AGENT_ID || project.agentModel !== null) {
+    await ctx.orchestrator.setAgent(projectId, REQUIRED_AGENT_ID, null).catch(() => {});
+  }
+
+  let session = await ensureAlbumAgentSession(ctx, projectId, agentDef.defaultModel ?? null);
+  if (viewStateInput !== undefined) {
+    session = (await updateAlbumAgentViewState(
+      ctx,
+      projectId,
+      viewStateInput,
+      agentDef.defaultModel ?? null,
+    )).session;
+  }
+  const runId = randomUUID();
+  const history = await loadMessages(ctx, projectId);
+  const attachmentSummary = attachments.length > 0
+    ? `\n\nAttachments: ${attachments.map((attachment) => attachment.filename).join(', ')}`
+    : '';
+  await appendMessage(ctx, projectId, history, {
+    role: 'user',
+    content: userText + attachmentSummary,
+    sessionId: session.id,
+    runId,
+    ts: Date.now(),
+  });
+
+  const projectDir = await ctx.projects.ensureDir(projectId);
+  const prompt = buildAlbumAgentPrompt({
+    history,
+    attachmentNames: attachments.map((attachment) => attachment.filename),
+    pendingConfirmation: session.pendingConfirmation,
+  });
+  const readTools = createAlbumReadTools({
+    getAlbumState: () => readAlbumModel(ctx, projectId),
+    getViewState: async () => (
+      await ensureAlbumAgentSession(ctx, projectId, agentDef.defaultModel ?? null)
+    ).viewState,
+  });
+  const generateTool = createAlbumGenerateTool({
+    executeGenerate: (toolCallId, input, signal) => executeAlbumGenerationTool({
+      ctx,
+      projectId,
+      projectDir,
+      agentDef,
+      toolCallId,
+      input,
+      signal,
+      requestAttachments: attachments,
+    }),
+  });
+  const customTools = [...readTools, generateTool];
+  const log = new AgentRunEventLog(runId, session.id);
+  const abortController = new AbortController();
+  const registeredRun: RegisteredAgentRun = {
+    projectKey: runtimeProjectKey(ctx, projectId),
+    projectId,
+    log,
+    abortController,
+    createdAt: Date.now(),
+  };
+  AGENT_RUNS.add(runId, registeredRun);
+
+  res.writeHead(200, {
+    'content-type': 'text/event-stream; charset=utf-8',
+    'cache-control': 'no-cache',
+    connection: 'keep-alive',
+    'x-agent-run-id': runId,
+    'x-agent-session-id': session.id,
+  });
+  const unsubscribe = log.subscribe((event) => writeAgentRunSse(res, event));
+
+  try {
+    const result = await runAgentTurn({
+      def: agentDef,
+      prompt,
+      context: {
+        cwd: projectDir,
+        model: session.model ?? agentDef.defaultModel,
+        systemPrompt: albumAgentSystemPrompt(),
+        customTools,
+      },
+      events: log,
+      signal: abortController.signal,
+    });
+    const assistantText = result.text.trim();
+    const toolStarts = new Map<string, { name: string }>();
+    for (const event of log.list()) {
+      if (event.type === 'tool.call.started') {
+        const data = event.data as { callId?: unknown; name?: unknown };
+        if (typeof data.callId === 'string' && typeof data.name === 'string') {
+          toolStarts.set(data.callId, { name: data.name });
+        }
+      } else if (event.type === 'tool.call.completed') {
+        const data = event.data as { callId?: unknown; output?: unknown; isError?: unknown };
+        const callId = typeof data.callId === 'string' ? data.callId : '';
+        const tool = toolStarts.get(callId)?.name ?? 'unknown_tool';
+        await appendMessage(ctx, projectId, history, {
+          role: 'tool',
+          tool,
+          content: safeToolResultText(data.output),
+          output: data.output,
+          sessionId: session.id,
+          runId,
+          ts: Date.now(),
+        });
+      }
+    }
+    if (assistantText) {
+      await appendMessage(ctx, projectId, history, {
+        role: 'assistant',
+        agent: agentDef.id,
+        content: assistantText,
+        sessionId: session.id,
+        runId,
+        ts: Date.now(),
+      });
+    } else if (result.cancelled || result.error) {
+      await appendMessage(ctx, projectId, history, {
+        role: 'system',
+        content: result.cancelled ? 'Agent run cancelled' : result.error ?? 'Agent run failed',
+        sessionId: session.id,
+        runId,
+        ts: Date.now(),
+      });
+    }
+  } finally {
+    AGENT_RUNS.markCompleted(runId);
+    unsubscribe();
+    if (!res.writableEnded) res.end();
+  }
+}
+
+async function ensureAlbumAgentSession(
+  ctx: CliContext,
+  projectId: string,
+  model: string | null,
+): Promise<AlbumAgentSessionRecord> {
+  if (ctx.database?.mode === 'postgres' && ctx.database.handle) {
+    const row = await projectChatPersistence(ctx).getOrCreateSessionForProject(projectId, {
+      source: 'studio',
+      model,
+      system_prompt_version: ALBUM_AGENT_PROMPT_VERSION,
+      toolset_version: ALBUM_AGENT_TOOLSET_VERSION,
+    });
+    return {
+      id: row.id,
+      projectId,
+      status: 'active',
+      model,
+      systemPromptVersion: ALBUM_AGENT_PROMPT_VERSION,
+      toolsetVersion: ALBUM_AGENT_TOOLSET_VERSION,
+      viewState: parseStoredAlbumViewState(row.metadata.view_state),
+      pendingConfirmation: parseStoredPendingAlbumConfirmation(row.metadata.pending_album_confirmation),
+      completedToolCalls: parseStoredCompletedAlbumToolCalls(row.metadata.completed_album_tool_calls),
+      createdAt: new Date(row.created_time).toISOString(),
+      updatedAt: new Date(row.updated_time).toISOString(),
+    };
+  }
+
+  const key = runtimeProjectKey(ctx, projectId);
+  const cached = AGENT_SESSIONS.get(key);
+  if (cached) return cached;
+  const projectDir = await ctx.projects.ensureDir(projectId);
+  const sessionPath = join(projectDir, 'agent-session.json');
+  if (existsSync(sessionPath)) {
+    try {
+      const parsed = JSON.parse(await readFile(sessionPath, 'utf8')) as AlbumAgentSessionRecord;
+      if (parsed.id && parsed.projectId === projectId && parsed.status === 'active') {
+        const restored: AlbumAgentSessionRecord = {
+          ...parsed,
+          model: model ?? parsed.model ?? null,
+          systemPromptVersion: ALBUM_AGENT_PROMPT_VERSION,
+          toolsetVersion: ALBUM_AGENT_TOOLSET_VERSION,
+          viewState: parseStoredAlbumViewState(parsed.viewState),
+          pendingConfirmation: parseStoredPendingAlbumConfirmation(parsed.pendingConfirmation),
+          completedToolCalls: parseStoredCompletedAlbumToolCalls(parsed.completedToolCalls),
+        };
+        AGENT_SESSIONS.set(key, restored);
+        return restored;
+      }
+    } catch {
+      // Ignore an invalid local session file and create a fresh session record.
+    }
+  }
+  const now = new Date().toISOString();
+  const created: AlbumAgentSessionRecord = {
+    id: randomUUID(),
+    projectId,
+    status: 'active',
+    model,
+    systemPromptVersion: ALBUM_AGENT_PROMPT_VERSION,
+    toolsetVersion: ALBUM_AGENT_TOOLSET_VERSION,
+    viewState: null,
+    pendingConfirmation: null,
+    completedToolCalls: {},
+    createdAt: now,
+    updatedAt: now,
+  };
+  await writeFile(sessionPath, JSON.stringify(created, null, 2), 'utf8');
+  AGENT_SESSIONS.set(key, created);
+  return created;
+}
+
+async function updateAlbumAgentViewState(
+  ctx: CliContext,
+  projectId: string,
+  input: unknown,
+  model: string | null,
+): Promise<{ accepted: boolean; session: AlbumAgentSessionRecord }> {
+  const session = await ensureAlbumAgentSession(ctx, projectId, model);
+  const album = await readAlbumModel(ctx, projectId);
+  const normalized = normalizeAlbumViewStateInput({
+    input,
+    pageCount: album.pageCount,
+    previous: session.viewState,
+  });
+  if (!normalized.accepted || !normalized.state) {
+    return { accepted: false, session };
+  }
+  if (normalized.state === session.viewState) {
+    return { accepted: true, session };
+  }
+  const updated: AlbumAgentSessionRecord = {
+    ...session,
+    viewState: normalized.state,
+    updatedAt: normalized.state.updatedAt,
+  };
+  await persistAlbumAgentSession(ctx, updated);
+  return { accepted: true, session: updated };
+}
+
+async function persistAlbumAgentSession(
+  ctx: CliContext,
+  session: AlbumAgentSessionRecord,
+): Promise<void> {
+  if (ctx.database?.mode === 'postgres' && ctx.database.handle) {
+    await projectChatPersistence(ctx).getOrCreateSessionForProject(session.projectId, {
+      view_state: session.viewState
+        ? jsonObject(session.viewState as unknown as Record<string, unknown>)
+        : null,
+      pending_album_confirmation: session.pendingConfirmation
+        ? jsonObject(session.pendingConfirmation as unknown as Record<string, unknown>)
+        : null,
+      completed_album_tool_calls: jsonObject(
+        session.completedToolCalls as unknown as Record<string, unknown>,
+      ),
+    });
+    return;
+  }
+  const key = runtimeProjectKey(ctx, session.projectId);
+  const projectDir = await ctx.projects.ensureDir(session.projectId);
+  await writeFile(join(projectDir, 'agent-session.json'), JSON.stringify(session, null, 2), 'utf8');
+  AGENT_SESSIONS.set(key, session);
+}
+
+function parseStoredAlbumViewState(value: unknown): AlbumViewState | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const input = value as Record<string, unknown>;
+  const activePageIndex = input.activePageIndex;
+  const pageCount = Number(input.pageCount);
+  const previewRevision = Number(input.previewRevision);
+  const clientRevision = Number(input.clientRevision);
+  const updatedAt = input.updatedAt;
+  if (
+    !(activePageIndex === null || (Number.isSafeInteger(activePageIndex) && Number(activePageIndex) >= 0))
+    || !Number.isSafeInteger(pageCount)
+    || pageCount < 0
+    || !Number.isSafeInteger(previewRevision)
+    || previewRevision < 0
+    || !Number.isSafeInteger(clientRevision)
+    || clientRevision < 0
+    || typeof updatedAt !== 'string'
+  ) {
+    return null;
+  }
+  return {
+    activePageIndex: activePageIndex === null ? null : Number(activePageIndex),
+    pageCount,
+    previewRevision,
+    clientRevision,
+    updatedAt,
+  };
+}
+
+function parseStoredPendingAlbumConfirmation(value: unknown): PendingAlbumConfirmation | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const input = value as Record<string, unknown>;
+  const generationInput = input.generationInput;
+  if (
+    typeof input.actionId !== 'string'
+    || input.kind !== 'replace_album'
+    || typeof input.summary !== 'string'
+    || !Number.isSafeInteger(input.expectedRevision)
+    || Number(input.expectedRevision) < 0
+    || typeof input.expectedContentHash !== 'string'
+    || !generationInput
+    || typeof generationInput !== 'object'
+    || Array.isArray(generationInput)
+    || typeof input.createdAt !== 'string'
+    || typeof input.expiresAt !== 'string'
+  ) {
+    return null;
+  }
+  return {
+    actionId: input.actionId,
+    kind: 'replace_album',
+    summary: input.summary,
+    expectedRevision: Number(input.expectedRevision),
+    expectedContentHash: input.expectedContentHash,
+    generationInput: generationInput as GenerateAlbumToolInput,
+    createdAt: input.createdAt,
+    expiresAt: input.expiresAt,
+  };
+}
+
+function parseStoredCompletedAlbumToolCalls(value: unknown): Record<string, CompletedAlbumToolCall> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
+  const out: Record<string, CompletedAlbumToolCall> = {};
+  for (const [key, raw] of Object.entries(value as Record<string, unknown>)) {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) continue;
+    const item = raw as Record<string, unknown>;
+    if (
+      !item.result
+      || typeof item.result !== 'object'
+      || Array.isArray(item.result)
+      || typeof item.completedAt !== 'string'
+    ) continue;
+    out[key] = {
+      result: item.result as Record<string, unknown>,
+      completedAt: item.completedAt,
+    };
+  }
+  return out;
+}
+
+interface ExecuteAlbumGenerationToolArgs {
+  ctx: CliContext;
+  projectId: string;
+  projectDir: string;
+  agentDef: import('@html-video/runtime').AgentDef;
+  toolCallId: string;
+  input: GenerateAlbumToolInput;
+  signal?: AbortSignal;
+  requestAttachments: Attachment[];
+}
+
+async function executeAlbumGenerationTool(
+  args: ExecuteAlbumGenerationToolArgs,
+): Promise<Record<string, unknown>> {
+  const key = runtimeProjectKey(args.ctx, args.projectId);
+  return withAlbumWriteQueue(key, async () => {
+    let session = await ensureAlbumAgentSession(
+      args.ctx,
+      args.projectId,
+      args.agentDef.defaultModel ?? null,
+    );
+    const replay = session.completedToolCalls[`tool:${args.toolCallId}`];
+    if (replay) return replayAlbumToolResult(replay.result);
+
+    const actionId = args.input.confirmation_action_id?.trim() ?? '';
+    if (actionId) {
+      const actionReplay = session.completedToolCalls[`action:${actionId}`];
+      if (actionReplay) {
+        const result = replayAlbumToolResult(actionReplay.result);
+        session = rememberAlbumToolResult(session, `tool:${args.toolCallId}`, result);
+        await persistAlbumAgentSession(args.ctx, session);
+        return result;
+      }
+      const pending = session.pendingConfirmation;
+      if (!pending || pending.actionId !== actionId) {
+        return rememberAndPersistAlbumToolResult(args, session, {
+          ok: false,
+          code: 'CONFIRMATION_NOT_FOUND',
+          message: 'The pending overwrite confirmation is missing or no longer current.',
+        });
+      }
+      if (Date.parse(pending.expiresAt) <= Date.now()) {
+        session = { ...session, pendingConfirmation: null, updatedAt: new Date().toISOString() };
+        return rememberAndPersistAlbumToolResult(args, session, {
+          ok: false,
+          code: 'CONFIRMATION_EXPIRED',
+          message: 'The overwrite confirmation expired. Start the generation request again.',
+        });
+      }
+      if (args.input.confirm_overwrite === false) {
+        const cancelled = {
+          ok: true,
+          cancelled: true,
+          code: 'OVERWRITE_CANCELLED',
+          action_id: actionId,
+          album_changed: false,
+        };
+        session = {
+          ...session,
+          pendingConfirmation: null,
+          updatedAt: new Date().toISOString(),
+        };
+        session = rememberAlbumToolResult(session, `action:${actionId}`, cancelled);
+        return rememberAndPersistAlbumToolResult(args, session, cancelled);
+      }
+
+      const current = await args.ctx.orchestrator.load(args.projectId);
+      const currentRevision = projectAlbumRevision(current);
+      const currentContentHash = await albumContentHash(args.ctx, current);
+      if (
+        currentRevision !== pending.expectedRevision
+        || currentContentHash !== pending.expectedContentHash
+      ) {
+        session = { ...session, pendingConfirmation: null, updatedAt: new Date().toISOString() };
+        return rememberAndPersistAlbumToolResult(args, session, {
+          ok: false,
+          code: 'CONFIRMATION_STALE',
+          message: 'The album changed after confirmation was requested. Start the generation request again.',
+          expected_revision: pending.expectedRevision,
+          current_revision: currentRevision,
+        });
+      }
+
+      const generated = await generateAndPersistAlbum({
+        ...args,
+        input: pending.generationInput,
+        expectedRevision: pending.expectedRevision,
+      });
+      session = await ensureAlbumAgentSession(
+        args.ctx,
+        args.projectId,
+        args.agentDef.defaultModel ?? null,
+      );
+      if (generated.ok === true) session = updateSessionAfterAlbumGeneration(session, generated);
+      session = { ...session, pendingConfirmation: null };
+      session = rememberAlbumToolResult(session, `action:${actionId}`, generated);
+      return rememberAndPersistAlbumToolResult(args, session, generated);
+    }
+
+    const normalizedInput = normalizeAlbumGenerationInput(args.input);
+    if (!normalizedInput.request) {
+      return rememberAndPersistAlbumToolResult(args, session, {
+        ok: false,
+        code: 'INVALID_GENERATION_REQUEST',
+        message: 'A concrete album request is required.',
+      });
+    }
+    const [project, album] = await Promise.all([
+      args.ctx.orchestrator.load(args.projectId),
+      readAlbumModel(args.ctx, args.projectId),
+    ]);
+    const currentRevision = projectAlbumRevision(project);
+    if (await hasGeneratedAlbumContent(args.ctx, project, album)) {
+      const now = new Date();
+      const pending: PendingAlbumConfirmation = {
+        actionId: randomUUID(),
+        kind: 'replace_album',
+        summary: `Replace the existing ${album.pageCount}-page album with: ${normalizedInput.request.slice(0, 240)}`,
+        expectedRevision: currentRevision,
+        expectedContentHash: await albumContentHash(args.ctx, project),
+        generationInput: normalizedInput,
+        createdAt: now.toISOString(),
+        expiresAt: new Date(now.getTime() + 15 * 60_000).toISOString(),
+      };
+      const confirmationRequired = {
+        ok: false,
+        confirmation_required: true,
+        code: 'OVERWRITE_CONFIRMATION_REQUIRED',
+        action_id: pending.actionId,
+        summary: pending.summary,
+        expected_revision: pending.expectedRevision,
+        expires_at: pending.expiresAt,
+        album_changed: false,
+      };
+      session = { ...session, pendingConfirmation: pending, updatedAt: now.toISOString() };
+      return rememberAndPersistAlbumToolResult(args, session, confirmationRequired);
+    }
+
+    const generated = await generateAndPersistAlbum({
+      ...args,
+      input: normalizedInput,
+      expectedRevision: currentRevision,
+    });
+    session = await ensureAlbumAgentSession(
+      args.ctx,
+      args.projectId,
+      args.agentDef.defaultModel ?? null,
+    );
+    if (generated.ok === true) session = updateSessionAfterAlbumGeneration(session, generated);
+    return rememberAndPersistAlbumToolResult(args, session, generated);
+  });
+}
+
+async function withAlbumWriteQueue<T>(key: string, fn: () => Promise<T>): Promise<T> {
+  const previous = ALBUM_WRITE_QUEUES.get(key) ?? Promise.resolve();
+  const current = previous.catch(() => undefined).then(fn);
+  ALBUM_WRITE_QUEUES.set(key, current);
+  try {
+    return await current;
+  } finally {
+    if (ALBUM_WRITE_QUEUES.get(key) === current) ALBUM_WRITE_QUEUES.delete(key);
+  }
+}
+
+function normalizeAlbumGenerationInput(input: GenerateAlbumToolInput): GenerateAlbumToolInput {
+  const request = input.request?.trim().slice(0, 4_000) ?? '';
+  const style = input.style?.trim().slice(0, 1_000) ?? '';
+  const templateId = input.template_id?.trim().slice(0, 200) ?? '';
+  const pageCount = Number(input.page_count);
+  return {
+    ...(request && { request }),
+    ...(Number.isSafeInteger(pageCount) && pageCount >= 1 && pageCount <= 30 && { page_count: pageCount }),
+    ...(style && { style }),
+    ...(templateId && { template_id: templateId }),
+  };
+}
+
+function projectAlbumRevision(project: Project): number {
+  return Number.isSafeInteger(project.albumRevision) && Number(project.albumRevision) >= 0
+    ? Number(project.albumRevision)
+    : 0;
+}
+
+async function albumContentHash(ctx: CliContext, project: Project): Promise<string> {
+  const hash = createHash('sha256');
+  const frames = [...(project.frames ?? [])].sort((left, right) => left.order - right.order);
+  if (frames.length > 0) {
+    for (const frame of frames) {
+      hash.update(frame.graphNodeId);
+      try { hash.update(await readFile(frame.htmlPath)); }
+      catch { hash.update('<missing>'); }
+    }
+  } else {
+    hash.update(await ctx.orchestrator.readRawHtml(project.id).catch(() => null) ?? '');
+  }
+  return hash.digest('hex');
+}
+
+async function hasGeneratedAlbumContent(
+  ctx: CliContext,
+  project: Project,
+  album: AlbumReadModel,
+): Promise<boolean> {
+  if (!album.exists) return false;
+  const html = await ctx.orchestrator.readRawHtml(project.id).catch(() => null) ?? '';
+  let templateHtml: string | null | undefined;
+  const template = project.templateId ? ctx.templates.get(project.templateId) : null;
+  const sourcePath = template?.__dir ? join(template.__dir, template.source_entry) : '';
+  try {
+    if (sourcePath && existsSync(sourcePath)) templateHtml = await readFile(sourcePath, 'utf8');
+  } catch {
+    templateHtml = null;
+  }
+  return shouldRequireAlbumOverwrite({
+    albumExists: album.exists,
+    albumRevision: projectAlbumRevision(project),
+    frameCount: project.frames?.length ?? 0,
+    currentHtml: html,
+    templateHtml,
+  });
+}
+
+function replayAlbumToolResult(result: Record<string, unknown>): Record<string, unknown> {
+  return {
+    ...result,
+    idempotent_replay: true,
+    album_changed: false,
+  };
+}
+
+function rememberAlbumToolResult(
+  session: AlbumAgentSessionRecord,
+  key: string,
+  result: Record<string, unknown>,
+): AlbumAgentSessionRecord {
+  const entries = Object.entries(session.completedToolCalls)
+    .sort((left, right) => Date.parse(left[1].completedAt) - Date.parse(right[1].completedAt))
+    .slice(-19);
+  return {
+    ...session,
+    completedToolCalls: {
+      ...Object.fromEntries(entries),
+      [key]: { result, completedAt: new Date().toISOString() },
+    },
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+async function rememberAndPersistAlbumToolResult(
+  args: ExecuteAlbumGenerationToolArgs,
+  session: AlbumAgentSessionRecord,
+  result: Record<string, unknown>,
+): Promise<Record<string, unknown>> {
+  const updated = rememberAlbumToolResult(session, `tool:${args.toolCallId}`, result);
+  await persistAlbumAgentSession(args.ctx, updated);
+  return result;
+}
+
+function updateSessionAfterAlbumGeneration(
+  session: AlbumAgentSessionRecord,
+  result: Record<string, unknown>,
+): AlbumAgentSessionRecord {
+  const revision = Number(result.revision);
+  const pageCount = Number(result.page_count);
+  const now = new Date().toISOString();
+  return {
+    ...session,
+    viewState: {
+      activePageIndex: pageCount > 0 ? 0 : null,
+      pageCount: Number.isSafeInteger(pageCount) && pageCount >= 0 ? pageCount : 0,
+      previewRevision: Number.isSafeInteger(revision) && revision >= 0 ? revision : 0,
+      clientRevision: session.viewState?.clientRevision ?? 0,
+      updatedAt: now,
+    },
+    updatedAt: now,
+  };
+}
+
+async function generateAndPersistAlbum(args: ExecuteAlbumGenerationToolArgs & {
+  expectedRevision: number;
+}): Promise<Record<string, unknown>> {
+  const beforeProject = await args.ctx.orchestrator.load(args.projectId);
+  const currentRevision = projectAlbumRevision(beforeProject);
+  if (currentRevision !== args.expectedRevision) {
+    return {
+      ok: false,
+      code: 'ALBUM_REVISION_CONFLICT',
+      expected_revision: args.expectedRevision,
+      current_revision: currentRevision,
+      album_changed: false,
+    };
+  }
+
+  const requestedTemplateId = args.input.template_id?.trim();
+  // The template selected in Studio is authoritative. Models may echo its
+  // display name (for example "Bold Signal") instead of the registry id.
+  const templateId = beforeProject.templateId || requestedTemplateId || null;
+  let template: import('@html-video/core').TemplateMetadata | null = null;
+  try {
+    template = templateId ? args.ctx.templates.get(templateId) : null;
+  } catch {
+    return {
+      ok: false,
+      code: 'TEMPLATE_NOT_FOUND',
+      template_id: templateId,
+      album_changed: false,
+    };
+  }
+  const attachments = await collectAlbumGeneratorAttachments(
+    args.projectId,
+    beforeProject,
+    args.requestAttachments,
+  );
+  const oldHtml = await args.ctx.orchestrator.readRawHtml(args.projectId).catch(() => null) ?? '';
+  const html = await generateAlbumHtmlWithSpecializedModel({
+    ctx: args.ctx,
+    projectId: args.projectId,
+    projectDir: args.projectDir,
+    agentDef: args.agentDef,
+    project: beforeProject,
+    input: args.input,
+    template,
+    attachments,
+    signal: args.signal,
+  });
+
+  let writeStarted = false;
+  try {
+    writeStarted = true;
+    await args.ctx.orchestrator.writePreviewHtmlRaw(args.projectId, hardenAlbumHtml(html));
+    const persisted = await args.ctx.orchestrator.load(args.projectId);
+    persisted.frames = [];
+    delete persisted.contentGraphPath;
+    persisted.albumRevision = currentRevision + 1;
+    if (templateId) persisted.templateId = templateId;
+    await args.ctx.projects.save(persisted);
+  } catch (error) {
+    if (writeStarted) {
+      try {
+        if (oldHtml) await args.ctx.orchestrator.writePreviewHtmlRaw(args.projectId, oldHtml);
+        await args.ctx.projects.save(beforeProject);
+      } catch (rollbackError) {
+        process.stderr.write(
+          `[studio:album-agent] rollback failed project=${args.projectId}: ${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}\n`,
+        );
+      }
+    }
+    throw error;
+  }
+
+  const album = await readAlbumModel(args.ctx, args.projectId);
+  return {
+    ok: true,
+    album_changed: true,
+    revision: currentRevision + 1,
+    page_count: album.pageCount,
+    template_id: templateId,
+    preview_url: `/preview/${args.projectId}`,
+  };
+}
+
+async function collectAlbumGeneratorAttachments(
+  projectId: string,
+  project: Project,
+  requestAttachments: Attachment[],
+): Promise<Attachment[]> {
+  const merged = new Map<string, Attachment>();
+  for (const attachment of requestAttachments) {
+    merged.set(`${attachment.kind}:${attachment.path || attachment.filename}`, attachment);
+  }
+  for (const asset of project.assets) {
+    const path = asset.path ?? '';
+    const key = `${asset.type}:${path || asset.id}`;
+    if (merged.has(key)) continue;
+    let inlineText = asset.content;
+    if (!inlineText && path && (asset.type === 'text' || asset.type === 'data')) {
+      try {
+        const value = await readFile(path, 'utf8');
+        if (value.length <= 20_000) inlineText = value;
+      } catch { /* path metadata is still useful */ }
+    }
+    merged.set(key, {
+      path,
+      kind: asset.type,
+      filename: asset.metadata.filename ?? `${asset.type}-${asset.id.slice(0, 8)}`,
+      size: asset.metadata.sizeBytes ?? 0,
+      ...(inlineText && { inlineText }),
+      ...((asset.type === 'image' || asset.type === 'video' || asset.type === 'audio') && {
+        browserUrl: projectAssetBrowserUrl(projectId, asset.id),
+      }),
+    });
+  }
+  return [...merged.values()].slice(0, 40);
+}
+
+async function generateAlbumHtmlWithSpecializedModel(args: {
+  ctx: CliContext;
+  projectId: string;
+  projectDir: string;
+  agentDef: import('@html-video/runtime').AgentDef;
+  project: Project;
+  input: GenerateAlbumToolInput;
+  template: import('@html-video/core').TemplateMetadata | null;
+  attachments: Attachment[];
+  signal?: AbortSignal;
+}): Promise<string> {
+  if (args.signal?.aborted) throw new Error('Album generation cancelled');
+  let templateHtml = '';
+  if (args.template?.__dir) {
+    const sourcePath = join(args.template.__dir, args.template.source_entry);
+    if (existsSync(sourcePath)) templateHtml = (await readFile(sourcePath, 'utf8')).slice(0, 60_000);
+  }
+  const pageCount = args.input.page_count ?? 6;
+  const operationId = randomUUID();
+  const prompt = buildAlbumGeneratorPrompt({ ...args, templateHtml, pageCount });
+  let output = await callAgentSimple(args.agentDef, prompt, args.projectDir, undefined, {
+    ctx: args.ctx,
+    projectId: args.projectId,
+    generationType: 'page_html',
+    operationId,
+    attempt: 1,
+    requestPayload: {
+      operation: 'generate_album_tool',
+      requested_page_count: pageCount,
+      template_id: args.template?.id ?? null,
+      attachment_count: args.attachments.length,
+    },
+    validateOutput: (value) => validateGeneratedAlbumOutput(value, pageCount),
+    invalidOutputCode: 'invalid_album_html',
+    signal: args.signal,
+  });
+  let issue = validateGeneratedAlbumOutput(output, pageCount);
+  if (args.signal?.aborted) throw new Error('Album generation cancelled');
+  if (issue) {
+    const repairPrompt = [
+      'Repair the attempted electronic album below.',
+      `Validation error: ${issue}`,
+      `Return exactly one fenced html block with a complete document and exactly ${pageCount} marked album pages.`,
+      'Do not include prose outside the block.',
+      '',
+      output.slice(0, 80_000),
+    ].join('\n');
+    output = await callAgentSimple(args.agentDef, repairPrompt, args.projectDir, undefined, {
+      ctx: args.ctx,
+      projectId: args.projectId,
+      generationType: 'page_html',
+      operationId,
+      attempt: 2,
+      requestPayload: {
+        operation: 'generate_album_tool_repair',
+        validation_error: issue,
+      },
+      validateOutput: (value) => validateGeneratedAlbumOutput(value, pageCount),
+      invalidOutputCode: 'invalid_album_html',
+      signal: args.signal,
+    });
+    issue = validateGeneratedAlbumOutput(output, pageCount);
+  }
+  if (args.signal?.aborted) throw new Error('Album generation cancelled');
+  if (issue) throw new Error(`Album generator returned invalid HTML: ${issue}`);
+  return extractHtmlDocument(output)!;
+}
+
+function buildAlbumGeneratorPrompt(args: {
+  project: Project;
+  input: GenerateAlbumToolInput;
+  template: import('@html-video/core').TemplateMetadata | null;
+  templateHtml: string;
+  attachments: Attachment[];
+  pageCount: number;
+}): string {
+  const resolution = args.project.preferences.resolution ?? { width: 1080, height: 1920 };
+  const rows = [
+    'You are the dedicated HTML generator inside an electronic-album tool.',
+    'The outer conversational agent has already decided to generate. Produce the artifact, not a discussion.',
+    `Create exactly ${args.pageCount} pages at ${resolution.width}x${resolution.height}.`,
+    'Output exactly one fenced ```html block containing a complete <!doctype html> document. No prose outside it.',
+    'Use a single #album container. Every page must be a direct child with class="album-page" and data-album-page="N".',
+    'Give every editable visible text node a stable, unique data-hv-text key using page_N.* naming.',
+    'Give editable images data-hv-image keys and CTA links/buttons data-hv-cta keys.',
+    'Implement keyboard/touch/wheel navigation, page dots or a page counter, and CSS scroll snap.',
+    'Do not add upload controls, FileReader, drag/drop upload handlers, local filesystem paths, or file:// URLs.',
+    'Use only browser-safe attachment URLs supplied below. Keep all CSS and JavaScript self-contained.',
+    `Project name: ${JSON.stringify(args.project.name)}`,
+    `User requirement: ${JSON.stringify(args.input.request ?? '')}`,
+    `Style direction: ${JSON.stringify(args.input.style ?? args.project.preferences.mood ?? '')}`,
+  ];
+  if (args.attachments.length > 0) {
+    rows.push('', 'Available project assets and source material:');
+    for (const attachment of args.attachments) rows.push(...renderAttachment(attachment));
+  }
+  if (args.template) {
+    rows.push(
+      '',
+      `Visual reference template: ${args.template.id} (${args.template.name}). Reuse its design language, not its placeholder copy.`,
+      '```html-reference',
+      args.templateHtml,
+      '```',
+    );
+  }
+  return rows.join('\n');
+}
+
+function validateGeneratedAlbumOutput(output: string, expectedPageCount: number): string | null {
+  const html = extractHtmlDocument(output);
+  if (!html) return 'response did not contain a complete HTML document';
+  const persistValidation = validateAlbumHtmlBeforePersist('', html);
+  if (!persistValidation.ok) return persistValidation.reasons.join('; ');
+  if (!looksLikeAlbumHtml(html)) return 'document was not recognizable as an electronic album';
+  const pages = parseAlbumPagesForAgent(html);
+  if (pages.length !== expectedPageCount) {
+    return `page count mismatch (${pages.length} != ${expectedPageCount})`;
+  }
+  if (!/\bdata-hv-text\s*=/i.test(html)) return 'document had no editable data-hv-text fields';
+  return null;
+}
+
+async function readAlbumModel(ctx: CliContext, projectId: string): Promise<AlbumReadModel> {
+  const project = await ctx.orchestrator.load(projectId);
+  const frames = [...(project.frames ?? [])].sort((left, right) => left.order - right.order);
+  if (frames.length > 0) {
+    const pages: AlbumPageReadModel[] = [];
+    for (const [index, frame] of frames.entries()) {
+      let html = '';
+      try { html = await readFile(frame.htmlPath, 'utf8'); } catch { /* unavailable frame */ }
+      pages.push(readAlbumPageFromHtml(html, index));
+    }
+    return {
+      exists: pages.length > 0,
+      pageCount: pages.length,
+      templateId: project.templateId ?? null,
+      previewAvailable: pages.some((page) => Object.keys(page.textFields).length > 0),
+      pages,
+    };
+  }
+
+  const html = await ctx.orchestrator.readRawHtml(projectId).catch(() => null) ?? '';
+  const pages = parseAlbumPagesForAgent(html);
+  if (pages.length === 0 && html && looksLikeAlbumHtml(html)) {
+    pages.push(readAlbumPageFromHtml(html, 0));
+  }
+  return {
+    exists: pages.length > 0,
+    pageCount: pages.length,
+    templateId: project.templateId ?? null,
+    previewAvailable: html.length > 0,
+    pages,
+  };
+}
+
+export function parseAlbumPagesForAgent(html: string): AlbumPageReadModel[] {
+  if (!html) return [];
+  const ranges = findAlbumPageRangesForRead(html);
+  return ranges.map((range, index) => (
+    readAlbumPageFromHtml(html.slice(range.openStart, range.closeEnd), index)
+  ));
+}
+
+function findAlbumPageRangesForRead(html: string): AlbumHtmlElementRange[] {
+  const marked = findAlbumPageElementRanges(html);
+  if (marked.length > 0) return marked;
+  const containers = findElementRangesByOpeningTag(
+    html,
+    /<([a-z][\w:-]*)(?=[\s>])(?=[^>]*(?:\bid\s*=\s*["']album["']|\bdata-album(?:\s*=|\s|>)|\bclass\s*=\s*["'][^"']*\balbum(?:-container)?\b[^"']*["']))[^>]*>/gi,
+  );
+  const container = containers[0];
+  if (!container) return [];
+  const ranges: AlbumHtmlElementRange[] = [];
+  const openRe = /<([a-z][\w:-]*)\b[^>]*>/gi;
+  openRe.lastIndex = container.openEnd;
+  let match: RegExpExecArray | null;
+  while ((match = openRe.exec(html)) !== null && match.index < container.closeStart) {
+    const tagName = String(match[1] || '').toLowerCase();
+    if (isVoidHtmlTag(tagName) || /\/\s*>$/.test(match[0])) continue;
+    const close = findMatchingElementClose(html, tagName, match.index);
+    if (!close || close.end > container.closeStart) continue;
+    const range: AlbumHtmlElementRange = {
+      tagName,
+      openStart: match.index,
+      openEnd: openRe.lastIndex,
+      closeStart: close.start,
+      closeEnd: close.end,
+    };
+    const fragment = html.slice(range.openStart, range.closeEnd);
+    if (
+      !/^(?:script|style|link|nav|footer)$/i.test(tagName)
+      && !/(?:class|id)\s*=\s*["'][^"']*(?:controls|dots|navigation)[^"']*["']/i.test(match[0])
+      && /data-hv-(?:text|image|cta)|<(?:h[1-3]|p|img|button|a)\b/i.test(fragment)
+    ) {
+      ranges.push(range);
+    }
+    openRe.lastIndex = close.end;
+  }
+  return ranges;
+}
+
+function readAlbumPageFromHtml(html: string, index: number): AlbumPageReadModel {
+  const textFields: Record<string, string> = {};
+  const textRe = /<([a-z][\w:-]*)\b([^>]*\bdata-hv-text\s*=\s*(?:"[^"]+"|'[^']+')[^>]*)>([\s\S]*?)<\/\1\s*>/gi;
+  for (const match of html.matchAll(textRe)) {
+    if (Object.keys(textFields).length >= 50) break;
+    const key = getAttrValue(match[0], 'data-hv-text');
+    const value = plainTextFromHtml(match[3] ?? '');
+    if (key && value) textFields[key] = value.slice(0, 500);
+  }
+  const preferred = Object.entries(textFields).find(([key]) => /(?:^|[._-])(title|headline|brand_name|name)$/i.test(key))
+    ?? Object.entries(textFields)[0];
+  const heading = /<h[1-3]\b[^>]*>([\s\S]*?)<\/h[1-3]\s*>/i.exec(html)?.[1] ?? '';
+  const summary = (preferred?.[1] || plainTextFromHtml(heading) || `Page ${index + 1}`).slice(0, 160);
+  return {
+    index,
+    pageNumber: index + 1,
+    summary,
+    textFields,
+  };
+}
+
+function plainTextFromHtml(html: string): string {
+  return html
+    .replace(/<script\b[\s\S]*?<\/script\s*>/gi, ' ')
+    .replace(/<style\b[\s\S]*?<\/style\s*>/gi, ' ')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/&amp;/gi, '&')
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>')
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;|&apos;/gi, "'")
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function safeToolResultText(output: unknown): string {
+  try { return JSON.stringify(output).slice(0, 20_000); }
+  catch { return String(output).slice(0, 20_000); }
+}
+
+function writeAgentRunSse(res: ServerResponse, event: AgentRunEvent): void {
+  try {
+    if (!res.writableEnded) {
+      res.write(`id: ${event.sequence}\ndata: ${JSON.stringify(event)}\n\n`);
+    }
+  } catch {
+    // Agent execution continues after a browser disconnects.
+  }
+}
+
+async function streamRegisteredAgentRun(
+  res: ServerResponse,
+  run: RegisteredAgentRun,
+  afterSequence: number,
+): Promise<void> {
+  res.writeHead(200, {
+    'content-type': 'text/event-stream; charset=utf-8',
+    'cache-control': 'no-cache',
+    connection: 'keep-alive',
+    'x-agent-run-id': run.log.runId,
+    'x-agent-session-id': run.log.sessionId,
+  });
+  const existing = run.log.list(afterSequence);
+  for (const event of existing) writeAgentRunSse(res, event);
+  if (existing.some((event) => TERMINAL_AGENT_RUN_EVENTS.has(event.type))) {
+    res.end();
+    return;
+  }
+  const lastSequence = existing.at(-1)?.sequence ?? afterSequence;
+  await new Promise<void>((resolveStream) => {
+    let terminalDuringReplay = false;
+    let unsubscribe = () => {};
+    const listener = (event: AgentRunEvent) => {
+      writeAgentRunSse(res, event);
+      if (TERMINAL_AGENT_RUN_EVENTS.has(event.type)) {
+        terminalDuringReplay = true;
+        unsubscribe();
+        if (!res.writableEnded) res.end();
+        resolveStream();
+      }
+    };
+    unsubscribe = run.log.subscribe(listener, lastSequence);
+    if (terminalDuringReplay) unsubscribe();
+    res.once('close', () => {
+      unsubscribe();
+      resolveStream();
+    });
+  });
 }
 
 async function loadMessages(ctx: CliContext, projectId: string): Promise<ChatMessage[]> {
@@ -3612,6 +4761,8 @@ async function appendMessage(
       ...(message.tool && { tool: message.tool }),
       payload: jsonObject({
         ...(message.output !== undefined && { output: message.output }),
+        ...(message.sessionId && { session_id: message.sessionId }),
+        ...(message.runId && { run_id: message.runId }),
         ...(selection && {
           selection_type: selection.selectionType,
           phase: selection.phase ?? null,
@@ -3648,12 +4799,16 @@ function projectChatPersistence(ctx: CliContext): PostgresChatPersistence {
 
 function chatRowToMessage(row: ChatMessageRow): ChatMessage {
   const output = row.payload.output;
+  const sessionId = typeof row.payload.session_id === 'string' ? row.payload.session_id : undefined;
+  const runId = typeof row.payload.run_id === 'string' ? row.payload.run_id : undefined;
   return {
     role: row.role,
     content: row.content,
     ...(row.agent && { agent: row.agent }),
     ...(row.tool && { tool: row.tool }),
     ...(output !== undefined && { output }),
+    ...(sessionId && { sessionId }),
+    ...(runId && { runId }),
     ts: row.occurred_time instanceof Date
       ? row.occurred_time.getTime()
       : new Date(row.occurred_time).getTime(),
@@ -7004,6 +8159,7 @@ async function callAgentSimple(
     onEvent?: (event: import('@html-video/runtime').AgentEvent) => void;
     validateOutput?: (output: string) => string | null;
     invalidOutputCode?: string;
+    signal?: AbortSignal;
     onSucceeded?: (handle: AiGenerationLogHandle | null, output: string) => void;
   },
 ): Promise<string> {
@@ -7026,6 +8182,7 @@ async function callAgentSimple(
     def,
     prompt,
     context: { cwd, ...(model && { model }) },
+    ...(logging?.signal && { signal: logging.signal }),
     onEvent: (ev) => {
       if (ev.type === 'text') buf += ev.chunk;
       else if (ev.type === 'error') agentError = ev.message;

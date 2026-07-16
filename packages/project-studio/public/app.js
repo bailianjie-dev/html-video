@@ -59,6 +59,11 @@ const API = {
   getAssets: id => fetch(`/api/projects/${id}/assets`).then(r => r.ok ? r.json() : Promise.reject(new Error(`${r.status}`))),
   rawHtml: id => fetch(`/api/projects/${id}/raw-html`).then(r => r.ok ? r.text() : null),
   putRawHtml: (id, html) => fetch(`/api/projects/${id}/raw-html`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ html }) }).then(r => r.json()),
+  putAgentViewState: (id, viewState) => fetch(`/api/projects/${id}/agent-session/view-state`, {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ view_state: viewState }),
+  }).then(async (r) => ({ ok: r.ok, status: r.status, ...(await r.json().catch(() => ({}))) })),
   contentGraph: id => fetch(`/api/projects/${id}/content-graph`).then(r => r.ok ? r.json() : null),
   unenhanceFrame: (id, nodeId) => fetch(`/api/projects/${id}/frames/${encodeURIComponent(nodeId)}/unenhance`, { method: 'POST' }).then(r => r.json()),
   testAgent: id => fetch(`/api/agents/${encodeURIComponent(id)}/test`, { method: 'POST' }).then(r => r.json()),
@@ -105,6 +110,9 @@ const state = {
   albumPageCount: 0,
   activeAlbumPage: 0,
   albumPageSummaries: [], // short per-page titles for the left rail
+  agentViewClientRevision: Date.now(),
+  agentViewLastSyncKey: '',
+  agentViewSyncTimer: null,
   albumPageTextEditActive: false, // 电子相册：点「编辑本页」后右侧只显示当前页字段
   // Phase C: per-frame native Remotion enhancement
   albumPageActionBusy: false,
@@ -1454,6 +1462,10 @@ async function runPendingGenerationJob(job) {
   if (!input) return;
   input.value = job.prompt || '';
   if (input.value.trim() || state.pendingAttachments.length) {
+    // `applyRouteFromLocation` marks the page as composing while the pending
+    // job is restored. Release that bootstrap-only lock before the real send;
+    // otherwise sendMessage exits immediately and leaves the prompt in the box.
+    state.composing = false;
     await sendMessage();
   }
 }
@@ -5915,6 +5927,7 @@ function updateAlbumPageTabActive() {
     btn.closest('.album-page-item')?.classList.toggle('active', isActive);
   });
   updateAlbumPageEditControls();
+  queueAgentViewStateSync();
 }
 
 // Keep --preview-scale on .preview-frame in sync with its rendered width
@@ -8178,6 +8191,62 @@ function currentAlbumPageAiFocus() {
 }
 
 // ============== send message ==============
+function currentAgentViewStateSnapshot({ bumpRevision = false } = {}) {
+  if (!state.selectedId) return null;
+  if (bumpRevision) {
+    state.agentViewClientRevision = Math.max(
+      Date.now(),
+      Number(state.agentViewClientRevision || 0) + 1,
+    );
+  }
+  const pageCount = isElectronicAlbumProject()
+    ? Math.max(0, Number(state.albumPageCount) || 0)
+    : 0;
+  const activePageIndex = pageCount > 0
+    ? Math.max(0, Math.min(pageCount - 1, Number(state.activeAlbumPage) || 0))
+    : null;
+  return {
+    activePageIndex,
+    pageCount,
+    previewRevision: Math.max(0, Number(state.previewRevision) || 0),
+    clientRevision: Math.max(0, Number(state.agentViewClientRevision) || 0),
+  };
+}
+
+function queueAgentViewStateSync() {
+  if (!state.selectedId) return;
+  const pageCount = isElectronicAlbumProject()
+    ? Math.max(0, Number(state.albumPageCount) || 0)
+    : 0;
+  const activePageIndex = pageCount > 0
+    ? Math.max(0, Math.min(pageCount - 1, Number(state.activeAlbumPage) || 0))
+    : null;
+  const syncKey = JSON.stringify({
+    projectId: state.selectedId,
+    activePageIndex,
+    pageCount,
+    previewRevision: Math.max(0, Number(state.previewRevision) || 0),
+  });
+  if (syncKey === state.agentViewLastSyncKey) return;
+  state.agentViewLastSyncKey = syncKey;
+  clearTimeout(state.agentViewSyncTimer);
+  state.agentViewSyncTimer = setTimeout(async () => {
+    const projectId = state.selectedId;
+    const snapshot = currentAgentViewStateSnapshot({ bumpRevision: true });
+    if (!projectId || !snapshot) return;
+    try {
+      const response = await api.putAgentViewState(projectId, snapshot);
+      if (!response.ok && response.status === 409) {
+        const serverRevision = Number(response.view_state?.clientRevision) || 0;
+        state.agentViewClientRevision = Math.max(state.agentViewClientRevision, serverRevision + 1);
+        state.agentViewLastSyncKey = '';
+      }
+    } catch {
+      state.agentViewLastSyncKey = '';
+    }
+  }, 120);
+}
+
 async function sendMessage() {
   if (state.composing || !state.selected) return;
   const ta = document.getElementById('composer-input');
@@ -8220,6 +8289,7 @@ async function sendMessage() {
   // We pass the focus along on every send (server uses it only for iterate).
   const focusFrame = state.iterateFocusFrameId || '';
   const albumPageFocus = focusFrame ? null : currentAlbumPageAiFocus();
+  const agentViewState = currentAgentViewStateSnapshot({ bumpRevision: true });
 
   // User message includes attachment summary + focus chip
   const attSummary = hasAttachments
@@ -8254,6 +8324,7 @@ async function sendMessage() {
         fd.append('album_page_count', String(albumPageFocus.pageCount));
         if (albumPageFocus.summary) fd.append('album_page_summary', albumPageFocus.summary);
       }
+      if (agentViewState) fd.append('agent_view_state', JSON.stringify(agentViewState));
       for (const a of state.pendingAttachments) fd.append('file', a.file, a.name);
       // Clear UI attachments before request so user sees them disappear
       state.pendingAttachments = [];
@@ -8275,6 +8346,7 @@ async function sendMessage() {
             album_page_count: albumPageFocus.pageCount,
             album_page_summary: albumPageFocus.summary,
           } : {}),
+          ...(agentViewState ? { agent_view_state: agentViewState } : {}),
         }),
       });
     }
@@ -8301,9 +8373,29 @@ async function sendMessage() {
         const lines = buf.split('\n\n');
         buf = lines.pop() ?? '';
         for (const line of lines) {
-          if (!line.startsWith('data: ')) continue;
+          const dataLine = line.split('\n').find((part) => part.startsWith('data: '));
+          if (!dataLine) continue;
           let ev;
-          try { ev = JSON.parse(line.slice(6)); } catch { continue; }
+          try { ev = JSON.parse(dataLine.slice(6)); } catch { continue; }
+          if (ev?.version === 1) {
+            if (ev.type === 'assistant.delta') {
+              ev = { type: 'text', chunk: ev.data?.text ?? '' };
+            } else if (ev.type === 'run.started') {
+              ev = { type: 'progress', stage: 'agent_started', message: 'AI 助手正在思考…' };
+            } else if (ev.type === 'tool.call.started') {
+              ev = { type: 'progress', stage: 'tool_started', message: 'AI 助手正在调用工具…' };
+            } else if (ev.type === 'album.changed') {
+              ev = { type: 'progress', stage: 'album_saved', message: '相册已保存，正在刷新预览…' };
+            } else if (ev.type === 'preview.ready') {
+              ev = { type: 'preview_ready', preview_url: ev.data?.previewUrl, revision: ev.data?.revision };
+            } else if (ev.type === 'run.failed') {
+              ev = { type: 'error', message: ev.data?.message ?? 'Agent failed' };
+            } else if (ev.type === 'run.cancelled') {
+              ev = { type: 'error', message: ev.data?.message ?? 'Agent run cancelled' };
+            } else {
+              continue;
+            }
+          }
           if (ev.type === 'text') {
             setGenerationProgress('模型正在输出内容，正在整理生成结果…', thinkingIdx);
             if (assistantIdx === -1) {
@@ -8888,7 +8980,7 @@ const AGENT_DESC = {
   'codex': 'Codex CLI (codex exec)',
   'hermes': 'Hermes ACP CLI',
   'qoder-cli': 'Qoder CLI (qodercli -p)',
-  'pi-agent': 'Pi Coding Agent (pi -p)',
+  'pi-agent': 'Pi Agent SDK (DashScope)',
 };
 
 function openSettingsModal(tab = 'agent') {

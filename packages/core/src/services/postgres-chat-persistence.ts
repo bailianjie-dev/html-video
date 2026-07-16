@@ -15,7 +15,7 @@ import type { UserContext } from './user-context.js';
 type AlbumAccess = Pick<AlbumRepository, 'findById' | 'findBySourceProjectId'>;
 type SessionAccess = Pick<
   ChatSessionRepository,
-  'create' | 'findActiveByAlbum' | 'nextMessageSequence'
+  'create' | 'findActiveByAlbum' | 'mergeMetadata' | 'nextMessageSequence'
 >;
 type MessageAccess = Pick<ChatMessageRepository, 'create' | 'listBySession'>;
 
@@ -39,6 +39,19 @@ export interface PostgresChatPersistenceOptions {
 
 export class PostgresChatPersistence {
   constructor(private readonly opts: PostgresChatPersistenceOptions) {}
+
+  async getOrCreateSessionForProject(projectId: string, metadata: JsonObject = {}) {
+    const user = this.opts.getUserContext();
+    const album = await this.requireAlbum(projectId, user);
+    const session = await this.getOrCreateSession(album, user);
+    if (Object.keys(metadata).length === 0) return session;
+    return await this.opts.sessions.mergeMetadata(
+      user.userId,
+      session.id,
+      metadata,
+      user.actorId,
+    ) ?? session;
+  }
 
   async listForProject(projectId: string): Promise<ChatMessageRow[]> {
     const user = this.opts.getUserContext();

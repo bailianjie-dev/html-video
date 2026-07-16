@@ -46,6 +46,17 @@ class MemorySessionRepository {
     ) ?? null;
   }
 
+  async mergeMetadata(userId, sessionId, metadata, updatedBy) {
+    const row = this.rows.find(
+      (item) => item.user_id === userId && item.id === sessionId,
+    );
+    if (!row) return null;
+    row.metadata = { ...row.metadata, ...metadata };
+    row.updated_by = updatedBy;
+    row.updated_time = new Date();
+    return row;
+  }
+
   async nextMessageSequence(userId, sessionId, updatedBy) {
     const row = this.rows.find(
       (item) => item.user_id === userId && item.id === sessionId,
@@ -176,4 +187,20 @@ test('treats another user conversation as a missing project', async () => {
     runAs('charlie', 'request-charlie', () => persistence.listForProject('shared-project')),
     (error) => error?.code === 'project-not-found',
   );
+});
+
+test('creates an agent session and merges runtime metadata', async () => {
+  const { persistence, runAs } = fixture();
+
+  const session = await runAs('alice', 'request-agent-session', () => (
+    persistence.getOrCreateSessionForProject('shared-project', {
+      model: 'qwen3.7-plus',
+      system_prompt_version: 'album-agent-v1-phase1',
+      toolset_version: 'album-tools-v1-none',
+    })
+  ));
+
+  assert.equal(session.metadata.model, 'qwen3.7-plus');
+  assert.equal(session.metadata.system_prompt_version, 'album-agent-v1-phase1');
+  assert.equal(session.metadata.toolset_version, 'album-tools-v1-none');
 });

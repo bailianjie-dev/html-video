@@ -27,6 +27,10 @@ export function albumRowToProject(album: AlbumRow): Project {
   if (album.last_preview_html_url) {
     project.lastPreviewHtmlUrl = album.last_preview_html_url;
   }
+  if (settings.album_revision !== undefined) {
+    const value = Number(settings.album_revision);
+    if (Number.isSafeInteger(value) && value >= 0) project.albumRevision = value;
+  }
   if (settings.local_last_preview_poster_path !== undefined) {
     const value = asOptionalString(settings.local_last_preview_poster_path);
     if (value !== undefined) project.lastPreviewPosterPath = value;
@@ -59,6 +63,7 @@ export function projectToAlbumSettings(project: Project, previous: JsonObject = 
     agent_model: project.agentModel ?? null,
     soundtrack: project.soundtrack,
     local_last_preview_html_path: project.lastPreviewHtmlPath,
+    album_revision: project.albumRevision,
     local_last_preview_poster_path: project.lastPreviewPosterPath,
     local_last_output_mp4_path: project.lastOutputMp4Path,
     content_graph_path: project.contentGraphPath,

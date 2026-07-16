@@ -37,6 +37,23 @@ export class ChatSessionRepository {
     ));
   }
 
+  async mergeMetadata(
+    userId: string,
+    sessionId: string,
+    metadata: Record<string, unknown>,
+    updatedBy: string,
+  ): Promise<ChatSessionRow | null> {
+    return firstRow(await this.db.query<ChatSessionRow>(
+      `UPDATE ai_album_chat_sessions
+       SET metadata = metadata || $3::jsonb,
+           updated_by = $4,
+           updated_time = now()
+       WHERE user_id = $1 AND id = $2
+       RETURNING *`,
+      [userId, sessionId, metadata, updatedBy],
+    ));
+  }
+
   async nextMessageSequence(
     userId: string,
     sessionId: string,

@@ -426,6 +426,8 @@ export interface Project {
   lastPreviewHtmlPath?: string;
   lastPreviewHtmlUrl?: string;
   lastPreviewPosterPath?: string;
+  /** Monotonic revision of the host-managed electronic album HTML. */
+  albumRevision?: number;
   lastOutputMp4Path?: string;
   /** Export history — every MP4 exported for this project, newest last. Each
    *  export writes a uniquely-named file so older ones aren't overwritten. */
