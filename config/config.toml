@@ -1,0 +1,53 @@
+# Base config (committed).
+# Local overrides: copy config/config.local.toml.example → config/config.local.toml
+# and fill in secrets. Non-empty local keys override this file.
+#
+# Templates: config/config.toml.example, config/config.local.toml.example
+
+[database]
+host = "127.0.0.1"
+port = 5432
+name = "html_video"
+user = "postgres"
+password = "CHANGE_ME"
+pool_min_size = 2
+pool_max_size = 10
+pool_timeout = 30
+connect_timeout = 10
+
+[oss]
+# false：不连 OSS，素材/HTML/导出留本机（可先填好下面字段）。
+# true：启用阿里云上传/下载；需有效密钥，且通常配合已配置的 [database]。
+# 建议在 config.local.toml 里按本机情况覆盖，不要在未配密钥时保持 true。
+enabled = false
+provider = "aliyun"
+endpoint = "oss-cn-hangzhou.aliyuncs.com"
+bucket = "your-bucket"
+access_key_id = "CHANGE_ME"
+access_key_secret = "CHANGE_ME"
+public_base_url = ""
+prefix = "albumgen/"
+
+[auth]
+# Default password for users that omit their own password field.
+# Placeholder CHANGE_ME disables login until you set a real password in local config.
+password = "CHANGE_ME"
+
+[[auth.users]]
+user_id = "admin"
+display_name = "管理员"
+
+[[auth.users]]
+user_id = "alice"
+display_name = "Alice"
+
+[[auth.users]]
+user_id = "bob"
+display_name = "Bob"
+
+[agent]
+# Pi Agent / DashScope (OpenAI-compatible). Prefer secrets in config.local.toml.
+base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+api_key = "CHANGE_ME"
+model = "qwen3.7-plus"
+max_tokens = 16384

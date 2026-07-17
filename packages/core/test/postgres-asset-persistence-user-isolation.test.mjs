@@ -189,15 +189,14 @@ test('returns project not found when the current user cannot access the album', 
   );
 });
 
-test('allows removal of a legacy project asset without a database row', async () => {
+test('rejects removal when the asset has no ai_album_assets row', async () => {
   const { persistence, runAs } = fixture();
 
-  assert.equal(
-    await runAs('alice', () => persistence.softDeleteForProject(
+  await assert.rejects(
+    runAs('alice', () => persistence.softDeleteForProject(
       'shared-project',
       'legacy-local-asset',
-      { allowMissingDatabaseRow: true },
     )),
-    null,
+    (error) => error?.code === 'asset-not-found',
   );
 });

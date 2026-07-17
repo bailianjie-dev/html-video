@@ -116,7 +116,6 @@ test('merges database from unified config.toml + local', () => {
       join(root, 'config', 'config.toml'),
       `
 [database]
-enabled = false
 host = "127.0.0.1"
 port = 5432
 name = "html_video"
@@ -130,7 +129,6 @@ pool_max_size = 10
       join(root, 'config', 'config.local.toml'),
       `
 [database]
-enabled = true
 password = "local-secret"
 pool_max_size = 4
 `.trim(),
@@ -139,11 +137,27 @@ pool_max_size = 4
 
     const config = loadDatabaseConfig(root);
     assert.ok(config);
-    assert.equal(config.enabled, true);
     assert.equal(config.host, '127.0.0.1');
     assert.equal(config.password, 'local-secret');
     assert.equal(config.poolMaxSize, 4);
     assert.match(config.sourcePath.replace(/\\/g, '/'), /config\/config\.local\.toml$/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('legacy database.enabled is ignored and cannot select file persistence', () => {
+  const root = mkdtempSync(join(tmpdir(), 'html-video-db-no-switch-'));
+  try {
+    mkdirSync(join(root, 'config'));
+    writeFileSync(
+      join(root, 'config', 'config.toml'),
+      '[database]\nenabled = false\nhost = "127.0.0.1"\nname = "html_video"\nuser = "postgres"\npassword = "secret"\n',
+      'utf8',
+    );
+    const config = loadDatabaseConfig(root);
+    assert.ok(config);
+    assert.equal(Object.hasOwn(config, 'enabled'), false);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -194,7 +208,7 @@ test('empty local file is ignored; base config is used', () => {
     mkdirSync(join(root, 'config'));
     writeFileSync(
       join(root, 'config', 'config.toml'),
-      '[database]\nenabled = false\nhost = "base"\nname = "n"\nuser = "u"\npassword = "base"\n',
+      '[database]\nhost = "base"\nname = "n"\nuser = "u"\npassword = "base"\n',
       'utf8',
     );
     writeFileSync(
@@ -220,18 +234,17 @@ test('split config/database.toml still works when unified is absent', () => {
     mkdirSync(join(root, 'config'));
     writeFileSync(
       join(root, 'config', 'database.toml'),
-      '[database]\nenabled = false\nhost = "split"\nname = "n"\nuser = "u"\npassword = "p"\n',
+      '[database]\nhost = "split"\nname = "n"\nuser = "u"\npassword = "p"\n',
       'utf8',
     );
     writeFileSync(
       join(root, 'config', 'database.local.toml'),
-      '[database]\nenabled = true\npassword = "local"\n',
+      '[database]\npassword = "local"\n',
       'utf8',
     );
     const config = loadDatabaseConfig(root);
     assert.equal(config?.host, 'split');
     assert.equal(config?.password, 'local');
-    assert.equal(config?.enabled, true);
     assert.match(config?.sourcePath.replace(/\\/g, '/') ?? '', /config\/database\.local\.toml$/);
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -244,12 +257,12 @@ test('split config/<name>.local.toml overrides base without unified file', () =>
     mkdirSync(join(root, 'config'));
     writeFileSync(
       join(root, 'config', 'database.toml'),
-      '[database]\nenabled = false\nhost = "base"\nname = "n"\nuser = "u"\npassword = "base"\n',
+      '[database]\nhost = "base"\nname = "n"\nuser = "u"\npassword = "base"\n',
       'utf8',
     );
     writeFileSync(
       join(root, 'config', 'database.local.toml'),
-      '[database]\nenabled = true\nhost = "local"\npassword = "local"\n',
+      '[database]\nhost = "local"\npassword = "local"\n',
       'utf8',
     );
     const resolved = resolveTomlConfig(root, 'database');
@@ -271,7 +284,7 @@ test('ignores obsolete .html-video/*.toml when config/ is present', () => {
     mkdirSync(join(root, '.html-video'));
     writeFileSync(
       join(root, 'config', 'config.toml'),
-      '[database]\nenabled = false\nhost = "config-dir"\nname = "n"\nuser = "u"\npassword = "from-config"\n',
+      '[database]\nhost = "config-dir"\nname = "n"\nuser = "u"\npassword = "from-config"\n',
       'utf8',
     );
     writeFileSync(
@@ -282,7 +295,6 @@ test('ignores obsolete .html-video/*.toml when config/ is present', () => {
     const config = loadDatabaseConfig(root);
     assert.equal(config?.host, 'config-dir');
     assert.equal(config?.password, 'from-config');
-    assert.equal(config?.enabled, false);
     assert.match(config?.sourcePath.replace(/\\/g, '/') ?? '', /config\/config\.toml$/);
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -291,10 +303,10 @@ test('ignores obsolete .html-video/*.toml when config/ is present', () => {
 
 test('mergeSimpleToml prefers local keys', () => {
   const merged = mergeSimpleToml(
-    '[database]\nenabled = false\npassword = "base"\n',
-    '[database]\nenabled = true\npassword = "local"\n',
+    '[database]\nhost = "base"\npassword = "base"\n',
+    '[database]\nhost = "local"\npassword = "local"\n',
   );
-  assert.match(merged, /enabled = true/);
+  assert.match(merged, /host = "local"/);
   assert.match(merged, /password = "local"/);
   assert.doesNotMatch(merged, /password = "base"/);
 });

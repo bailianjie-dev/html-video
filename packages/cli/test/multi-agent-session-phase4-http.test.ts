@@ -3,6 +3,7 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
+import { FileProjectPersistence, ProjectStore } from '@html-video/core';
 
 import { bootstrap } from '../dist/context.js';
 import { startStudioServer } from '../dist/studio-server.js';
@@ -10,7 +11,10 @@ import { startStudioServer } from '../dist/studio-server.js';
 test('Phase 4 Session UI contract passes real HTTP lifecycle and isolated view-state acceptance', async () => {
   const root = await mkdtemp(join(tmpdir(), 'html-video-phase4-http-'));
   try {
-    const ctx = await bootstrap({ cwd: root });
+    const ctx = await bootstrap({
+      cwd: root,
+      projects: new FileProjectPersistence(new ProjectStore(root)),
+    });
     const studio = await startStudioServer(ctx, 0, '127.0.0.1');
     const headers = {
       'content-type': 'application/json',

@@ -245,15 +245,6 @@ export async function startStudioServer(
             error: 'Database config not found or invalid. Use config/config.toml (+ config.local.toml) with a [database] section.',
           });
         }
-        if (!cfg.enabled) {
-          return json(res, 200, {
-            ok: true,
-            mode: 'mock',
-            config: maskedDatabaseConfig(cfg),
-            note: 'database.enabled is false; PostgreSQL write/read was skipped.',
-          });
-        }
-
         const handle = ctx.database?.handle && ctx.database.config.sourcePath === cfg.sourcePath
           ? ctx.database.handle
           : createPgClient(cfg);
@@ -315,15 +306,6 @@ export async function startStudioServer(
             error: 'Database config not found or invalid. Use config/config.toml (+ config.local.toml) with a [database] section.',
           });
         }
-        if (!cfg.enabled) {
-          return json(res, 200, {
-            ok: true,
-            mode: 'mock',
-            config: maskedDatabaseConfig(cfg),
-            note: 'database.enabled is false; PostgreSQL write/read was skipped.',
-          });
-        }
-
         const handle = ctx.database?.handle && ctx.database.config.sourcePath === cfg.sourcePath
           ? ctx.database.handle
           : createPgClient(cfg);
@@ -485,15 +467,6 @@ export async function startStudioServer(
             error: 'Database config not found or invalid. Use config/config.toml (+ config.local.toml) with a [database] section.',
           });
         }
-        if (!dbCfg.enabled) {
-          return json(res, 200, {
-            ok: true,
-            mode: 'mock',
-            database_config: maskedDatabaseConfig(dbCfg),
-            note: 'database.enabled is false; OSS upload and asset DB write were skipped.',
-          });
-        }
-
         const ossCfg = loadOssConfig(ctx.projectRoot);
         if (!ossCfg) {
           return json(res, 500, {
@@ -594,15 +567,6 @@ export async function startStudioServer(
             error: 'Database config not found or invalid. Use config/config.toml (+ config.local.toml) with a [database] section.',
           });
         }
-        if (!cfg.enabled) {
-          return json(res, 200, {
-            ok: true,
-            mode: 'mock',
-            config: maskedDatabaseConfig(cfg),
-            note: 'database.enabled is false; PostgreSQL health check was skipped.',
-          });
-        }
-
         const handle = ctx.database?.handle && ctx.database.config.sourcePath === cfg.sourcePath
           ? ctx.database.handle
           : createPgClient(cfg);
@@ -723,7 +687,7 @@ export async function startStudioServer(
       if (projectExportJobsMatch && projectExportJobsMatch[1] && m === 'GET') {
         if (ctx.database?.mode !== 'postgres' || !ctx.database.handle) {
           return json(res, 503, {
-            error: 'PostgreSQL persistence is not enabled; export jobs are unavailable.',
+            error: 'PostgreSQL persistence is unavailable in this explicit test context.',
           });
         }
         const projectId = decodeURIComponent(projectExportJobsMatch[1]);
@@ -743,7 +707,7 @@ export async function startStudioServer(
       if (exportJobMatch && exportJobMatch[1] && m === 'GET') {
         if (ctx.database?.mode !== 'postgres' || !ctx.database.handle) {
           return json(res, 503, {
-            error: 'PostgreSQL persistence is not enabled; export jobs are unavailable.',
+            error: 'PostgreSQL persistence is unavailable in this explicit test context.',
           });
         }
         const jobId = decodeURIComponent(exportJobMatch[1]);
@@ -889,12 +853,10 @@ export async function startStudioServer(
       // Remove asset
       const rmAssetMatch = url.pathname.match(/^\/api\/projects\/([^/]+)\/assets\/([^/]+)$/);
       if (rmAssetMatch && rmAssetMatch[1] && rmAssetMatch[2] && m === 'DELETE') {
-        const existing = await ctx.orchestrator.load(rmAssetMatch[1]);
         await softDeleteAssetInPostgres(
           ctx,
           rmAssetMatch[1],
           rmAssetMatch[2],
-          existing.assets.some((asset) => asset.id === rmAssetMatch[2]),
         );
         const project = await ctx.orchestrator.removeAsset(rmAssetMatch[1], rmAssetMatch[2]);
         return json(res, 200, { project });
@@ -2797,12 +2759,9 @@ async function softDeleteAssetInPostgres(
   ctx: CliContext,
   projectId: string,
   assetId: string,
-  allowMissingDatabaseRow: boolean,
 ): Promise<void> {
   if (ctx.database?.mode !== 'postgres' || !ctx.database.handle) return;
-  await projectAssetPersistence(ctx).softDeleteForProject(projectId, assetId, {
-    allowMissingDatabaseRow,
-  });
+  await projectAssetPersistence(ctx).softDeleteForProject(projectId, assetId);
 }
 
 function projectAssetPersistence(ctx: CliContext): PostgresAssetPersistence {
@@ -7959,7 +7918,25 @@ async function loadProjectAssetBytes(
   try {
     const assets = await projectAssetPersistence(ctx).listForProject(projectId);
     const asset = assets.find((item) => item.id === assetId && item.status !== 'deleted');
-    if (!asset?.oss_key) return null;
+    if (!asset) return null;
+    const inlineContent = asset.metadata.inline_content;
+    if (typeof inlineContent === 'string') {
+      return {
+        mime: asset.mime_type || 'text/plain; charset=utf-8',
+        body: Buffer.from(inlineContent, 'utf8'),
+      };
+    }
+    const localPath = asset.metadata.local_path;
+    if (typeof localPath === 'string') {
+      const safe = resolve(localPath);
+      if (isPathInside(resolveLocalWorkRoot(ctx), safe) && existsSync(safe)) {
+        return {
+          mime: asset.mime_type || AssetStore.guessMime(safe).mime,
+          body: await readFile(safe),
+        };
+      }
+    }
+    if (!asset.oss_bucket || !asset.oss_key) return null;
     const ossConfig = loadOssConfig(ctx.projectRoot);
     if (!ossConfig?.enabled) return null;
     const downloaded = await downloadFromAliyunOss(ossConfig, { key: asset.oss_key });

@@ -16,7 +16,7 @@
 - `ai_album_chat_sessions`：聊天会话
 - `ai_album_chat_messages`：聊天消息
 
-迁移期间仍保留 `FileProjectPersistence` 作为数据库关闭时的兼容方案。
+正式运行统一使用 `PostgresProjectPersistence`。`FileProjectPersistence` 仅保留给历史迁移和显式测试夹具，不再由运行时配置选择。
 
 ## 2. 已完成功能
 
@@ -39,7 +39,7 @@
 
 ### 2.2 项目和页面持久化
 
-当 `database.enabled = true` 时：
+正式运行时：
 
 - `POST /api/projects`
 - `GET /api/projects`
@@ -67,7 +67,7 @@
 
 ### 2.3 OSS 素材
 
-当 `database.enabled = true` 且 `oss.enabled = true` 时：
+当 `oss.enabled = true` 时：
 
 - `POST /api/projects/:id/assets` 把文件上传至阿里云 OSS
 - 图片转相册和聊天框 multipart 附件复用同一 OSS/数据库素材链路
@@ -80,7 +80,7 @@
 - HTML object key 包含用户、项目和页面标识，跨用户不会覆盖
 - 清理覆盖软删除素材，以及已删除相册关联的 HTML/MP4 OSS 产物
 
-数据库或 OSS 未启用时，上传继续走原有本地文件行为。
+OSS 未启用时，素材文件仍可使用本地路径；项目、页面和素材元数据仍统一保存到 PostgreSQL。
 
 素材正式流程和查询已使用 request-scoped 用户，跨用户访问返回 404。
 
@@ -151,9 +151,7 @@ PostgreSQL 模式已使用 `ai_album_chat_sessions` 和 `ai_album_chat_messages`
 
 - 基本：`config/database.toml`
 - 本地：`config/database.local.toml`
-- 开关：`[database].enabled`
-
-`enabled = true` 使用 PostgreSQL；关闭或无有效配置时使用 `FileProjectPersistence`。
+PostgreSQL 没有启停开关。缺少有效 `[database]` 配置时应用启动失败，不再使用 `FileProjectPersistence` 自动兜底。
 
 ### OSS
 
@@ -161,7 +159,7 @@ PostgreSQL 模式已使用 `ai_album_chat_sessions` 和 `ai_album_chat_messages`
 - 本地：`config/oss.local.toml`
 - 开关：`[oss].enabled`
 
-当前只支持阿里云 OSS。正式素材上传到 OSS 需要数据库和 OSS 两个开关同时启用。
+当前只支持阿里云 OSS。数据库始终启用，`oss.enabled` 只控制素材文件是否上传 OSS。
 
 ### 临时登录
 
@@ -270,10 +268,9 @@ pnpm --filter @html-video/cli typecheck
 PostgreSQL 模式本地工作目录已改为
 `.html-video/tmp/work/<safe-user-id>/<safe-project-id>/`。PostgreSQL 模式下读取以数据库里的 `raw_html`、`content.graph_node` 等结构化字段为准，不再从旧 `.html-video/projects` 本地路径 fallback。
 
-### P1：素材读取尚未完全以 `ai_album_assets` 为唯一来源
+### 已完成：素材统一以 `ai_album_assets` 为唯一来源
 
-文件上传已入库，但部分 inline text/data 和兼容字段仍保存在 `ai_album_albums.settings`
-中的 `legacy_assets`。项目加载时也尚未完全从素材表重建 `project.assets[]`。
+文件、inline text/data 和 reference-link 均同步到素材表，项目加载从素材表重建 `project.assets[]`。旧 SHA-1 项目素材 ID 保存在 metadata 中以维持引用兼容，数据库主键继续使用 UUID。`007_migrate_legacy_assets.sql` 负责迁移并删除 settings 中的 `legacy_assets`。
 
 ### P2：文档更新
 

@@ -1,5 +1,5 @@
 import type { AlbumRow, AlbumStatus, JsonObject, JsonValue } from '../db/types.js';
-import type { Asset, FrameRecord, Project, ProjectSoundtrack, ProjectStatus, UserPreferences } from '../types/index.js';
+import type { FrameRecord, Project, ProjectSoundtrack, ProjectStatus, UserPreferences } from '../types/index.js';
 
 type ProjectSettings = Record<string, JsonValue | undefined>;
 
@@ -8,7 +8,7 @@ export function albumRowToProject(album: AlbumRow): Project {
   const project: Project = {
     id: album.source_project_id ?? album.id,
     name: album.title,
-    assets: asArray<Asset>(settings.legacy_assets),
+    assets: [],
     templateId: asNullableString(settings.template_id),
     variables: asRecord(settings.variables),
     preferences: mergeRenderPreferences(asRecord(settings.preferences), album),
@@ -68,7 +68,6 @@ export function projectToAlbumSettings(project: Project, previous: JsonObject = 
     local_last_output_mp4_path: project.lastOutputMp4Path,
     content_graph_path: project.contentGraphPath,
     legacy_frames: project.frames ?? [],
-    legacy_assets: project.assets ?? [],
     legacy_exports: project.exports ?? [],
   }) as JsonObject;
 }

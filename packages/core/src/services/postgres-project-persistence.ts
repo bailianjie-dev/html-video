@@ -7,6 +7,7 @@ import type { AlbumPageRow, AlbumRow, JsonObject, JsonValue } from '../db/types.
 import { HtmlVideoError } from '../errors.js';
 import { AlbumPageRepository } from '../repositories/album-page-repository.js';
 import { AlbumRepository } from '../repositories/album-repository.js';
+import { AssetRepository } from '../repositories/asset-repository.js';
 import type { FrameRecord, Project } from '../types/index.js';
 import {
   albumRowToProject,
@@ -25,6 +26,12 @@ import type {
 } from './project-persistence.js';
 import type { UserContext } from './user-context.js';
 import { safeWorkDirectorySegment } from './work-directory.js';
+import {
+  assetRowToProjectAsset,
+  projectAssetIdentity,
+  projectAssetToCreateInput,
+  projectAssetToUpdatePatch,
+} from './project-asset-mapper.js';
 
 export interface PostgresProjectPersistenceOptions {
   db: DbClient;
@@ -32,16 +39,19 @@ export interface PostgresProjectPersistenceOptions {
   getUserContext: () => Readonly<UserContext>;
   albums?: AlbumRepository;
   pages?: AlbumPageRepository;
+  assets?: AssetRepository;
   publishHtml?: HtmlPublisher;
 }
 
 export class PostgresProjectPersistence implements ProjectPersistence {
   private readonly albums: AlbumRepository;
   private readonly pages: AlbumPageRepository;
+  private readonly assets: AssetRepository;
 
   constructor(private readonly opts: PostgresProjectPersistenceOptions) {
     this.albums = opts.albums ?? new AlbumRepository(opts.db);
     this.pages = opts.pages ?? new AlbumPageRepository(opts.db);
+    this.assets = opts.assets ?? new AssetRepository(opts.db);
   }
 
   async ensureDir(id: string): Promise<string> {
@@ -78,10 +88,11 @@ export class PostgresProjectPersistence implements ProjectPersistence {
         page_count: project.frames?.length ?? 0,
         settings,
       }, user.actorId);
+      await this.syncProjectAssets(project, existing.id, user);
       return;
     }
 
-    await this.albums.create({
+    const created = await this.albums.create({
       id: randomUUID(),
       user_id: user.userId,
       source_project_id: project.id,
@@ -97,6 +108,7 @@ export class PostgresProjectPersistence implements ProjectPersistence {
       created_by: user.actorId,
       updated_by: user.actorId,
     });
+    await this.syncProjectAssets(project, created.id, user);
   }
 
   async load(id: string): Promise<Project> {
@@ -109,13 +121,15 @@ export class PostgresProjectPersistence implements ProjectPersistence {
     if (!album || album.status === 'deleted') {
       throw new HtmlVideoError('project-not-found', `Project ${id} not found`);
     }
-    return albumRowToProject(album);
+    return this.projectFromAlbum(album, user);
   }
 
   async list(): Promise<Project[]> {
     const user = this.opts.getUserContext();
     const albums = await this.albums.listByUser(user.userId);
-    return albums.filter(isFormalProjectAlbum).map((album) => albumRowToProject(album));
+    return Promise.all(
+      albums.filter(isFormalProjectAlbum).map((album) => this.projectFromAlbum(album, user)),
+    );
   }
 
   async remove(id: string): Promise<void> {
@@ -139,7 +153,7 @@ export class PostgresProjectPersistence implements ProjectPersistence {
   }> {
     const user = this.opts.getUserContext();
     const album = await this.requireAlbum(projectId, user);
-    const project = albumRowToProject(album);
+    const project = await this.projectFromAlbum(album, user);
     const projectDir = await this.ensureDir(project.id);
     const htmlPath = join(projectDir, 'preview.html');
     await writeFile(htmlPath, html, 'utf8');
@@ -269,7 +283,7 @@ export class PostgresProjectPersistence implements ProjectPersistence {
       }
       return {
         ok: true,
-        project: albumRowToProject(outcome.updated),
+        project: await this.projectFromAlbum(outcome.updated, user),
         htmlPath,
         ...(publication && { htmlUrl: publication.url }),
         previousRevision: expectedRevision,
@@ -296,7 +310,7 @@ export class PostgresProjectPersistence implements ProjectPersistence {
   ): Promise<{ project: Project; frame: FrameRecord; htmlUrl?: string }> {
     const user = this.opts.getUserContext();
     const album = await this.requireAlbum(projectId, user);
-    const project = albumRowToProject(album);
+    const project = await this.projectFromAlbum(album, user);
     const projectDir = await this.ensureDir(project.id);
     const framesDir = join(projectDir, 'frames');
     await mkdir(framesDir, { recursive: true });
@@ -402,7 +416,7 @@ export class PostgresProjectPersistence implements ProjectPersistence {
   ): Promise<{ project: Project; graphPath: string }> {
     const user = this.opts.getUserContext();
     const album = await this.requireAlbum(projectId, user);
-    const project = albumRowToProject(album);
+    const project = await this.projectFromAlbum(album, user);
     const projectDir = await this.ensureDir(project.id);
     const graphPath = join(projectDir, 'content-graph.json');
     await writeFile(graphPath, JSON.stringify(graph, null, 2), 'utf8');
@@ -470,6 +484,52 @@ export class PostgresProjectPersistence implements ProjectPersistence {
     if (bySourceProjectId) return bySourceProjectId;
     if (!isUuid(id)) return null;
     return this.albums.findById(user.userId, id);
+  }
+
+  private async projectFromAlbum(
+    album: AlbumRow,
+    user: Readonly<UserContext>,
+  ): Promise<Project> {
+    const project = albumRowToProject(album);
+    const rows = await this.assets.listByAlbum(user.userId, album.id);
+    project.assets = rows.map(assetRowToProjectAsset);
+    return project;
+  }
+
+  private async syncProjectAssets(
+    project: Project,
+    albumId: string,
+    user: Readonly<UserContext>,
+  ): Promise<void> {
+    const rows = await this.assets.listByAlbum(user.userId, albumId, { includeDeleted: true });
+    const byProjectId = new Map(rows.map((row) => [projectAssetIdentity(row), row]));
+    const retained = new Set<string>();
+
+    for (const asset of project.assets ?? []) {
+      retained.add(asset.id);
+      const existing = byProjectId.get(asset.id);
+      if (existing) {
+        await this.assets.update(
+          user.userId,
+          existing.id,
+          projectAssetToUpdatePatch(asset, existing),
+          user.actorId,
+        );
+      } else {
+        await this.assets.create(projectAssetToCreateInput(
+          asset,
+          albumId,
+          user.userId,
+          user.actorId,
+        ));
+      }
+    }
+
+    for (const row of rows) {
+      if (row.status !== 'deleted' && !retained.has(projectAssetIdentity(row))) {
+        await this.assets.softDelete(user.userId, row.id, user.actorId);
+      }
+    }
   }
 
   private async requireAlbum(id: string, user: Readonly<UserContext>): Promise<AlbumRow> {

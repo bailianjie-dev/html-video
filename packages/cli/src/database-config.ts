@@ -3,7 +3,6 @@ import type { DbClient, DbQueryResult, TransactionalDbClient } from '@html-video
 import { resolveTomlConfig } from './config-files.js';
 
 export interface DatabaseConfig {
-  enabled: boolean;
   host: string;
   port: number;
   name: string;
@@ -80,7 +79,6 @@ export function createPgClient(config: DatabaseConfig): PgClientHandle {
 
 export function maskedDatabaseConfig(config: DatabaseConfig): Record<string, unknown> {
   return {
-    enabled: config.enabled,
     host: maskHost(config.host),
     port: config.port,
     name: maskName(config.name),
@@ -117,7 +115,6 @@ function parseDatabaseToml(raw: string): Omit<DatabaseConfig, 'sourcePath'> | nu
   if (!host || !name || !user || !password) return null;
 
   return {
-    enabled: asBoolean(values.enabled, false),
     host,
     port: asNumber(values.port, 5432),
     name,
@@ -145,10 +142,6 @@ function asString(value: unknown): string {
 
 function asNumber(value: unknown, fallback: number): number {
   return typeof value === 'number' && Number.isFinite(value) ? value : fallback;
-}
-
-function asBoolean(value: unknown, fallback: boolean): boolean {
-  return typeof value === 'boolean' ? value : fallback;
 }
 
 function maskHost(host: string): string {

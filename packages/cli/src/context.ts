@@ -8,10 +8,9 @@ import { fileURLToPath } from 'node:url';
 import {
   AssetStore,
   EngineRegistry,
-  FileProjectPersistence,
+  HtmlVideoError,
   PostgresProjectPersistence,
   ProjectOrchestrator,
-  ProjectStore,
   RequestContextStorage,
   TemplateRegistry,
 } from '@html-video/core';
@@ -39,8 +38,8 @@ export interface CliContext {
   requestContexts: RequestContextStorage;
   database?: {
     config: DatabaseConfig;
-    handle?: PgClientHandle;
-    mode: 'postgres' | 'file';
+    handle: PgClientHandle;
+    mode: 'postgres';
   };
 }
 
@@ -69,7 +68,11 @@ function findTemplatesDir(projectRoot: string): string {
   return candidates[0]!;
 }
 
-export async function bootstrap(opts: { cwd?: string } = {}): Promise<CliContext> {
+export async function bootstrap(opts: {
+  cwd?: string;
+  /** Explicit dependency injection for isolated tests; never selected by runtime configuration. */
+  projects?: ProjectPersistence;
+} = {}): Promise<CliContext> {
   const projectRoot = findProjectRoot(opts.cwd);
 
   const engines = new EngineRegistry();
@@ -84,14 +87,20 @@ export async function bootstrap(opts: { cwd?: string } = {}): Promise<CliContext
   const templatesDir = findTemplatesDir(projectRoot);
   await templates.scan(templatesDir);
 
-  const projectStore = new ProjectStore(projectRoot);
   const requestContexts = new RequestContextStorage();
-  const databaseConfig = loadDatabaseConfig(projectRoot);
-  let databaseHandle: PgClientHandle | undefined;
-  let projects: ProjectPersistence = new FileProjectPersistence(projectStore);
+  let projects = opts.projects;
   let database: CliContext['database'];
-  if (databaseConfig?.enabled) {
-    databaseHandle = createPgClient(databaseConfig);
+  if (!projects) {
+    const databaseConfig = loadDatabaseConfig(projectRoot);
+    if (!databaseConfig) {
+      throw new HtmlVideoError(
+        'invalid-input',
+        'PostgreSQL configuration is required. Configure [database] in config/config.toml and config/config.local.toml.',
+        false,
+        { requirement: 'database-config' },
+      );
+    }
+    const databaseHandle = createPgClient(databaseConfig);
     projects = new PostgresProjectPersistence({
       db: databaseHandle.db,
       projectRoot,
@@ -99,8 +108,6 @@ export async function bootstrap(opts: { cwd?: string } = {}): Promise<CliContext
       publishHtml: createHtmlOssPublisher(projectRoot),
     });
     database = { config: databaseConfig, handle: databaseHandle, mode: 'postgres' };
-  } else if (databaseConfig) {
-    database = { config: databaseConfig, mode: 'file' };
   }
   const assets = new AssetStore({
     projectRoot,
@@ -127,6 +134,6 @@ export async function bootstrap(opts: { cwd?: string } = {}): Promise<CliContext
     templatesDir,
     mediaConfig,
     requestContexts,
-    ...(database !== undefined && { database }),
+    ...(database && { database }),
   };
 }

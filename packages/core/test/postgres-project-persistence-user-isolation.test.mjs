@@ -133,6 +133,54 @@ class MemoryAlbumPageRepository {
   }
 }
 
+class MemoryAssetRepository {
+  rows = [];
+
+  async create(input) {
+    const now = new Date();
+    const row = {
+      ...input,
+      album_id: input.album_id ?? null,
+      page_id: input.page_id ?? null,
+      usage_type: input.usage_type ?? 'source',
+      source: input.source ?? 'system',
+      status: input.status ?? 'available',
+      oss_bucket: input.oss_bucket ?? null,
+      thumbnail_url: input.thumbnail_url ?? null,
+      file_name: input.file_name ?? null,
+      mime_type: input.mime_type ?? null,
+      file_ext: input.file_ext ?? null,
+      file_size_bytes: input.file_size_bytes ?? null,
+      width: input.width ?? null,
+      height: input.height ?? null,
+      duration_ms: input.duration_ms ?? null,
+      checksum_sha256: input.checksum_sha256 ?? null,
+      metadata: input.metadata ?? {},
+      created_time: now,
+      updated_time: now,
+    };
+    this.rows.push(row);
+    return row;
+  }
+
+  async listByAlbum(userId, albumId, opts = {}) {
+    return this.rows.filter((row) => row.user_id === userId
+      && row.album_id === albumId
+      && (opts.includeDeleted || row.status !== 'deleted'));
+  }
+
+  async update(userId, id, patch, updatedBy) {
+    const row = this.rows.find((item) => item.user_id === userId && item.id === id);
+    if (!row) return null;
+    Object.assign(row, patch, { updated_by: updatedBy, updated_time: new Date() });
+    return row;
+  }
+
+  async softDelete(userId, id, updatedBy) {
+    return this.update(userId, id, { status: 'deleted' }, updatedBy);
+  }
+}
+
 function project(id, name) {
   const now = new Date().toISOString();
   return {
@@ -176,12 +224,14 @@ async function fixture(t, publishHtml) {
   const contexts = new RequestContextStorage();
   const albums = new MemoryAlbumRepository();
   const pages = new MemoryAlbumPageRepository();
+  const assets = new MemoryAssetRepository();
   const persistence = new PostgresProjectPersistence({
     db: { query: async () => { throw new Error('Unexpected database query'); } },
     projectRoot,
     getUserContext: () => contexts.getRequiredUser(),
     albums,
     pages,
+    assets,
     ...(publishHtml && { publishHtml }),
   });
   const runAs = (userId, callback) => contexts.run({
@@ -189,8 +239,43 @@ async function fixture(t, publishHtml) {
     source: 'header',
     user: { userId, actorId: userId },
   }, callback);
-  return { albums, pages, persistence, projectRoot, runAs };
+  return { albums, pages, assets, persistence, projectRoot, runAs };
 }
+
+test('uses ai_album_assets as the only project asset source', async (t) => {
+  const { albums, assets, persistence, runAs } = await fixture(t);
+  const input = project('proj_assets', 'Asset album');
+  input.assets = [{
+    id: 'legacy-sha1-id',
+    type: 'text',
+    path: 'C:/tmp/legacy-sha1-id.txt',
+    content: 'database-backed text',
+    metadata: {
+      filename: 'inline.txt',
+      mimeType: 'text/plain',
+      sizeBytes: 20,
+      userCaption: 'caption',
+    },
+    userTags: ['important'],
+  }];
+
+  await runAs('alice', () => persistence.save(input));
+
+  assert.equal('legacy_assets' in albums.rows[0].settings, false);
+  assert.equal(assets.rows.length, 1);
+  assert.notEqual(assets.rows[0].id, 'legacy-sha1-id');
+  assert.equal(assets.rows[0].metadata.project_asset_id, 'legacy-sha1-id');
+  assert.equal(assets.rows[0].metadata.inline_content, 'database-backed text');
+
+  albums.rows[0].settings.legacy_assets = [{ id: 'must-not-load', type: 'text' }];
+  const loaded = await runAs('alice', () => persistence.load('proj_assets'));
+  assert.deepEqual(loaded.assets, input.assets);
+
+  loaded.assets = [];
+  await runAs('alice', () => persistence.save(loaded));
+  assert.equal(assets.rows[0].status, 'deleted');
+  assert.deepEqual((await runAs('alice', () => persistence.load('proj_assets'))).assets, []);
+});
 
 test('publishes preview and frame HTML with request-scoped user identity', async (t) => {
   const publications = [];

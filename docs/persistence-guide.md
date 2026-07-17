@@ -41,7 +41,6 @@
 
 ```toml
 [database]
-enabled = true
 host = "127.0.0.1"
 port = 5432
 name = "html_video"
@@ -55,9 +54,9 @@ connect_timeout = 10
 
 行为说明：
 
-- `enabled = true`：正式项目接口使用 PostgreSQL 持久化
-- `enabled = false`：继续使用原本本地文件持久化
-- 加载顺序：`config/database.toml` + `config/database.local.toml`（本地覆盖基本）→ 兼容 `.html-video/database.toml` → 根目录 `database.toml`
+- PostgreSQL 是正式运行的必需依赖，不提供启停开关
+- 缺少有效数据库配置时应用启动失败，不再回退本地项目文件
+- 加载顺序：`config/config.toml` + `config/config.local.toml`（本地覆盖基本）；旧 `config/database*.toml` 仅作配置路径兼容
 - 接口返回配置时会隐藏敏感字段，不会返回数据库密码
 
 ### OSS
@@ -77,7 +76,7 @@ prefix = "html-video/dev"
 行为说明：
 
 - 当前 OSS 实现只支持阿里云 OSS
-- `enabled = true` 且 `database.enabled = true` 时，正式文件上传会保存到 OSS，并写入 `ai_album_assets`
+- `enabled = true` 时，正式文件上传会保存到 OSS，并写入 `ai_album_assets`
 - `enabled = false` 或配置不存在时，正式上传继续走原本本地文件行为
 - `public_base_url` 用于生成可在 HTML 中直接引用的素材 URL
 - `prefix` 用于控制 OSS object key 前缀
@@ -86,7 +85,7 @@ prefix = "html-video/dev"
 
 ### 项目主表
 
-以下接口在 `database.enabled = true` 时使用 `ai_album_albums`：
+以下接口统一使用 `ai_album_albums`：
 
 ```text
 POST   /api/projects
@@ -104,7 +103,7 @@ DELETE /api/projects/:id
 
 ### 页面 / HTML
 
-以下内容在 `database.enabled = true` 时使用 `ai_album_album_pages`：
+以下内容统一使用 `ai_album_album_pages`：
 
 ```text
 GET /api/projects/:id/raw-html
@@ -135,7 +134,7 @@ POST /api/projects/:id/messages  # multipart 聊天/图片转相册附件
 
 行为：
 
-- `database.enabled = true` 且 `oss.enabled = true`
+- `oss.enabled = true`
   - 文件上传到 OSS
   - 写入 `ai_album_assets`
   - `project.assets[]` 中的 `path` 使用 OSS URL
@@ -312,21 +311,6 @@ Test-Path config/database.local.toml
 
 然后检查 `[database]` 配置块是否完整。
 
-### database.enabled is false
-
-原因：
-
-- `config/database.toml` 或 `config/database.local.toml` 中设置了：
-
-```toml
-enabled = false
-```
-
-结果：
-
-- dev 测试接口会返回 mock/skipped
-- 正式项目接口继续使用本地文件行为
-
 ### OSS config not found or invalid
 
 原因：
@@ -443,11 +427,11 @@ garbage_batch_size = 100
 
 这是迁移期设计，用于保持现有前端和业务代码稳定。
 
-### `ai_album_assets` 不是唯一资产来源
+### `ai_album_assets` 是唯一素材元数据来源
 
-当前正式文件上传已经写入 `ai_album_assets`，但内联 text/data 仍可能只存在于 Project settings 或本地文件中。
+文件、内联 text/data 和 reference-link 素材均写入 `ai_album_assets`。项目加载时由素材表重建 `project.assets[]`，不再读取 `ai_album_albums.settings.legacy_assets`。
 
-后续如果要进一步收敛，可以把 text/data 也写入 `ai_album_assets`，并让项目加载时从 `ai_album_assets` 重建 `project.assets[]`。
+历史 `legacy_assets` 数据由 `007_migrate_legacy_assets.sql` 一次性迁入素材表；迁移完成后会从相册 settings 删除旧字段。素材删除必须命中对应数据库行，不再接受“数据库无记录但本地存在”的兼容成功路径。
 
 ### AI 生成日志
 

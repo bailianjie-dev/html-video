@@ -4,16 +4,32 @@ import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
+import { FileProjectPersistence, ProjectStore } from '@html-video/core';
 
 import { type CliContext, bootstrap } from '../dist/context.js';
 import { startStudioServer } from '../dist/studio-server.js';
 
 const RUN_TIMEOUT_MS = 15_000;
 
-test('file mode isolates concurrent Session runs through real HTTP and SSE', async () => {
+test('runtime bootstrap requires PostgreSQL configuration instead of falling back to files', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'html-video-postgres-required-'));
+  try {
+    await assert.rejects(
+      bootstrap({ cwd: root }),
+      /PostgreSQL configuration is required/,
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('explicit test persistence isolates concurrent Session runs through real HTTP and SSE', async () => {
   const root = await mkdtemp(join(tmpdir(), 'html-video-phase31-file-'));
   try {
-    const ctx = await bootstrap({ cwd: root });
+    const ctx = await bootstrap({
+      cwd: root,
+      projects: new FileProjectPersistence(new ProjectStore(root)),
+    });
     assert.notEqual(ctx.database?.mode, 'postgres');
     await withFakeAgentProvider(() => runHttpAcceptance(ctx, 'file'));
   } finally {

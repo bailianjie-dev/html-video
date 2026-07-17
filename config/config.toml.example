@@ -12,7 +12,6 @@
 # Do not commit config.local.toml (gitignored via config/*.local.toml).
 
 [database]
-enabled = true
 host = "127.0.0.1"
 port = 5432
 name = "html_video"
@@ -24,7 +23,11 @@ pool_timeout = 30
 connect_timeout = 10
 
 [oss]
-enabled = true
+# Master switch for object storage (Aliyun OSS).
+# false: keep assets / HTML / exports local; other [oss] fields may still be filled in.
+# true: upload/download to OSS (needs real keys; usually also needs [database]).
+# Prefer overriding this in config.local.toml for your machine.
+enabled = false
 provider = "aliyun"
 # Example: "oss-cn-beijing.aliyuncs.com"
 endpoint = "oss-cn-hangzhou.aliyuncs.com"

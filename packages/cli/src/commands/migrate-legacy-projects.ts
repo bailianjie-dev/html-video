@@ -81,7 +81,7 @@ export async function migrateLegacyProjects(
   opts: LegacyProjectMigrationOptions = {},
 ): Promise<LegacyProjectMigrationResult> {
   if (ctx.database?.mode !== 'postgres' || !ctx.database.handle) {
-    throw new Error('Legacy migration requires database.enabled = true.');
+    throw new Error('Legacy migration requires PostgreSQL configuration.');
   }
   const oss = loadOssConfig(ctx.projectRoot);
   if (opts.execute && !oss?.enabled) {
@@ -192,7 +192,7 @@ async function migrateOneLegacyProject(
   });
 
   const normalizedProject = normalizeLegacyProjectPaths(projectDir, project);
-  await persistence.save(normalizedProject);
+  await persistence.save({ ...normalizedProject, assets: [] });
   const album = await findProjectAlbum(albums, normalizedProject.id, user.userId);
   if (!album) throw new Error(`Album was not created for project ${normalizedProject.id}`);
 
@@ -214,6 +214,12 @@ async function migrateOneLegacyProject(
     uploadedAssets.push({ filePath, row: created });
     assetsUploaded += 1;
   }
+
+  await persistence.save(rebindMigratedProjectAssets(
+    normalizedProject,
+    projectDir,
+    uploadedAssets,
+  ));
 
   const graphPath = normalizedProject.contentGraphPath;
   if (graphPath && existsSync(graphPath)) {
@@ -238,8 +244,7 @@ async function migrateOneLegacyProject(
   }
 
   // Keep local path metadata out of the durable DB copy after a successful
-  // migration. The runtime can still fall back to files if a future project has
-  // not been migrated, but migrated history should be DB/OSS-addressable.
+  // migration. Project assets are already represented by ai_album_assets.
   const latest = await findProjectAlbum(albums, normalizedProject.id, user.userId);
   if (latest) {
     const settings = cleanMigratedAlbumSettings(
@@ -384,18 +389,7 @@ function cleanMigratedAlbumSettings(
   assets: UploadedLegacyAsset[],
 ): JsonObject {
   const next = { ...settings };
-  if (Array.isArray(next.legacy_assets)) {
-    next.legacy_assets = next.legacy_assets.map((raw) => {
-      if (!isJsonObject(raw)) return raw;
-      const item = { ...raw };
-      if (typeof item.path === 'string') {
-        const replacement = migratedAssetProxyForPath(projectDir, projectId, item.path, assets);
-        if (replacement) item.path = replacement;
-        else if (isLegacyLocalPath(projectDir, item.path)) delete item.path;
-      }
-      return item;
-    });
-  }
+  delete next.legacy_assets;
   if (Array.isArray(next.legacy_frames)) {
     next.legacy_frames = next.legacy_frames.map((raw) => {
       if (!isJsonObject(raw)) return raw;
@@ -418,6 +412,29 @@ function cleanMigratedAlbumSettings(
     });
   }
   return next;
+}
+
+function rebindMigratedProjectAssets(
+  project: Project,
+  projectDir: string,
+  assets: UploadedLegacyAsset[],
+): Project {
+  return {
+    ...project,
+    assets: project.assets.map((asset) => {
+      if (!asset.path) return asset;
+      const resolved = resolveLegacyPath(projectDir, asset.path);
+      const migrated = resolved
+        ? assets.find((item) => resolve(item.filePath) === resolve(resolved))
+        : undefined;
+      if (!migrated) return asset;
+      return {
+        ...asset,
+        id: migrated.row.id,
+        path: `/api/projects/${encodeURIComponent(project.id)}/assets/${encodeURIComponent(migrated.row.id)}/content`,
+      };
+    }),
+  };
 }
 
 function migratedAssetProxyForPath(

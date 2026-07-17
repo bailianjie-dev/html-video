@@ -51,13 +51,11 @@ export class PostgresAssetPersistence {
   async softDeleteForProject(
     projectId: string,
     assetId: string,
-    opts: { allowMissingDatabaseRow?: boolean } = {},
   ): Promise<AssetRow | null> {
     const user = this.opts.getUserContext();
     const album = await this.requireAlbum(projectId, user);
     const asset = await this.opts.assets.findById(user.userId, assetId);
     if (!asset || asset.album_id !== album.id || asset.status === 'deleted') {
-      if (opts.allowMissingDatabaseRow && !asset) return null;
       throw new HtmlVideoError('asset-not-found', `Asset ${assetId} not found`);
     }
     const deleted = await this.opts.assets.softDelete(user.userId, assetId, user.actorId);
