@@ -220,6 +220,62 @@ test('structured patch updates target page data-hv-text copy', () => {
   assert.match(result.html, /data-hv-text="page_1\.title">Old one<\/h1>/);
 });
 
+test('structured patch applies exact old-to-new text replacements without a model rewrite', () => {
+  const html = `<!doctype html><html><body><main id="album">
+    <section data-album-page="page_1">
+      <h1 data-hv-text="page_1.title_line1">小米</h1>
+      <h2 data-hv-text="page_1.title_line2">SU7</h2>
+      <p data-hv-text="page_1.subtitle">其它内容保持不变</p>
+    </section>
+    <section data-album-page="page_2"><h1 data-hv-text="page_2.title">小米</h1></section>
+  </main></body></html>`;
+
+  const result = patchAlbumHtmlForSimpleRequest(html, {
+    userText: '将标题第一行"小米"改为"xiaomi"，标题第二行"SU7"改为"su7"，其他内容保持不变。',
+    targetPageIndex: 0,
+  });
+
+  assert.ok(result);
+  assert.equal(result.action, 'text');
+  assert.match(result.summary, /updated 2 exact text fields/);
+  assert.match(result.html, /data-hv-text="page_1\.title_line1">xiaomi<\/h1>/);
+  assert.match(result.html, /data-hv-text="page_1\.title_line2">su7<\/h2>/);
+  assert.match(result.html, /data-hv-text="page_1\.subtitle">其它内容保持不变<\/p>/);
+  assert.match(result.html, /data-hv-text="page_2\.title">小米<\/h1>/);
+});
+
+test('structured exact replacement supports a quoted single-field title change', () => {
+  const html = `<!doctype html><html><body><main id="album">
+    <section data-album-page="page_1"><h1 data-hv-text="page_1.title">XIAOMI SU7</h1></section>
+  </main></body></html>`;
+
+  const result = patchAlbumHtmlForSimpleRequest(html, {
+    userText: '将标题 "XIAOMI SU7" 改为 "小米SU7"，其他内容保持不变。',
+    targetPageIndex: 0,
+  });
+
+  assert.ok(result);
+  assert.equal(result.key, 'page_1.title');
+  assert.match(result.html, />小米SU7<\/h1>/);
+});
+
+test('structured exact replacement refuses ambiguous editable text matches', () => {
+  const html = `<!doctype html><html><body><main id="album">
+    <section data-album-page="page_1">
+      <h1 data-hv-text="page_1.title">SU7</h1>
+      <p data-hv-text="page_1.footer">SU7</p>
+    </section>
+  </main></body></html>`;
+
+  assert.equal(
+    patchAlbumHtmlForSimpleRequest(html, {
+      userText: '将 "SU7" 改为 "su7"',
+      targetPageIndex: 0,
+    }),
+    null,
+  );
+});
+
 test('structured patch replaces an existing CTA', () => {
   const html = `<!doctype html><html><body><main id="album">
     <section data-album-page="page_1">

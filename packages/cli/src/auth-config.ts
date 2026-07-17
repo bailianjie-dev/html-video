@@ -1,7 +1,7 @@
 import { createHash, createHmac, timingSafeEqual } from 'node:crypto';
 import { resolveTomlConfig } from './config-files.js';
 
-/** Legacy single-account username; used when auth.toml has no [[auth.users]]. */
+/** Legacy single-account username; used when authhas no [[auth.users]]. */
 export const DEV_AUTH_USERNAME = 'admin';
 
 export interface AuthUser {

@@ -8,8 +8,8 @@
  * If the local file exists and has real content (non-empty after comments),
  * its keys override the base file. Otherwise only the base file is used.
  *
- * Legacy per-domain files (`config/database.toml`, `config/oss.toml`, …) and
- * `.html-video/<name>.toml` remain supported as a fallback.
+ * Fallback (when unified file lacks a section): `config/<name>.toml` +
+ * optional `config/<name>.local.toml`.
  */
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -108,21 +108,6 @@ export function resolveTomlConfig(
       content: localRaw,
       basePath: hasBase ? basePath : null,
       localPath,
-    };
-  }
-
-  // Migration: prefer existing legacy secrets over committed base templates.
-  const legacy = [
-    join(projectRoot, '.html-video', `${name}.toml`),
-    join(projectRoot, `${name}.toml`),
-  ];
-  for (const path of legacy) {
-    if (!existsSync(path)) continue;
-    return {
-      sourcePath: path,
-      content: readFileSync(path, 'utf8'),
-      basePath: null,
-      localPath: null,
     };
   }
 

@@ -100,6 +100,15 @@ import {
   type UpdateAlbumToolInput,
 } from './album-agent-tools.js';
 import { isLocalAgentSessionId, LocalAgentSessionStore } from './local-agent-session-store.js';
+import {
+  parseSimpleAlbumCommand,
+  type SimpleAlbumCommand,
+  type SimpleAlbumCommandNotHandledReason,
+} from './simple-album-command.js';
+import type {
+  SimpleAlbumHtmlPatchStrategy,
+  SimpleAlbumHtmlSourceRange,
+} from './simple-album-html-patch.js';
 
 interface StudioHandle {
   url: string;
@@ -1671,7 +1680,6 @@ export async function startStudioServer(
           const activeRun = AGENT_RUNS.getActiveForSession(runtimeProjectKey(ctx, projectId), sessionId);
           if (activeRun) return agentSessionRunConflict(res, activeRun);
           const input = await readAlbumAgentMessageRequest(ctx, req, projectId);
-          await attachExternalSources(ctx, projectId, input.userText, input.attachments);
           return handleAlbumAgentV1Message({
             ctx,
             res,
@@ -1716,18 +1724,13 @@ export async function startStudioServer(
       if (msgsMatch && msgsMatch[1] && m === 'POST') {
         const id = msgsMatch[1];
         await ctx.orchestrator.load(id);
-        const defaultSession = await ensureAlbumAgentSession(
-          ctx,
-          id,
-          findAgent(REQUIRED_AGENT_ID)?.defaultModel ?? null,
-        );
+        const defaultSession = await ensureAlbumAgentSession(ctx, id, null);
         const activeRun = AGENT_RUNS.getActiveForSession(
           runtimeProjectKey(ctx, id),
           defaultSession.id,
         );
         if (activeRun) return agentSessionRunConflict(res, activeRun);
         const input = await readAlbumAgentMessageRequest(ctx, req, id);
-        await attachExternalSources(ctx, id, input.userText, input.attachments);
         return handleAlbumAgentV1Message({
           ctx,
           res,
@@ -3156,18 +3159,9 @@ async function handleAlbumAgentV1Message(args: {
   viewStateInput?: unknown;
 }): Promise<void> {
   const { ctx, res, projectId, sessionId, userText, attachments, viewStateInput } = args;
-  const project = await ctx.orchestrator.load(projectId);
-  const agentDef = findAgent(REQUIRED_AGENT_ID);
-  if (!agentDef) {
-    return json(res, 400, { error: `agent "${REQUIRED_AGENT_ID}" not registered` });
-  }
-  if (project.agentId !== REQUIRED_AGENT_ID || project.agentModel !== null) {
-    await ctx.orchestrator.setAgent(projectId, REQUIRED_AGENT_ID, null).catch(() => {});
-  }
-
   let session = sessionId
     ? await getActiveAlbumAgentSession(ctx, projectId, sessionId)
-    : await ensureAlbumAgentSession(ctx, projectId, agentDef.defaultModel ?? null);
+    : await ensureAlbumAgentSession(ctx, projectId, null);
   if (viewStateInput !== undefined) {
     session = (await updateAlbumAgentViewStateForSession(
       ctx,
@@ -3203,106 +3197,164 @@ async function handleAlbumAgentV1Message(args: {
   let runOutcome: AgentRunOutcome = 'failed';
 
   try {
-  const history = await loadMessagesForSession(ctx, projectId, session.id);
-  const attachmentSummary = attachments.length > 0
-    ? `\n\nAttachments: ${attachments.map((attachment) => attachment.filename).join(', ')}`
-    : '';
-  await appendMessage(ctx, projectId, history, {
-    role: 'user',
-    content: userText + attachmentSummary,
-    sessionId: session.id,
-    runId,
-    ts: Date.now(),
-  });
+    const history = await loadMessagesForSession(ctx, projectId, session.id);
+    const attachmentSummary = attachments.length > 0
+      ? `\n\nAttachments: ${attachments.map((attachment) => attachment.filename).join(', ')}`
+      : '';
+    await appendMessage(ctx, projectId, history, {
+      role: 'user',
+      content: userText + attachmentSummary,
+      sessionId: session.id,
+      runId,
+      ts: Date.now(),
+    });
 
-  const projectDir = await ctx.projects.ensureDir(projectId);
-  const promptAlbum = await readAlbumModel(ctx, projectId);
-  const promptTemplate = promptAlbum.templateId && ctx.templates.has(promptAlbum.templateId)
-    ? ctx.templates.get(promptAlbum.templateId)
-    : null;
-  const prompt = buildAlbumAgentPrompt({
-    history,
-    project: {
-      albumExists: promptAlbum.exists,
-      template: promptAlbum.templateId
-        ? { id: promptAlbum.templateId, name: promptTemplate?.name ?? null }
-        : null,
-      revision: promptAlbum.revision,
-      pageCount: promptAlbum.pageCount,
-    },
-    attachments: attachments.map((attachment) => ({
-      filename: attachment.filename,
-      kind: attachment.kind,
-      ...(attachment.assetId && { assetId: attachment.assetId }),
-    })),
-    pendingConfirmation: session.pendingConfirmation,
-  });
-  const readTools = createAlbumReadTools({
-    getAlbumState: () => readAlbumModel(ctx, projectId),
-    getViewState: async () => (await getAlbumAgentSession(ctx, projectId, session.id)).viewState,
-  });
-  const generateTool = createAlbumGenerateTool({
-    executeGenerate: (toolCallId, input, signal) => executeAlbumGenerationTool({
-      ctx,
-      projectId,
-      sessionId: session.id,
-      projectDir,
-      agentDef,
-      toolCallId,
-      input,
-      signal,
-      requestAttachments: attachments,
-    }),
-  });
-  const updateTools = createAlbumUpdateTools({
-    executePageUpdate: (toolCallId, input, signal) => executeAlbumUpdateTool({
-      ctx,
-      projectId,
-      sessionId: session.id,
-      projectDir,
-      agentDef,
-      toolCallId,
-      mode: 'page',
-      input,
-      signal,
-      requestAttachments: attachments,
-    }),
-    executeAlbumUpdate: (toolCallId, input, signal) => executeAlbumUpdateTool({
-      ctx,
-      projectId,
-      sessionId: session.id,
-      projectDir,
-      agentDef,
-      toolCallId,
-      mode: 'album',
-      input,
-      signal,
-      requestAttachments: attachments,
-    }),
-  });
-  const assetTools = createAlbumAssetTools({
-    executeAssetReplacement: (toolCallId, input, signal) => executeAlbumAssetReplacementTool({
-      ctx,
-      projectId,
-      sessionId: session.id,
-      agentDef,
-      toolCallId,
-      input,
-      signal,
-    }),
-  });
-  const customTools = [...readTools, generateTool, ...updateTools, ...assetTools];
-  res.writeHead(200, {
-    'content-type': 'text/event-stream; charset=utf-8',
-    'cache-control': 'no-cache',
-    connection: 'keep-alive',
-    'x-agent-run-id': runId,
-    'x-agent-session-id': session.id,
-    'x-agent-events-url': sessionAgentRunEventsPath(projectId, session.id, runId),
-  });
-  streamStarted = true;
-  unsubscribe = log.subscribe((event) => writeAgentRunSse(res, event));
+    res.writeHead(200, {
+      'content-type': 'text/event-stream; charset=utf-8',
+      'cache-control': 'no-cache',
+      connection: 'keep-alive',
+      'x-agent-run-id': runId,
+      'x-agent-session-id': session.id,
+      'x-agent-events-url': sessionAgentRunEventsPath(projectId, session.id, runId),
+    });
+    streamStarted = true;
+    unsubscribe = log.subscribe((event) => writeAgentRunSse(res, event));
 
+    const fastResult = attachments.length === 0 && extractUrls(userText).length === 0
+      ? await tryExecuteSimpleAlbumCommand({
+          ctx,
+          projectId,
+          sessionId: session.id,
+          userText,
+          signal: abortController.signal,
+        })
+      : deterministicNotHandled(performance.now(), 'attachments_or_urls_present');
+
+    if (abortController.signal.aborted && fastResult.status !== 'handled_success') {
+      log.append('run.cancelled', { message: 'Agent run cancelled' });
+      await appendMessage(ctx, projectId, history, {
+        role: 'system',
+        content: 'Agent run cancelled',
+        sessionId: session.id,
+        runId,
+        ts: Date.now(),
+      });
+      runOutcome = 'cancelled';
+      return;
+    }
+
+    if (fastResult.status !== 'not_handled') {
+      await completeDeterministicAlbumRun({
+        ctx,
+        projectId,
+        sessionId: session.id,
+        runId,
+        history,
+        log,
+        result: fastResult,
+      });
+      runOutcome = 'completed';
+      return;
+    }
+
+    // The deterministic router made no mutation. Only now initialize the
+    // existing Agent path and any external-source side effects.
+    await attachExternalSources(ctx, projectId, userText, attachments);
+    const project = await ctx.orchestrator.load(projectId);
+    const agentDef = findAgent(REQUIRED_AGENT_ID);
+    if (!agentDef) {
+      const message = `agent "${REQUIRED_AGENT_ID}" not registered`;
+      log.append('run.failed', { code: 'AGENT_NOT_REGISTERED', message });
+      await appendMessage(ctx, projectId, history, {
+        role: 'system',
+        content: message,
+        sessionId: session.id,
+        runId,
+        ts: Date.now(),
+      });
+      return;
+    }
+    if (project.agentId !== REQUIRED_AGENT_ID || project.agentModel !== null) {
+      await ctx.orchestrator.setAgent(projectId, REQUIRED_AGENT_ID, null).catch(() => {});
+    }
+
+    const projectDir = await ctx.projects.ensureDir(projectId);
+    const promptAlbum = await readAlbumModel(ctx, projectId);
+    const promptTemplate = promptAlbum.templateId && ctx.templates.has(promptAlbum.templateId)
+      ? ctx.templates.get(promptAlbum.templateId)
+      : null;
+    const prompt = buildAlbumAgentPrompt({
+      history,
+      project: {
+        albumExists: promptAlbum.exists,
+        template: promptAlbum.templateId
+          ? { id: promptAlbum.templateId, name: promptTemplate?.name ?? null }
+          : null,
+        revision: promptAlbum.revision,
+        pageCount: promptAlbum.pageCount,
+      },
+      attachments: attachments.map((attachment) => ({
+        filename: attachment.filename,
+        kind: attachment.kind,
+        ...(attachment.assetId && { assetId: attachment.assetId }),
+      })),
+      pendingConfirmation: session.pendingConfirmation,
+    });
+    const readTools = createAlbumReadTools({
+      getAlbumState: () => readAlbumModel(ctx, projectId),
+      getViewState: async () => (await getAlbumAgentSession(ctx, projectId, session.id)).viewState,
+    });
+    const generateTool = createAlbumGenerateTool({
+      executeGenerate: (toolCallId, input, signal) => executeAlbumGenerationTool({
+        ctx,
+        projectId,
+        sessionId: session.id,
+        projectDir,
+        agentDef,
+        toolCallId,
+        input,
+        signal,
+        requestAttachments: attachments,
+      }),
+    });
+    const updateTools = createAlbumUpdateTools({
+      executePageUpdate: (toolCallId, input, signal) => executeAlbumUpdateTool({
+        ctx,
+        projectId,
+        sessionId: session.id,
+        projectDir,
+        agentDef,
+        toolCallId,
+        mode: 'page',
+        input,
+        signal,
+        requestAttachments: attachments,
+      }),
+      executeAlbumUpdate: (toolCallId, input, signal) => executeAlbumUpdateTool({
+        ctx,
+        projectId,
+        sessionId: session.id,
+        projectDir,
+        agentDef,
+        toolCallId,
+        mode: 'album',
+        input,
+        signal,
+        requestAttachments: attachments,
+      }),
+    });
+    const assetTools = createAlbumAssetTools({
+      executeAssetReplacement: (toolCallId, input, signal) => executeAlbumAssetReplacementTool({
+        ctx,
+        projectId,
+        sessionId: session.id,
+        agentDef,
+        toolCallId,
+        input,
+        signal,
+      }),
+    });
+    const customTools = [...readTools, generateTool, ...updateTools, ...assetTools];
     const result = await runAgentTurn({
       def: agentDef,
       prompt,
@@ -3369,6 +3421,157 @@ async function handleAlbumAgentV1Message(args: {
     unsubscribe();
     if (streamStarted && !res.writableEnded) res.end();
   }
+}
+
+async function completeDeterministicAlbumRun(args: {
+  ctx: CliContext;
+  projectId: string;
+  sessionId: string;
+  runId: string;
+  history: ChatMessage[];
+  log: AgentRunEventLog;
+  result: Exclude<TryExecuteSimpleAlbumCommandResult, { status: 'not_handled' }>;
+}): Promise<void> {
+  const { ctx, projectId, sessionId, runId, history, log, result } = args;
+  const toolCallId = `deterministic-${runId}`;
+  const toolName = result.command.type === 'replace_text'
+    ? 'replace_album_text'
+    : 'set_album_text_color';
+  const details = deterministicToolResultDetails(result);
+  const output = {
+    content: [{ type: 'text', text: JSON.stringify(details) }],
+    details,
+  };
+  const assistantText = deterministicAssistantResponse(result);
+
+  log.append('run.started', {
+    agent: 'fast-command-router',
+    model: null,
+    executor: 'deterministic',
+  });
+  log.append('tool.call.started', {
+    callId: toolCallId,
+    name: toolName,
+    arguments: result.command,
+    executor: 'deterministic',
+  });
+  log.append('tool.call.completed', {
+    callId: toolCallId,
+    output,
+    isError: result.status !== 'handled_success',
+    executor: 'deterministic',
+    durationMs: result.duration_ms,
+  });
+  if (result.status === 'handled_success') {
+    const changeSummary = {
+      page_count: 1,
+      text_count: 1,
+      image_count: 0,
+      cta_count: 0,
+      style_variable_count: 0,
+      structural_change: result.strategy === 'wrap_text_node_with_color_span',
+    };
+    log.append('album.changed', {
+      revision: result.revision,
+      previousRevision: result.previous_revision,
+      pageCount: result.page_count,
+      changedPages: [result.page_number],
+      changeSummary,
+      operation: result.command.type,
+      pageNumber: result.page_number,
+      toolCallId,
+      executor: 'deterministic',
+    });
+    log.append('preview.ready', {
+      previewUrl: result.preview_url,
+      revision: result.revision,
+      previousRevision: result.previous_revision,
+      pageCount: result.page_count,
+      changedPages: [result.page_number],
+      changeSummary,
+      operation: result.command.type,
+      pageNumber: result.page_number,
+      executor: 'deterministic',
+    });
+  }
+  log.append('assistant.completed', { text: assistantText, executor: 'deterministic' });
+  log.append('run.completed', { reason: 'deterministic_command', executor: 'deterministic' });
+
+  await appendMessage(ctx, projectId, history, {
+    role: 'tool',
+    tool: toolName,
+    content: safeToolResultText(output),
+    output,
+    sessionId,
+    runId,
+    ts: Date.now(),
+  });
+  await appendMessage(ctx, projectId, history, {
+    role: 'assistant',
+    agent: 'fast-command-router',
+    content: assistantText,
+    sessionId,
+    runId,
+    ts: Date.now(),
+  });
+}
+
+function deterministicToolResultDetails(
+  result: Exclude<TryExecuteSimpleAlbumCommandResult, { status: 'not_handled' }>,
+): Record<string, unknown> {
+  if (result.status === 'handled_success') {
+    return {
+      ok: true,
+      album_changed: true,
+      operation: result.command.type,
+      executor: result.executor,
+      strategy: result.strategy,
+      duration_ms: result.duration_ms,
+      previous_revision: result.previous_revision,
+      revision: result.revision,
+      page_number: result.page_number,
+      page_count: result.page_count,
+      changed_pages: [result.page_number],
+      changed_text_keys: [result.changed_key],
+      preview_url: result.preview_url,
+    };
+  }
+  if (result.status === 'handled_conflict') {
+    return {
+      ok: false,
+      code: 'ALBUM_REVISION_CONFLICT',
+      album_changed: false,
+      executor: result.executor,
+      strategy: result.strategy,
+      duration_ms: result.duration_ms,
+      expected_revision: result.expected_revision,
+      current_revision: result.current_revision,
+    };
+  }
+  return {
+    ok: false,
+    code: 'FAST_COMMAND_VALIDATION_FAILED',
+    album_changed: false,
+    executor: result.executor,
+    strategy: result.strategy,
+    duration_ms: result.duration_ms,
+    message: result.validation_reasons.join('; '),
+  };
+}
+
+function deterministicAssistantResponse(
+  result: Exclude<TryExecuteSimpleAlbumCommandResult, { status: 'not_handled' }>,
+): string {
+  if (result.status === 'handled_conflict') {
+    return '相册已被其他操作更新，本次没有覆盖新版本。请刷新后重试。';
+  }
+  if (result.status === 'validation_failed') {
+    return '这项修改未通过安全校验，相册内容没有改变。';
+  }
+  if (result.command.type === 'replace_text') {
+    return `已将第 ${result.page_number} 页的“${result.command.old_text}”替换为“${result.command.new_text}”。`;
+  }
+  return `已将第 ${result.page_number} 页“${result.command.target_text}”的文字颜色设置为 ${result.command.color}。`;
 }
 
 async function ensureAlbumAgentSession(
@@ -3990,6 +4193,248 @@ async function withAlbumWriteQueue<T>(key: string, fn: () => Promise<T>): Promis
   } finally {
     if (ALBUM_WRITE_QUEUES.get(key) === current) ALBUM_WRITE_QUEUES.delete(key);
   }
+}
+
+export interface TryExecuteSimpleAlbumCommandInput {
+  ctx: CliContext;
+  projectId: string;
+  sessionId: string;
+  userText: string;
+  /** Optional caller snapshot. When omitted, the pre-queue project revision is used. */
+  expectedRevision?: number;
+  signal?: AbortSignal;
+}
+
+interface DeterministicExecutionMetadata {
+  executor: 'deterministic';
+  strategy: SimpleAlbumHtmlPatchStrategy | null;
+  duration_ms: number;
+}
+
+export type TryExecuteSimpleAlbumCommandResult =
+  | (DeterministicExecutionMetadata & {
+      status: 'handled_success';
+      command: SimpleAlbumCommand;
+      album_changed: true;
+      expected_revision: number;
+      previous_revision: number;
+      revision: number;
+      page_number: number;
+      page_count: number;
+      changed_key: string;
+      source_range: SimpleAlbumHtmlSourceRange;
+      replacement_range: SimpleAlbumHtmlSourceRange;
+      preview_url: string;
+    })
+  | (DeterministicExecutionMetadata & {
+      status: 'handled_conflict';
+      command: SimpleAlbumCommand;
+      album_changed: false;
+      expected_revision: number;
+      current_revision: number;
+    })
+  | (DeterministicExecutionMetadata & {
+      status: 'not_handled';
+      reason: SimpleAlbumCommandNotHandledReason | string;
+      album_changed: false;
+    })
+  | (DeterministicExecutionMetadata & {
+      status: 'validation_failed';
+      command: SimpleAlbumCommand;
+      reason: string;
+      validation_reasons: string[];
+      album_changed: false;
+    });
+
+/**
+ * Deterministically execute the small Fast Command subset.
+ * This service is intentionally not connected to POST /messages yet.
+ */
+export async function tryExecuteSimpleAlbumCommand(
+  input: TryExecuteSimpleAlbumCommandInput,
+): Promise<TryExecuteSimpleAlbumCommandResult> {
+  const startedAt = performance.now();
+  const parsed = parseSimpleAlbumCommand(input.userText);
+  if (!parsed.handled) {
+    return deterministicNotHandled(startedAt, parsed.reason);
+  }
+  const command = parsed.command;
+  const strategy = simpleAlbumCommandStrategy(command);
+  if (input.signal?.aborted) return deterministicNotHandled(startedAt, 'cancelled', strategy);
+
+  const [initialProject, initialSession, initialHtml] = await Promise.all([
+    input.ctx.orchestrator.load(input.projectId),
+    getActiveAlbumAgentSession(input.ctx, input.projectId, input.sessionId),
+    input.ctx.orchestrator.readRawHtml(input.projectId).catch(() => null),
+  ]);
+  if (!initialHtml) return deterministicNotHandled(startedAt, 'no_album_html', strategy);
+  if (input.signal?.aborted) return deterministicNotHandled(startedAt, 'cancelled', strategy);
+  const snapshotRevision = projectAlbumRevision(initialProject);
+  const expectedRevision = input.expectedRevision ?? snapshotRevision;
+  if (!Number.isSafeInteger(expectedRevision) || expectedRevision < 0) {
+    return deterministicNotHandled(startedAt, 'invalid_expected_revision', strategy);
+  }
+  const initialCurrentPage = sessionCurrentPageNumber(initialSession);
+  const queueKey = runtimeProjectKey(input.ctx, input.projectId);
+
+  return withAlbumWriteQueue(queueKey, async () => {
+    if (input.signal?.aborted) return deterministicNotHandled(startedAt, 'cancelled', strategy);
+    const [project, session, currentHtml] = await Promise.all([
+      input.ctx.orchestrator.load(input.projectId),
+      getActiveAlbumAgentSession(input.ctx, input.projectId, input.sessionId),
+      input.ctx.orchestrator.readRawHtml(input.projectId).catch(() => null),
+    ]);
+    const currentRevision = projectAlbumRevision(project);
+    if (currentRevision !== expectedRevision) {
+      return {
+        status: 'handled_conflict',
+        executor: 'deterministic',
+        strategy,
+        duration_ms: elapsedMilliseconds(startedAt),
+        command,
+        album_changed: false,
+        expected_revision: expectedRevision,
+        current_revision: currentRevision,
+      };
+    }
+    if (!currentHtml) return deterministicNotHandled(startedAt, 'no_album_html', strategy);
+    if (input.signal?.aborted) return deterministicNotHandled(startedAt, 'cancelled', strategy);
+
+    // Loaded lazily to keep the source patcher independent from HTTP startup.
+    const { executeSimpleAlbumHtmlPatch } = await import('./simple-album-html-patch.js');
+    const patchResult = executeSimpleAlbumHtmlPatch(currentHtml, command, {
+      currentPageNumber: sessionCurrentPageNumber(session) ?? initialCurrentPage ?? undefined,
+    });
+    if (!patchResult.handled) {
+      if (patchResult.reason === 'validation_failed') {
+        return {
+          status: 'validation_failed',
+          executor: 'deterministic',
+          strategy,
+          duration_ms: elapsedMilliseconds(startedAt),
+          command,
+          reason: patchResult.reason,
+          validation_reasons: patchResult.validation_reasons ?? [],
+          album_changed: false,
+        };
+      }
+      return deterministicNotHandled(startedAt, patchResult.reason, strategy);
+    }
+    if (patchResult.patch.html === currentHtml) {
+      return deterministicNotHandled(startedAt, 'no_effect', strategy);
+    }
+
+    // Keep the service explicitly pinned to the same final validation used by
+    // existing album tools, even though the source patcher validates as well.
+    const validation = validateAlbumHtmlBeforePersist(currentHtml, patchResult.patch.html);
+    if (!validation.ok) {
+      return {
+        status: 'validation_failed',
+        executor: 'deterministic',
+        strategy,
+        duration_ms: elapsedMilliseconds(startedAt),
+        command,
+        reason: 'validation_failed',
+        validation_reasons: [...validation.reasons],
+        album_changed: false,
+      };
+    }
+    if (input.signal?.aborted) return deterministicNotHandled(startedAt, 'cancelled', strategy);
+
+    let saved: Record<string, unknown>;
+    try {
+      saved = await persistAlbumUpdate({
+        ctx: input.ctx,
+        projectId: input.projectId,
+        currentHtml,
+        modifiedHtml: patchResult.patch.html,
+        expectedRevision,
+        pageIndex: patchResult.patch.page_number - 1,
+        operation: 'update_album_page',
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (!/(?:persistence validation|changed page count|produced no changes|escaped target page)/i.test(message)) {
+        throw error;
+      }
+      return {
+        status: 'validation_failed',
+        executor: 'deterministic',
+        strategy,
+        duration_ms: elapsedMilliseconds(startedAt),
+        command,
+        reason: 'validation_failed',
+        validation_reasons: [message],
+        album_changed: false,
+      };
+    }
+    if (saved.ok !== true) {
+      return {
+        status: 'handled_conflict',
+        executor: 'deterministic',
+        strategy,
+        duration_ms: elapsedMilliseconds(startedAt),
+        command,
+        album_changed: false,
+        expected_revision: expectedRevision,
+        current_revision: Number(saved.current_revision),
+      };
+    }
+
+    const updatedSession = updateSessionAfterAlbumUpdate(
+      session,
+      saved,
+      patchResult.patch.page_number - 1,
+    );
+    await persistAlbumAgentSession(input.ctx, updatedSession);
+    return {
+      status: 'handled_success',
+      executor: 'deterministic',
+      strategy: patchResult.patch.patch_strategy,
+      duration_ms: elapsedMilliseconds(startedAt),
+      command,
+      album_changed: true,
+      expected_revision: expectedRevision,
+      previous_revision: Number(saved.previous_revision),
+      revision: Number(saved.revision),
+      page_number: patchResult.patch.page_number,
+      page_count: Number(saved.page_count),
+      changed_key: patchResult.patch.changed_key,
+      source_range: patchResult.patch.source_range,
+      replacement_range: patchResult.patch.replacement_range,
+      preview_url: String(saved.preview_url ?? `/preview/${input.projectId}`),
+    };
+  });
+}
+
+function sessionCurrentPageNumber(session: AlbumAgentSessionRecord): number | null {
+  const index = session.viewState?.activePageIndex;
+  return Number.isSafeInteger(index) && Number(index) >= 0 ? Number(index) + 1 : null;
+}
+
+function simpleAlbumCommandStrategy(command: SimpleAlbumCommand): SimpleAlbumHtmlPatchStrategy {
+  return command.type === 'replace_text'
+    ? 'replace_text_node_source'
+    : 'wrap_text_node_with_color_span';
+}
+
+function deterministicNotHandled(
+  startedAt: number,
+  reason: SimpleAlbumCommandNotHandledReason | string,
+  strategy: SimpleAlbumHtmlPatchStrategy | null = null,
+): TryExecuteSimpleAlbumCommandResult {
+  return {
+    status: 'not_handled',
+    executor: 'deterministic',
+    strategy,
+    duration_ms: elapsedMilliseconds(startedAt),
+    reason,
+    album_changed: false,
+  };
+}
+
+function elapsedMilliseconds(startedAt: number): number {
+  return Math.round((performance.now() - startedAt) * 1000) / 1000;
 }
 
 function normalizeAlbumGenerationInput(input: GenerateAlbumToolInput): GenerateAlbumToolInput {
@@ -4705,7 +5150,10 @@ function updateSessionAfterAlbumUpdate(
   };
 }
 
-async function persistAlbumUpdate(args: ExecuteAlbumUpdateToolArgs & {
+async function persistAlbumUpdate(args: (ExecuteAlbumUpdateToolArgs | {
+  ctx: CliContext;
+  projectId: string;
+}) & {
   currentHtml: string;
   modifiedHtml: string;
   expectedRevision: number;
@@ -5530,6 +5978,16 @@ export function patchAlbumHtmlForSimpleRequest(
   const layoutIntent = parseAlbumLayoutPatchIntent(args.userText);
   if (layoutIntent) return patchAlbumHtmlLayout(html, pages, pageIndex, layoutIntent);
 
+  const exactTextReplacements = parseAlbumExactTextReplacements(args.userText);
+  if (exactTextReplacements.length > 0) {
+    return patchAlbumHtmlExactTextReplacements(
+      html,
+      pages,
+      pageIndex,
+      exactTextReplacements,
+    );
+  }
+
   const textIntent = parseAlbumTextPatchIntent(args.userText);
   if (textIntent) return patchAlbumHtmlText(html, pages, pageIndex, textIntent);
 
@@ -5812,6 +6270,11 @@ interface AlbumTextPatchIntent {
   value: string;
 }
 
+interface AlbumExactTextReplacement {
+  oldValue: string;
+  newValue: string;
+}
+
 interface AlbumCtaPatchIntent {
   label: string;
   href?: string;
@@ -5838,6 +6301,87 @@ function parseAlbumTextPatchIntent(text: string): AlbumTextPatchIntent | null {
     return { fieldHint: hinted[1], value: cleanupPatchValue(hinted[2]) };
   }
   return null;
+}
+
+function parseAlbumExactTextReplacements(text: string): AlbumExactTextReplacement[] {
+  const raw = String(text || '').trim();
+  if (!raw) return [];
+  const replacements: AlbumExactTextReplacement[] = [];
+  const pattern = /["'“‘]([^"'”’\n]{1,120})["'”’]\s*(?:改成|改为|改為|替换为|替換為|换成|換成|replace(?:d)?\s+with)\s*["'“‘]([^"'”’\n]{1,120})["'”’]/giu;
+  for (const match of raw.matchAll(pattern)) {
+    const oldValue = cleanupPatchValue(match[1] || '');
+    const newValue = cleanupPatchValue(match[2] || '');
+    if (!oldValue || !newValue || oldValue === newValue) return [];
+    replacements.push({ oldValue, newValue });
+    if (replacements.length >= 12) break;
+  }
+  return replacements;
+}
+
+function patchAlbumHtmlExactTextReplacements(
+  html: string,
+  pages: AlbumHtmlElementRange[],
+  pageIndex: number,
+  replacements: AlbumExactTextReplacement[],
+): AlbumStructuredPatchResult | null {
+  const page = pages[pageIndex]!;
+  const candidates = findElementRangesByOpeningTag(
+    html,
+    /<([a-z][\w:-]*)(?=[\s>])(?=[^>]*\bdata-hv-text\s*=)[^>]*>/gi,
+  ).filter((range) => range.openStart >= page.openEnd && range.closeEnd <= page.closeStart);
+  if (!candidates.length) return null;
+
+  const selected: Array<{
+    target: AlbumHtmlElementRange;
+    replacement: AlbumExactTextReplacement;
+  }> = [];
+  const usedStarts = new Set<number>();
+  for (const replacement of replacements) {
+    const readable = candidates.map((range) => ({
+      range,
+      value: albumEditablePlainText(html, range),
+    })).filter((entry) => entry.value !== null && !usedStarts.has(entry.range.openStart));
+    let matches = readable.filter((entry) => entry.value === replacement.oldValue);
+    if (matches.length === 0) {
+      const folded = replacement.oldValue.toLocaleLowerCase();
+      matches = readable.filter((entry) => entry.value?.toLocaleLowerCase() === folded);
+    }
+    // Never guess when the old value occurs in multiple editable fields.
+    if (matches.length !== 1) return null;
+    const target = matches[0]!.range;
+    usedStarts.add(target.openStart);
+    selected.push({ target, replacement });
+  }
+
+  let patched = html;
+  for (const { target, replacement } of selected.sort((a, b) => b.target.openStart - a.target.openStart)) {
+    patched = `${patched.slice(0, target.openEnd)}${escapeHtmlText(replacement.newValue)}${patched.slice(target.closeStart)}`;
+  }
+  const keys = selected.map(({ target }) =>
+    getAttrValue(html.slice(target.openStart, target.openEnd), 'data-hv-text') || 'field');
+  return {
+    html: patched,
+    action: 'text',
+    pageIndex,
+    pageCount: pages.length,
+    key: keys[0],
+    summary: `updated ${keys.length} exact text field${keys.length === 1 ? '' : 's'} on page ${pageIndex + 1}`,
+  };
+}
+
+function albumEditablePlainText(html: string, range: AlbumHtmlElementRange): string | null {
+  const inner = html.slice(range.openEnd, range.closeStart);
+  if (/<\/?[a-z][^>]*>/i.test(inner)) return null;
+  return inner
+    .replace(/&#(\d+);/g, (_match, code: string) => String.fromCodePoint(Number(code)))
+    .replace(/&#x([0-9a-f]+);/gi, (_match, code: string) => String.fromCodePoint(Number.parseInt(code, 16)))
+    .replace(/&nbsp;/gi, '\u00a0')
+    .replace(/&quot;/gi, '"')
+    .replace(/&apos;/gi, "'")
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>')
+    .replace(/&amp;/gi, '&')
+    .trim();
 }
 
 function parseAlbumCtaPatchIntent(text: string): AlbumCtaPatchIntent | null {

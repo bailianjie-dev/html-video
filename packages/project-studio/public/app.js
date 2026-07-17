@@ -4,7 +4,9 @@ import { t, getLocale, setLocale, AVAILABLE_LOCALES } from './i18n.js';
 import {
   buildAgentViewStateSnapshot,
   createAgentRunUiState,
+  isAgentRunExecutionActive,
   preserveActivePageIndex,
+  reconcileRestoredAgentRunUi,
   reduceAgentRunUiEvent,
   restoreAgentRunUiState,
   serializeAgentRunUiState,
@@ -17,6 +19,10 @@ import {
   selectedAgentSessionStorageKey,
   sessionDisplayTitle,
 } from './agent-session-ui.js';
+import {
+  readEditableTextValue,
+  writeEditableTextValue,
+} from './editable-text.js';
 
 // Re-render whole UI on language change.
 document.addEventListener('hv-locale-change', () => {
@@ -1013,17 +1019,16 @@ async function loadAgentSession(projectId, session, options = {}) {
   applyAgentSessionViewState(viewStateResult);
 
   let restoredRunMessageIndex = -1;
-  let restoredRun = restoredAgentRunUi(projectId, sessionId, options.allowLegacyRun === true);
-  if (restoredRun?.sessionId && restoredRun.sessionId !== sessionId) restoredRun = null;
-  if (restoredRun?.status !== 'running' && session.active_run?.run_id) {
-    restoredRun = {
-      ...createAgentRunUiState({ runId: session.active_run.run_id, sessionId }),
-      status: 'running',
-      statusText: '正在恢复 Agent 运行状态',
-    };
+  const locallyRestoredRun = restoredAgentRunUi(projectId, sessionId, options.allowLegacyRun === true);
+  const restoredRun = reconcileRestoredAgentRunUi(
+    locallyRestoredRun,
+    session.active_run,
+    sessionId,
+  );
+  if (locallyRestoredRun?.status === 'running' && !restoredRun) {
+    clearPersistedAgentRunUi(projectId, sessionId);
   }
   if (restoredRun?.status === 'running') {
-    if (!restoredRun.sessionId) restoredRun.sessionId = sessionId;
     state.agentRunUi = restoredRun;
     state.messages.push({ role: 'agent-run', runState: restoredRun, ts: Date.now(), recovered: true });
     restoredRunMessageIndex = state.messages.length - 1;
@@ -1551,7 +1556,7 @@ function makeAlbumProjectName(raw) {
 function projectUserStatus(project) {
   if (!project) return '';
   if (state.selectedId === project.id && state.exporting) return '正在导出';
-  if (state.selectedId === project.id && shouldShowGenerationLoading(project)) return '正在生成';
+  if (state.selectedId === project.id && isCurrentAgentRunActive(project)) return '正在生成';
   if (hasProjectPreview(project)) return '已生成，可预览和调整';
   if (project.status === 'rendered' || project.status === 'previewed') return '生成中断，可重新生成';
   if (project.status === 'draft') return '准备生成';
@@ -1568,15 +1573,22 @@ function hasProjectPreview(project) {
   );
 }
 
+/** Current Session execution state, independent from whether an older preview exists. */
+function isCurrentAgentRunActive(project = state.selected) {
+  if (!project || project.id !== state.selectedId) return false;
+  return isAgentRunExecutionActive({
+    runStatus: state.agentRunUi?.status,
+    composing: state.composing,
+    expectingInitialGeneration: state.expectingInitialGeneration,
+    backendGenerating: state.backendGenerating,
+    hasProgressTimer: !!state.generationProgressTimer,
+  });
+}
+
 /** Preview shell should show loading — not the regenerate recover card. */
 function shouldShowGenerationLoading(project = state.selected) {
   if (!project || hasProjectPreview(project)) return false;
-  return !!(
-    state.composing
-    || state.expectingInitialGeneration
-    || state.backendGenerating
-    || state.generationProgressTimer
-  );
+  return isCurrentAgentRunActive(project);
 }
 
 function generationLoadingEmptyHtml(meta = state.generationMeta || {}) {
@@ -2270,14 +2282,15 @@ function renderGenerationPage() {
     ['展示设备', ratioText],
   ];
   const hasPreview = hasProjectPreview(state.selected);
-  const showGenerating = shouldShowGenerationLoading();
-  const needsRegenerate = !!state.selected && !hasPreview && !showGenerating;
-  const progressText = showGenerating
+  const runActive = isCurrentAgentRunActive();
+  const showLoadingPreview = shouldShowGenerationLoading();
+  const needsRegenerate = !!state.selected && !hasPreview && !showLoadingPreview;
+  const progressText = runActive
     ? (state.generationProgressText || '整理内容 → 规划页面 → 生成文案 → 生成预览')
     : hasPreview
       ? '已生成，可预览和调整'
       : '尚未生成预览，请重新生成';
-  const footerText = showGenerating
+  const footerText = runActive
     ? `${meta.title || '电子相册'} · 正在生成`
     : hasPreview
       ? `${meta.title || '电子相册'} · 已生成，可预览和调整`
@@ -2969,8 +2982,8 @@ function updateGenerationControls() {
     } else if (state.selected) {
       const meta = projectGenerationMeta(state.selected) || {};
       const hasPreview = hasProjectPreview(state.selected);
-      const showGenerating = shouldShowGenerationLoading();
-      const line = showGenerating
+      const runActive = isCurrentAgentRunActive();
+      const line = runActive
         ? `${meta.title || state.selected.name || '电子相册'} · 正在生成`
         : hasPreview
           ? `${meta.title || state.selected.name || '电子相册'} · 已生成，可预览和调整`
@@ -2982,7 +2995,7 @@ function updateGenerationControls() {
   const progress = document.querySelector('.generation-progress b');
   if (progress) {
     // Keep assistant「执行进度」for generation — do not hijack it for export %.
-    if (shouldShowGenerationLoading()) {
+    if (isCurrentAgentRunActive()) {
       progress.textContent = state.generationProgressText || '整理内容 → 规划页面 → 生成文案 → 生成预览';
     } else if (hasProjectPreview(state.selected)) {
       progress.textContent = '已生成，可预览和调整';
@@ -4965,6 +4978,8 @@ const TOOL_DISPLAY_NAMES = {
   generate_album: '生成相册',
   update_album: '修改整本相册',
   update_album_page: '修改单页',
+  replace_album_text: '快速替换文字',
+  set_album_text_color: '快速修改文字颜色',
   replace_album_assets: '替换相册图片',
   confirm_album_action: '确认相册操作',
 };
@@ -4972,6 +4987,7 @@ const TOOL_DISPLAY_NAMES = {
 const TOOL_STATUS_VIEW = {
   running: { label: '执行中', icon: 'clock' },
   succeeded: { label: '已完成', icon: 'check' },
+  completed: { label: '已结束', icon: 'check' },
   confirmation_required: { label: '等待确认', icon: 'alert' },
   conflict: { label: '版本冲突', icon: 'alert' },
   validation_failed: { label: '校验失败', icon: 'alert' },
@@ -5042,7 +5058,6 @@ function renderAgentRunMessage(runState, { persisted = false } = {}) {
     : run.status === 'failed' || run.status === 'cancelled'
       ? 'alert'
       : 'clock';
-  const meta = [run.agent, run.model].filter(Boolean).join(' · ');
   return `<div class="msg agent-run ${esc(run.status || 'idle')}${persisted ? ' persisted' : ''}">
     <div class="agent-run-head">
       <span class="agent-run-icon">${navIcon(statusIcon)}</span>
@@ -5050,7 +5065,6 @@ function renderAgentRunMessage(runState, { persisted = false } = {}) {
       ${run.latestRevision !== null && run.latestRevision !== undefined ? `<span class="agent-run-revision">revision ${esc(run.latestRevision)}</span>` : ''}
       ${!persisted && run.status === 'running' && run.runId ? `<button type="button" class="agent-run-cancel" data-cancel-agent-run="${esc(run.runId)}">取消</button>` : ''}
     </div>
-    ${meta ? `<div class="agent-run-meta">${esc(meta)}</div>` : ''}
     ${run.tools?.length ? `<div class="agent-tools">${run.tools.map(renderAgentTool).join('')}</div>` : '<div class="agent-run-thinking">正在分析请求并选择下一步</div>'}
     ${run.error?.message ? `<div class="agent-run-error"><b>${esc(run.error.code || 'RUN_ERROR')}</b><span>${esc(run.error.message)}</span></div>` : ''}
   </div>`;
@@ -5873,13 +5887,26 @@ async function collapsePageTextEdit() {
 
 async function startAlbumPageTextEdit(pageIndex) {
   if (!state.selected || !isElectronicAlbumProject()) return;
-  if (typeof pageIndex === 'number' && !Number.isNaN(pageIndex)) {
-    state.activeAlbumPage = Math.max(0, Math.min((state.albumPageCount || 1) - 1, pageIndex));
-    queueAgentViewStateSync();
-    updateAlbumPageTabActive();
-    scrollPreviewToAlbumPage(state.activeAlbumPage, 'auto', { mode: 'browse' });
-  }
+  // Save any in-progress edits for the previous page before switching.
   await flushTextEditsIfNeeded();
+
+  let target;
+  if (typeof pageIndex === 'number' && !Number.isNaN(pageIndex)) {
+    target = pageIndex;
+  } else {
+    // Centre preview may have moved via album-native wheel/dots while studio
+    // state still pointed at page 0 — resolve from the live iframe.
+    const visible = resolveVisibleAlbumPageIndex();
+    target = visible == null ? state.activeAlbumPage : visible;
+  }
+  const liveCount = getAlbumPagesFromIframe(document.getElementById('preview-iframe')).length;
+  const pageCount = Math.max(Number(state.albumPageCount) || 1, liveCount || 1);
+  if (liveCount > 0) state.albumPageCount = liveCount;
+  state.activeAlbumPage = Math.max(0, Math.min(pageCount - 1, Number(target) || 0));
+  queueAgentViewStateSync();
+  updateAlbumPageTabActive();
+  scrollPreviewToAlbumPage(state.activeAlbumPage, 'auto', { mode: 'browse' });
+
   state.albumPageTextEditActive = true;
   if (document.querySelector('.generation-side-dock')) {
     setGenerationSideTab('edit', { expand: true });
@@ -5957,10 +5984,63 @@ function syncAlbumPagesFromPreview(iframe, { refreshStrip = true } = {}) {
   // refreshStrip reserved for callers that used to force a remount; ignored now
   // so device-shell switches (refreshStrip=false) and text edits stay quiet.
   void refreshStrip;
+  // Prefer the page the preview is actually showing (album scripts often use
+  // .active / scroll without updating studio state yet).
+  const visible = resolveVisibleAlbumPageIndex(iframe);
+  if (visible != null && visible !== state.activeAlbumPage && !state.albumPageTextEditActive) {
+    state.activeAlbumPage = visible;
+  }
   updateAlbumPageEditControls();
   scrollPreviewToAlbumPage(state.activeAlbumPage, 'auto', { mode: 'browse' });
   wireAlbumPageScrollSync(iframe);
   wireAlbumPreviewWheelNav(iframe);
+}
+
+/**
+ * Resolve which album page the centre preview is actually showing.
+ * Album HTML often advances pages via its own wheel/dots JS (toggling
+ * .album-page.active) without studio state keeping up — so "本页编辑"
+ * must read the live iframe, not trust a stale activeAlbumPage.
+ */
+function resolveVisibleAlbumPageIndex(iframe = document.getElementById('preview-iframe')) {
+  try {
+    const doc = iframe?.contentDocument;
+    if (!doc) return null;
+    const pages = findAlbumPageElements(doc);
+    if (!pages.length) return null;
+
+    const hardCut = pages.findIndex((page) => page.classList.contains('hv-preview-page-active'));
+    if (hardCut >= 0) return hardCut;
+
+    const marked = [];
+    pages.forEach((page, index) => {
+      if (page.classList.contains('active')) marked.push(index);
+    });
+    if (marked.length === 1) return marked[0];
+
+    const album = doc.getElementById('album')
+      || doc.querySelector('.album, [data-album], .scroll-container, .story-container, .album-container, .pages')
+      || doc.scrollingElement;
+    if (!album) return marked[0] ?? null;
+
+    const albumRect = album.getBoundingClientRect();
+    let bestIndex = 0;
+    let bestDistance = Infinity;
+    pages.forEach((page, index) => {
+      const rect = page.getBoundingClientRect();
+      const distance = Math.min(
+        Math.abs(rect.top - albumRect.top),
+        Math.abs(rect.left - albumRect.left),
+      );
+      if (distance < bestDistance) {
+        bestDistance = distance;
+        bestIndex = index;
+      }
+    });
+    return bestIndex;
+  } catch {
+    return null;
+  }
 }
 
 /** Update left-rail page titles without remounting thumb iframes. */
@@ -5990,46 +6070,87 @@ function wireAlbumPageScrollSync(iframe) {
   try {
     const doc = iframe?.contentDocument;
     if (!doc) return;
+
+    // Always rebind cleanly — remount/rewire used to stack duplicate scroll listeners.
+    const prevCleanup = doc.__hvAlbumPageSyncCleanup;
+    if (typeof prevCleanup === 'function') {
+      try { prevCleanup(); } catch { /* ignore */ }
+      doc.__hvAlbumPageSyncCleanup = null;
+    }
+
     const album = doc.getElementById('album')
       || doc.querySelector('.album, [data-album], .scroll-container, .story-container, .album-container, .pages')
       || doc.scrollingElement;
     const pages = getAlbumPagesFromIframe(iframe);
-    if (!album || pages.length === 0 || album.dataset.hvStudioPageSync === '1') return;
-    album.dataset.hvStudioPageSync = '1';
+    if (!album || pages.length === 0) return;
+
+    const abort = new AbortController();
+    const { signal } = abort;
     let ticking = false;
-    const update = () => {
+    let editCollapseTimer = null;
+
+    const applyFromPreview = () => {
       ticking = false;
-      // Hard-cut focus mode: rail owns the page — don't fight it via scroll sync.
+      // Hard-cut: left rail owns the page; don't fight display:none paging.
       if (doc.documentElement.classList.contains('hv-album-preview-focus')) return;
-      const albumRect = album.getBoundingClientRect();
-      let bestIndex = 0;
-      let bestDistance = Infinity;
-      pages.forEach((page, index) => {
-        const rect = page.getBoundingClientRect();
-        const distance = Math.min(
-          Math.abs(rect.top - albumRect.top),
-          Math.abs(rect.left - albumRect.left),
-        );
-        if (distance < bestDistance) {
-          bestDistance = distance;
-          bestIndex = index;
-        }
-      });
-      if (bestIndex !== state.activeAlbumPage) {
-        const wasEditing = state.albumPageTextEditActive;
-        state.activeAlbumPage = bestIndex;
-        queueAgentViewStateSync();
-        updateAlbumPageTabActive();
-        // 滑动换页视为浏览，不继续改字 → 自动收起编辑栏
-        if (wasEditing) collapsePageTextEdit();
-        else updateAlbumPageEditControls();
+      const bestIndex = resolveVisibleAlbumPageIndex(iframe);
+      if (bestIndex == null || bestIndex === state.activeAlbumPage) return;
+      const wasEditing = state.albumPageTextEditActive;
+      state.activeAlbumPage = bestIndex;
+      queueAgentViewStateSync();
+      updateAlbumPageTabActive();
+      // Debounce edit-collapse so smooth scroll / class thrash doesn't flicker the dock.
+      if (wasEditing) {
+        clearTimeout(editCollapseTimer);
+        editCollapseTimer = setTimeout(() => {
+          if (state.albumPageTextEditActive) collapsePageTextEdit();
+        }, 120);
+      } else {
+        updateAlbumPageEditControls();
       }
     };
-    album.addEventListener('scroll', () => {
+
+    const schedule = () => {
       if (ticking) return;
       ticking = true;
-      requestAnimationFrame(update);
-    }, { passive: true });
+      requestAnimationFrame(applyFromPreview);
+    };
+
+    // Native album scripts (wheel/dots) often toggle .album-page.active and use
+    // scrollIntoView — scroll events alone are unreliable under transform:scale.
+    album.addEventListener('scroll', schedule, { passive: true, signal });
+    doc.addEventListener('scroll', schedule, { passive: true, capture: true, signal });
+    album.addEventListener('wheel', () => {
+      schedule();
+      // Smooth scrollIntoView finishes after the wheel handler returns.
+      setTimeout(schedule, 120);
+      setTimeout(schedule, 420);
+    }, { passive: true, signal });
+    album.addEventListener('touchend', () => {
+      setTimeout(schedule, 80);
+      setTimeout(schedule, 360);
+    }, { passive: true, signal });
+
+    doc.querySelectorAll('.page-dots .dot, [data-dot]').forEach((dot) => {
+      dot.addEventListener('click', () => {
+        setTimeout(schedule, 80);
+        setTimeout(schedule, 360);
+      }, { signal });
+    });
+
+    const mo = new MutationObserver(schedule);
+    pages.forEach((page) => {
+      mo.observe(page, { attributes: true, attributeFilter: ['class'] });
+    });
+
+    doc.__hvAlbumPageSyncCleanup = () => {
+      clearTimeout(editCollapseTimer);
+      abort.abort();
+      mo.disconnect();
+    };
+
+    // Catch up immediately in case the album already moved before wiring.
+    schedule();
   } catch {}
 }
 
@@ -6131,16 +6252,7 @@ function scrollPreviewToAlbumPage(index, behavior = 'smooth', opts = {}) {
 
 /** Reset scroll-sync after DOM page order changes (reorder / duplicate / delete). */
 function rewireAlbumPageScrollSync(iframe) {
-  const frame = iframe || document.getElementById('preview-iframe');
-  try {
-    const doc = frame?.contentDocument;
-    if (!doc) return;
-    const album = doc.getElementById('album')
-      || doc.querySelector('.album, [data-album], .scroll-container, .story-container, .album-container, .pages')
-      || doc.scrollingElement;
-    if (album?.dataset) delete album.dataset.hvStudioPageSync;
-  } catch { /* ignore */ }
-  wireAlbumPageScrollSync(frame);
+  wireAlbumPageScrollSync(iframe || document.getElementById('preview-iframe'));
 }
 
 /** Hard-cut centre preview to one album page (reliable when scroll snap fails). */
@@ -6645,28 +6757,42 @@ function reloadPreview() {
   renderPreview();
 }
 
-async function refreshAfterPreviewReady({ frameCount = 0, focusedFrame = '' } = {}) {
-  if (!state.selected) return;
-  const projectId = state.selected.id;
+async function refreshAfterPreviewReady({
+  frameCount = 0,
+  focusedFrame = '',
+  projectId = state.selected?.id || '',
+  sessionId = state.activeAgentSessionId,
+} = {}) {
+  if (!projectId || !sessionId || !isActiveAgentSessionContext(projectId, sessionId)) return false;
   const keepAlbumPage = Math.max(0, Number(state.activeAlbumPage) || 0);
   const keepAlbumEditing = !!state.albumPageTextEditActive;
 
   if (frameCount > 0) state.activeFrameId = null;
   if (focusedFrame) state.activeFrameId = focusedFrame;
-  const pr = await API.getProject(projectId);
-  state.selected = pr.project;
+  // The preview route is already authoritative when preview.ready is emitted.
+  // A transient project-metadata refresh failure must not abort SSE handling or
+  // prevent the iframe from being cache-busted and rebuilt.
+  try {
+    const pr = await API.getProject(projectId);
+    if (!isActiveAgentSessionContext(projectId, sessionId)) return false;
+    if (pr?.project) state.selected = pr.project;
+  } catch { /* keep the selected project and still reload /preview below */ }
+  if (!isActiveAgentSessionContext(projectId, sessionId)) return false;
 
   if (frameCount > 0) {
     try {
-      const cg = await API.contentGraph(state.selected.id);
+      const cg = await API.contentGraph(projectId);
+      if (!isActiveAgentSessionContext(projectId, sessionId)) return false;
       ingestContentGraphNodes(cg?.graph?.nodes);
     } catch { /* no graph - single-frame/album, fine */ }
-    await enrichFrameLabelsFromHtml(state.selected.id);
+    await enrichFrameLabelsFromHtml(projectId);
+    if (!isActiveAgentSessionContext(projectId, sessionId)) return false;
   }
 
   markPreviewRevision();
   renderPreview();
-  await refreshTextFields();
+  try { await refreshTextFields(); } catch { /* preview convergence is more important than editor metadata */ }
+  if (!isActiveAgentSessionContext(projectId, sessionId)) return false;
 
   if (isElectronicAlbumProject()) {
     state.activeAlbumPage = preserveActivePageIndex(keepAlbumPage, state.albumPageCount);
@@ -6683,6 +6809,7 @@ async function refreshAfterPreviewReady({ frameCount = 0, focusedFrame = '' } = 
   renderToolbar();
   renderFooter();
   updateGenerationControls();
+  return true;
 }
 
 // ============== v0.8: frames timeline + graph modal ==============
@@ -7562,9 +7689,8 @@ async function refreshTextFields() {
   if (isAlbum && state.albumPageTextEditActive) {
     const idx = Math.max(0, Math.min(albumPages.length - 1, state.activeAlbumPage || 0));
     scanRoot = albumPages[idx] || doc;
-    const pageHasEditableFields = scanRoot.querySelector('[data-hv-text], [data-hv-image], [data-hv-cta]');
-    const docHasEditableFields = doc.querySelector('[data-hv-text], [data-hv-image], [data-hv-cta]');
-    if (!pageHasEditableFields && docHasEditableFields) scanRoot = doc;
+    // Do not fall back to the whole document — that dumps every page's fields
+    // under "第 N 页" and looks like the editor jumped back to page 1.
   }
 
   const nodes = scanRoot.querySelectorAll('[data-hv-text]');
@@ -7574,7 +7700,8 @@ async function refreshTextFields() {
     const key = el.getAttribute('data-hv-text');
     if (!key || seen.has(key)) continue;
     seen.add(key);
-    const text = el.textContent ?? '';
+    // Keep <br> as \n so multi-line titles stay editable as two lines.
+    const text = readEditableTextValue(el);
     fields.push({ key, original: text, current: text });
   }
   state.textFields = fields;
@@ -7756,7 +7883,9 @@ function getAlbumThumbDocument(pageIndex) {
 function applyTextFieldToPreview(key, value) {
   if (!key) return;
   forEachLiveEditDocs((doc) => {
-    findPreviewTextNodes(doc, key).forEach((n) => { n.textContent = value ?? ''; });
+    findPreviewTextNodes(doc, key).forEach((n) => {
+      writeEditableTextValue(n, value ?? '');
+    });
   });
   refreshActiveAlbumPageTopicFromLive();
 }
@@ -8546,7 +8675,7 @@ async function commitTextEdits() {
   const doc = new DOMParser().parseFromString(html, 'text/html');
   for (const f of state.textFields) {
     const nodes = doc.querySelectorAll(`[data-hv-text="${cssEscape(f.key)}"]`);
-    nodes.forEach((n) => { n.textContent = f.current; });
+    nodes.forEach((n) => { writeEditableTextValue(n, f.current); });
     f.original = f.current;
   }
   for (const f of state.imageFields) {
@@ -8827,6 +8956,11 @@ function persistAgentRunUi(projectId, sessionId, runState) {
   try { localStorage.setItem(agentRunStorageKey(projectId, sessionId), serialized); } catch { /* storage is best effort */ }
 }
 
+function clearPersistedAgentRunUi(projectId, sessionId) {
+  if (!projectId || !sessionId) return;
+  try { localStorage.removeItem(agentRunStorageKey(projectId, sessionId)); } catch { /* storage is best effort */ }
+}
+
 function restoredAgentRunUi(projectId, sessionId, allowLegacy = false) {
   if (!projectId || !sessionId) return null;
   try {
@@ -8890,7 +9024,10 @@ async function applyAgentRunEvent(event, context) {
     if (effect.type === 'preview_ready' && isActiveAgentSessionContext(context.projectId, context.sessionId)) {
       const preview = effect.preview || {};
       setGenerationProgress('预览已生成，正在刷新页面和缩略图…', context.runMessageIndex);
-      await refreshAfterPreviewReady();
+      await refreshAfterPreviewReady({
+        projectId: context.projectId,
+        sessionId: context.sessionId,
+      });
       queueAgentViewStateSync();
     } else if (effect.type === 'terminal' && isActiveAgentSessionContext(context.projectId, context.sessionId)) {
       stopGenerationProgressTicker(
@@ -8940,6 +9077,7 @@ async function cancelActiveAgentRun(runId, button) {
   const runMessage = state.messages.find(
     (message) => message.role === 'agent-run' && message.runState?.runId === runId,
   );
+  const runMessageIndex = state.messages.indexOf(runMessage);
   if (!projectId || !sessionId || !runId || !runMessage || runMessage.runState.status !== 'running') return;
   if (button) button.disabled = true;
   runMessage.runState = { ...runMessage.runState, statusText: '正在取消 Agent…' };
@@ -8949,6 +9087,16 @@ async function cancelActiveAgentRun(runId, button) {
   try {
     const response = await API.cancelAgentRun(projectId, sessionId, runId);
     if (!response.ok) throw new Error(response.error || `取消失败 (${response.status})`);
+    // The live POST stream may have disconnected or may miss the terminal
+    // event in a DELETE race. Resume from the current cursor so the replayable
+    // Session SSE stream always settles the card and its running tools.
+    if (
+      runMessageIndex >= 0
+      && isActiveAgentSessionContext(projectId, sessionId)
+      && state.messages[runMessageIndex]?.runState?.status === 'running'
+    ) {
+      void resumeAgentRun(projectId, sessionId, runMessageIndex);
+    }
   } catch (error) {
     if (isActiveAgentSessionContext(projectId, sessionId)) {
       runMessage.runState = { ...runMessage.runState, statusText: '取消失败，Agent 仍在运行' };

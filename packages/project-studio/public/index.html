@@ -3338,13 +3338,6 @@
   }
   .agent-run-cancel { margin-left: auto; flex: 0 0 auto; }
   .agent-run-revision + .agent-run-cancel { margin-left: 0; }
-  .agent-run-meta {
-    margin: 3px 0 0 22px;
-    color: var(--text-faint);
-    font-family: var(--font-mono);
-    font-size: 10px;
-    overflow-wrap: anywhere;
-  }
   .agent-run-thinking { margin: 7px 0 0 22px; color: var(--text-muted); }
   .agent-tools { display: grid; gap: 7px; margin-top: 8px; }
   .agent-tool {
@@ -3355,7 +3348,8 @@
     background: var(--bg-subtle);
   }
   .agent-tool.running { border-color: #93c5fd; background: #f5f9ff; }
-  .agent-tool.succeeded { border-color: #bbdfc5; background: #f5fbf6; }
+  .agent-tool.succeeded,
+  .agent-tool.completed { border-color: #bbdfc5; background: #f5fbf6; }
   .agent-tool.confirmation_required { border-color: #e5c56c; background: #fffbeb; }
   .agent-tool.conflict,
   .agent-tool.validation_failed,
@@ -4389,6 +4383,6 @@
   </div>
 </div>
 
-<script type="module" src="/app.js?v=phase6-agent-status"></script>
+<script type="module" src="/app.js?v=hide-agent-model-meta"></script>
 </body>
 </html>

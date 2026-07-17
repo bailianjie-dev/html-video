@@ -9,6 +9,7 @@ export {
   resolvePiAgentConfig,
   parsePositiveIntEnv,
   DEFAULT_PI_MAX_TOKENS,
+  waitForPiPromptOrAbort,
 } from './defs/pi-agent.js';
 export type { PiAgentResolvedConfig } from './defs/pi-agent.js';
 export { AgentRunEventLog, runAgentTurn } from './agent-run.js';

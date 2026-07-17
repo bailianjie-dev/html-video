@@ -80,6 +80,36 @@ export function resolvePiAgentConfig(modelOverride?: string): PiAgentResolvedCon
   return { apiKey, baseUrl, model, maxTokens };
 }
 
+/**
+ * Treat completion of session.abort() as authoritative cancellation. Some
+ * SDK/provider combinations leave the original prompt promise pending after
+ * abort, which otherwise prevents the Run from ever emitting run.cancelled.
+ */
+export async function waitForPiPromptOrAbort(
+  promptPromise: Promise<unknown>,
+  abortSession: () => Promise<unknown>,
+  signal: AbortSignal,
+): Promise<'completed' | 'aborted'> {
+  let abortStarted = false;
+  let resolveAborted!: () => void;
+  const aborted = new Promise<void>((resolve) => { resolveAborted = resolve; });
+  const onAbort = () => {
+    if (abortStarted) return;
+    abortStarted = true;
+    void abortSession().catch(() => { /* abort is best effort */ }).finally(resolveAborted);
+  };
+  if (signal.aborted) onAbort();
+  else signal.addEventListener('abort', onAbort, { once: true });
+  try {
+    return await Promise.race([
+      promptPromise.then(() => 'completed' as const),
+      aborted.then(() => 'aborted' as const),
+    ]);
+  } finally {
+    signal.removeEventListener('abort', onAbort);
+  }
+}
+
 function buildDashScopeModel(
   baseUrl: string,
   modelId: string,
@@ -190,15 +220,13 @@ async function runPiSdkSession(opts: {
     }
   });
 
-  const onAbort = () => {
-    void session.abort().catch(() => { /* ignore */ });
-  };
-  if (signal.aborted) onAbort();
-  else signal.addEventListener('abort', onAbort, { once: true });
-
   try {
-    await session.prompt(prompt);
-    return { exitCode: failed || signal.aborted ? -1 : 0 };
+    const outcome = await waitForPiPromptOrAbort(
+      session.prompt(prompt),
+      () => session.abort(),
+      signal,
+    );
+    return { exitCode: failed || outcome === 'aborted' || signal.aborted ? -1 : 0 };
   } catch (err) {
     if (!signal.aborted) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -206,7 +234,6 @@ async function runPiSdkSession(opts: {
     }
     return { exitCode: -1 };
   } finally {
-    signal.removeEventListener('abort', onAbort);
     unsubscribe();
     session.dispose();
   }

@@ -21,12 +21,12 @@ import {
 } from '../dist/config-files.js';
 import { parseAgentTomlSection } from '../dist/load-env.js';
 
-test('loads legacy single-admin auth.toml under .html-video', () => {
+test('loads single-admin auth from config/config.toml', () => {
   const root = mkdtempSync(join(tmpdir(), 'html-video-auth-'));
   try {
-    mkdirSync(join(root, '.html-video'));
+    mkdirSync(join(root, 'config'));
     writeFileSync(
-      join(root, '.html-video', 'auth.toml'),
+      join(root, 'config', 'config.toml'),
       '[auth]\npassword = "a-secret#with-comment-char" # comment\n',
       'utf8',
     );
@@ -214,8 +214,8 @@ test('empty local file is ignored; base config is used', () => {
   }
 });
 
-test('legacy split database.toml still works when unified is absent', () => {
-  const root = mkdtempSync(join(tmpdir(), 'html-video-legacy-split-'));
+test('split config/database.toml still works when unified is absent', () => {
+  const root = mkdtempSync(join(tmpdir(), 'html-video-split-'));
   try {
     mkdirSync(join(root, 'config'));
     writeFileSync(
@@ -232,43 +232,16 @@ test('legacy split database.toml still works when unified is absent', () => {
     assert.equal(config?.host, 'split');
     assert.equal(config?.password, 'local');
     assert.equal(config?.enabled, true);
+    assert.match(config?.sourcePath.replace(/\\/g, '/') ?? '', /config\/database\.local\.toml$/);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
 });
 
-// Loading order: local → legacy → base. Legacy secrets still win until migrated.
-test('resolveTomlConfig prefers legacy over base-only config', () => {
-  const root = mkdtempSync(join(tmpdir(), 'html-video-legacy-'));
+test('split config/<name>.local.toml overrides base without unified file', () => {
+  const root = mkdtempSync(join(tmpdir(), 'html-video-split-override-'));
   try {
     mkdirSync(join(root, 'config'));
-    mkdirSync(join(root, '.html-video'));
-    writeFileSync(
-      join(root, 'config', 'database.toml'),
-      '[database]\nenabled = false\nhost = "base"\nname = "n"\nuser = "u"\npassword = "base"\n',
-      'utf8',
-    );
-    writeFileSync(
-      join(root, '.html-video', 'database.toml'),
-      '[database]\nenabled = true\nhost = "legacy"\nname = "n"\nuser = "u"\npassword = "legacy"\n',
-      'utf8',
-    );
-    const resolved = resolveTomlConfig(root, 'database');
-    assert.ok(resolved);
-    assert.match(resolved.sourcePath.replace(/\\/g, '/'), /\.html-video\/database\.toml$/);
-    const config = loadDatabaseConfig(root);
-    assert.equal(config?.host, 'legacy');
-    assert.equal(config?.enabled, true);
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
-});
-
-test('resolveTomlConfig local overrides legacy', () => {
-  const root = mkdtempSync(join(tmpdir(), 'html-video-local-first-'));
-  try {
-    mkdirSync(join(root, 'config'));
-    mkdirSync(join(root, '.html-video'));
     writeFileSync(
       join(root, 'config', 'database.toml'),
       '[database]\nenabled = false\nhost = "base"\nname = "n"\nuser = "u"\npassword = "base"\n',
@@ -279,15 +252,38 @@ test('resolveTomlConfig local overrides legacy', () => {
       '[database]\nenabled = true\nhost = "local"\npassword = "local"\n',
       'utf8',
     );
-    writeFileSync(
-      join(root, '.html-video', 'database.toml'),
-      '[database]\nenabled = true\nhost = "legacy"\nname = "n"\nuser = "u"\npassword = "legacy"\n',
-      'utf8',
-    );
+    const resolved = resolveTomlConfig(root, 'database');
+    assert.ok(resolved);
+    assert.match(resolved.sourcePath.replace(/\\/g, '/'), /config\/database\.local\.toml$/);
     const config = loadDatabaseConfig(root);
     assert.equal(config?.host, 'local');
     assert.equal(config?.password, 'local');
     assert.equal(config?.name, 'n');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('ignores obsolete .html-video/*.toml when config/ is present', () => {
+  const root = mkdtempSync(join(tmpdir(), 'html-video-ignore-old-'));
+  try {
+    mkdirSync(join(root, 'config'));
+    mkdirSync(join(root, '.html-video'));
+    writeFileSync(
+      join(root, 'config', 'config.toml'),
+      '[database]\nenabled = false\nhost = "config-dir"\nname = "n"\nuser = "u"\npassword = "from-config"\n',
+      'utf8',
+    );
+    writeFileSync(
+      join(root, '.html-video', 'database.toml'),
+      '[database]\nenabled = true\nhost = "old-html-video"\nname = "n"\nuser = "u"\npassword = "old"\n',
+      'utf8',
+    );
+    const config = loadDatabaseConfig(root);
+    assert.equal(config?.host, 'config-dir');
+    assert.equal(config?.password, 'from-config');
+    assert.equal(config?.enabled, false);
+    assert.match(config?.sourcePath.replace(/\\/g, '/') ?? '', /config\/config\.toml$/);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

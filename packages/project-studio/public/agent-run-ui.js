@@ -53,6 +53,10 @@ export function summarizeToolArguments(name, input) {
   };
 
   add('页码', finiteNumber(args.page_number));
+  add('原文字', shortText(args.old_text, 48));
+  add('新文字', shortText(args.new_text, 48));
+  add('文字', shortText(args.target_text, 48));
+  add('颜色', shortText(args.color, 32));
   add('目标', shortText(args.target_key, 48));
   add('资源', compactIdentifier(args.asset_id));
   add('预期版本', finiteNumber(args.expected_revision));
@@ -170,12 +174,51 @@ export function createAgentRunUiState({ runId = '', sessionId = '' } = {}) {
   };
 }
 
+export function isAgentRunExecutionActive({
+  runStatus = '',
+  composing = false,
+  expectingInitialGeneration = false,
+  backendGenerating = false,
+  hasProgressTimer = false,
+} = {}) {
+  return !!(
+    runStatus === 'running'
+    || composing
+    || expectingInitialGeneration
+    || backendGenerating
+    || hasProgressTimer
+  );
+}
+
 function mergeTool(tools, callId, patch) {
   const id = String(callId || `tool-${tools.length + 1}`);
   const index = tools.findIndex((tool) => tool.callId === id);
   if (index === -1)
     return [...tools, { callId: id, name: 'unknown_tool', argumentSummary: ['无参数'], ...patch }];
   return tools.map((tool, toolIndex) => (toolIndex === index ? { ...tool, ...patch } : tool));
+}
+
+function settleRunningTools(tools, status) {
+  return tools.map((tool) =>
+    tool.status === 'running' ? { ...tool, status } : tool,
+  );
+}
+
+function settleChangedAlbumTool(tools, callId, revision) {
+  const id = String(callId || '');
+  if (!id) return tools;
+  return tools.map((tool) => {
+    if (tool.callId !== id || tool.status !== 'running') return tool;
+    return {
+      ...tool,
+      status: 'succeeded',
+      result: tool.result || {
+        ok: true,
+        albumChanged: true,
+        revision,
+      },
+    };
+  });
 }
 
 export function reduceAgentRunUiEvent(previousState, event) {
@@ -199,7 +242,7 @@ export function reduceAgentRunUiEvent(previousState, event) {
     state = {
       ...state,
       status: 'running',
-      statusText: 'AI 助手正在思考',
+      statusText: data.executor === 'deterministic' ? '正在快速修改' : 'AI 助手正在思考',
       agent: shortText(data.agent, 48),
       model: shortText(data.model, 64),
       error: null,
@@ -255,6 +298,10 @@ export function reduceAgentRunUiEvent(previousState, event) {
     state = {
       ...state,
       statusText: '相册已保存，正在刷新预览',
+      // album.changed is authoritative proof that the matching write tool has
+      // finished. This also repairs a UI cursor gap if tool.call.completed was
+      // missed while the artifact and preview already advanced.
+      tools: settleChangedAlbumTool(state.tools, data.toolCallId, revision),
       latestRevision: revision ?? state.latestRevision,
     };
   } else if (event.type === 'preview.ready') {
@@ -281,13 +328,22 @@ export function reduceAgentRunUiEvent(previousState, event) {
   } else if (event.type === 'assistant.completed') {
     state = { ...state, statusText: '回复已完成' };
   } else if (event.type === 'run.completed') {
-    state = { ...state, status: 'completed', statusText: '本轮处理完成' };
+    state = {
+      ...state,
+      status: 'completed',
+      statusText: '本轮处理完成',
+      // A terminal Run cannot still have an executing tool. Normally every
+      // tool.call.completed event arrives first; this neutral fallback keeps a
+      // restored/local cursor gap from leaving the card stuck at “执行中”.
+      tools: settleRunningTools(state.tools, 'completed'),
+    };
     effects.push({ type: 'terminal', status: 'completed' });
   } else if (event.type === 'run.failed') {
     state = {
       ...state,
       status: 'failed',
       statusText: '本轮执行失败',
+      tools: settleRunningTools(state.tools, 'failed'),
       error: { code: shortText(data.code, 64), message: shortText(data.message, 180) },
     };
     effects.push({ type: 'terminal', status: 'failed' });
@@ -296,15 +352,37 @@ export function reduceAgentRunUiEvent(previousState, event) {
       ...state,
       status: 'cancelled',
       statusText: '本轮已取消',
-      tools: state.tools.map((tool) =>
-        tool.status === 'running' ? { ...tool, status: 'cancelled' } : tool,
-      ),
+      tools: settleRunningTools(state.tools, 'cancelled'),
       error: { code: 'RUN_CANCELLED', message: shortText(data.message, 180) },
     };
     effects.push({ type: 'terminal', status: 'cancelled' });
   }
 
   return { state, effects };
+}
+
+/**
+ * Server Session state is authoritative for whether a Run is still active.
+ * Local storage only contributes the event cursor when it refers to that same
+ * active Run; a stale locally-running card must not be resurrected after the
+ * server has already cleared active_run.
+ */
+export function reconcileRestoredAgentRunUi(restored, activeRun, sessionId) {
+  const activeRunId = String(activeRun?.run_id || activeRun?.runId || '');
+  if (!activeRunId) return null;
+  if (
+    restored?.version === 1
+    && restored.status === 'running'
+    && restored.runId === activeRunId
+    && (!restored.sessionId || restored.sessionId === sessionId)
+  ) {
+    return { ...restored, sessionId };
+  }
+  return {
+    ...createAgentRunUiState({ runId: activeRunId, sessionId }),
+    status: 'running',
+    statusText: '正在恢复 Agent 运行状态',
+  };
 }
 
 export function toolUiFromStoredMessage(message) {

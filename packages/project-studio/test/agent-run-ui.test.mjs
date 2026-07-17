@@ -4,11 +4,14 @@ import test from 'node:test';
 import {
   buildAgentViewStateSnapshot,
   createAgentRunUiState,
+  isAgentRunExecutionActive,
   preserveActivePageIndex,
+  reconcileRestoredAgentRunUi,
   reduceAgentRunUiEvent,
   restoreAgentRunUiState,
   serializeAgentRunUiState,
   summarizeToolArguments,
+  toolUiFromStoredMessage,
 } from '../public/agent-run-ui.js';
 
 function event(sequence, type, data = {}) {
@@ -157,12 +160,113 @@ test('cancels an active tool and ignores replayed event sequences', () => {
   assert.deepEqual(replay.effects, []);
 });
 
+test('terminal events settle tools when a local cursor missed tool completion', () => {
+  const completed = apply([
+    event(1, 'run.started'),
+    event(2, 'tool.call.started', { callId: 'c', name: 'generate_album', arguments: {} }),
+    event(3, 'run.completed'),
+  ]).state;
+  assert.equal(completed.status, 'completed');
+  assert.equal(completed.tools[0].status, 'completed');
+
+  const failed = apply([
+    event(1, 'run.started'),
+    event(2, 'tool.call.started', { callId: 'c', name: 'update_album_page', arguments: {} }),
+    event(3, 'run.failed', { code: 'MODEL_FAILED', message: 'failed' }),
+  ]).state;
+  assert.equal(failed.status, 'failed');
+  assert.equal(failed.tools[0].status, 'failed');
+});
+
+test('album.changed settles its write tool when the completion event was missed', () => {
+  const state = apply([
+    event(1, 'run.started'),
+    event(2, 'tool.call.started', {
+      callId: 'write-1',
+      name: 'update_album_page',
+      arguments: { page_number: 1, expected_revision: 1 },
+    }),
+    event(4, 'album.changed', {
+      toolCallId: 'write-1',
+      revision: 2,
+      pageCount: 3,
+    }),
+  ]).state;
+
+  assert.equal(state.tools[0].status, 'succeeded');
+  assert.equal(state.tools[0].result.albumChanged, true);
+  assert.equal(state.tools[0].result.revision, 2);
+});
+
+test('deterministic runs reuse the existing reducer with a fast-edit status', () => {
+  const started = reduceAgentRunUiEvent(
+    createAgentRunUiState({ runId: 'fast-run', sessionId: 'fast-session' }),
+    event(1, 'run.started', {
+      agent: 'fast-command-router',
+      model: null,
+      executor: 'deterministic',
+    }),
+  );
+  assert.equal(started.state.status, 'running');
+  assert.equal(started.state.statusText, '正在快速修改');
+});
+
+test('persisted deterministic tools restore as completed after a browser refresh', () => {
+  const tool = toolUiFromStoredMessage({
+    role: 'tool',
+    tool: 'set_album_text_color',
+    runId: 'fast-run',
+    sessionId: 'session-a',
+    output: {
+      details: {
+        ok: true,
+        album_changed: true,
+        executor: 'deterministic',
+        strategy: 'update_controlled_color_span',
+        revision: 3,
+        previous_revision: 2,
+        changed_pages: [2],
+      },
+    },
+  });
+  assert.equal(tool.name, 'set_album_text_color');
+  assert.equal(tool.status, 'succeeded');
+  assert.equal(tool.result.revision, 3);
+  assert.deepEqual(tool.result.changedPages, [2]);
+});
+
 test('serializes and restores a running event cursor', () => {
   const state = apply([event(1, 'run.started'), event(2, 'assistant.delta', { text: 'hi' })]).state;
   const restored = restoreAgentRunUiState(serializeAgentRunUiState(state));
   assert.equal(restored.runId, 'run-1');
   assert.equal(restored.status, 'running');
   assert.equal(restored.lastSequence, 2);
+});
+
+test('server active_run is authoritative when reconciling restored UI state', () => {
+  const local = apply([
+    event(1, 'run.started'),
+    event(2, 'tool.call.started', { callId: 'c', name: 'generate_album', arguments: {} }),
+  ]).state;
+
+  assert.equal(reconcileRestoredAgentRunUi(local, null, 'session-1'), null);
+
+  const matching = reconcileRestoredAgentRunUi(
+    local,
+    { run_id: 'run-1' },
+    'session-1',
+  );
+  assert.equal(matching.lastSequence, 2);
+  assert.equal(matching.tools[0].status, 'running');
+
+  const replaced = reconcileRestoredAgentRunUi(
+    local,
+    { run_id: 'run-2' },
+    'session-1',
+  );
+  assert.equal(replaced.runId, 'run-2');
+  assert.equal(replaced.lastSequence, 0);
+  assert.deepEqual(replaced.tools, []);
 });
 
 test('tool argument summaries hide HTML, URLs and local paths', () => {
@@ -192,6 +296,12 @@ test('page state snapshot contains only Session view state fields', () => {
     previewRevision: 8,
     clientRevision: 12,
   });
+});
+
+test('running execution state is independent from whether a preview already exists', () => {
+  assert.equal(isAgentRunExecutionActive({ runStatus: 'running' }), true);
+  assert.equal(isAgentRunExecutionActive({ composing: true }), true);
+  assert.equal(isAgentRunExecutionActive({ runStatus: 'completed' }), false);
 });
 
 test('preview refresh keeps the active page and only clamps when pages shrink', () => {
