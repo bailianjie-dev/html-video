@@ -290,6 +290,7 @@ Invoke-RestMethod -Method Get http://127.0.0.1:3071/api/dev/album-persistence-he
 排查：
 
 - 确认已执行 `migrations/001_init_album_tables.sql`
+- **全新空库**：可一次执行 `migrations/bootstrap.sql`（等价于按序应用 001..007）。已有库请继续用编号增量迁移，不要跑 bootstrap
 - 使用 OSS 垃圾清理任务前执行 `migrations/004_add_oss_cleanup_indexes.sql`
 - 使用 HTML OSS 发布前执行 `migrations/005_add_album_page_html_oss.sql`
 - 确认数据库客户端里看到的库名和 `database.toml` 的 `name` 一致

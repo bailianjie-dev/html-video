@@ -26,6 +26,11 @@ import {
   readEditableTextValue,
   writeEditableTextValue,
 } from './editable-text.js';
+import {
+  albumPageNavigationTarget,
+  createAlbumPageNavigationLock,
+  decidePreviewAlbumPageSync,
+} from './album-page-navigation.js';
 
 // Re-render whole UI on language change.
 document.addEventListener('hv-locale-change', () => {
@@ -180,6 +185,7 @@ const state = {
   albumPageCount: 0,
   activeAlbumPage: 0,
   albumPageSummaries: [], // short per-page titles for the left rail
+  albumPageNavigationLock: null, // { target, until } while a rail click is moving the preview
   agentViewClientRevision: Date.now(),
   agentViewLastSyncKey: '',
   agentViewSyncTimer: null,
@@ -447,6 +453,8 @@ function clearSessionState() {
   state.activeAlbumPage = 0;
   state.activeAlbumPage = 0;
   state.albumPageTextEditActive = false;
+  state.albumPageNavigationLock = null;
+  state.generationSideTab = 'assistant';
   state.agentRunUi = null;
   state.resumingAgentRun = false;
   state.resumingAgentRunKey = '';
@@ -1019,6 +1027,8 @@ async function loadAgentSession(projectId, session, options = {}) {
   state.resumingAgentRun = false;
   state.resumingAgentRunKey = '';
   state.albumPageTextEditActive = false;
+  state.albumPageNavigationLock = null;
+  state.generationSideTab = 'assistant';
   state.agentViewLastSyncKey = '';
   clearTimeout(state.agentViewSyncTimer);
   if (!options.preserveComposing) {
@@ -1215,6 +1225,8 @@ async function selectProject(id, options = {}) {
   state.agentSessionsLoading = true;
   state.agentSessionLoadToken += 1;
   state.albumPageTextEditActive = false;
+  state.albumPageNavigationLock = null;
+  state.generationSideTab = 'assistant';
   state.enhancing = null;
   state.agentRunUi = null;
   state.resumingAgentRun = false;
@@ -2282,7 +2294,6 @@ function renderGenerationPage() {
       ? `${meta.title || '电子相册'} · 已生成，可预览和调整`
       : `${meta.title || '电子相册'} · 需要重新生成`;
   const canExportHtml = hasProjectPreview(state.selected);
-  const canExportMp4 = !!state.selected && hasPreview && !state.exporting;
   const previewEmptyHtml = needsRegenerate
     ? generationRecoverEmptyHtml()
     : hasPreview
@@ -2310,7 +2321,7 @@ function renderGenerationPage() {
           <div class="generation-export-actions">
             <button type="button" class="generation-btn secondary" id="btn-reload" title="重新加载中间预览与左侧页缩略图">↻ 刷新预览</button>
             <button type="button" class="generation-btn primary" id="btn-generation-export-html" title="导出 HTML 网页（图片内嵌，可离线打开）"${canExportHtml ? '' : ' disabled'}>导出电子相册</button>
-            <button type="button" class="generation-btn primary" id="btn-generation-export-mp4" title="导出 MP4：按页淡入淡出翻页，总时长约 12–18 秒"${canExportMp4 ? '' : ' disabled'}>${state.exporting ? '导出中...' : '导出视频'}</button>
+            ${'' /* 导出视频暂不开放；需要时恢复 btn-generation-export-mp4 */}
           </div>
         </div>
       </header>
@@ -2415,7 +2426,7 @@ function wireGenerationPage() {
   const recoverRegenerateBtn = document.getElementById('btn-recover-regenerate');
   if (recoverRegenerateBtn) recoverRegenerateBtn.onclick = () => sendGenerationQuickAdjust('请基于当前需求重新生成这本电子相册，保留用户已选择的页数、受众、场景、语气、展示设备、风格、素材使用方式和行动引导。');
   const editPageBtn = document.getElementById('btn-edit-album-page');
-  if (editPageBtn) editPageBtn.onclick = () => startAlbumPageTextEdit();
+  if (editPageBtn) editPageBtn.onclick = () => startAlbumPageTextEdit(state.activeAlbumPage);
   wirePreviewZoomControls();
   wirePreviewToolbarDrag();
   // Preview shell follows create-page display device (手机→竖屏 / 电脑→横屏)
@@ -2423,7 +2434,6 @@ function wireGenerationPage() {
   // 右坞默认展开但宽度已收窄；若用户上次点过「收起」则记住折叠偏好
   document.body.classList.remove('assistant-collapsed', 'textfields-collapsed');
   state.generationSideTab = state.generationSideTab === 'edit' ? 'edit' : 'assistant';
-  state.albumPageTextEditActive = false;
   applyGenerationSideCollapsedPref();
   setGenerationSideTab(state.generationSideTab, { expand: !isGenerationSideCollapsedPref() });
   syncPreviewDeviceSwitchUi();
@@ -5577,7 +5587,11 @@ function renderOptionCard(opts, picked, msgIdx) {
 }
 
 // ============== preview ==============
-function renderPreview({ refreshFramesStrip = true } = {}) {
+function renderPreview({
+  refreshFramesStrip = true,
+  restoreAlbumPageIndex = null,
+  onPreviewReady = null,
+} = {}) {
   const stage = document.getElementById('preview-stage');
   if (!stage) return;
   const p = state.selected;
@@ -5694,10 +5708,27 @@ function renderPreview({ refreshFramesStrip = true } = {}) {
   if (iframe && tag === 'iframe') {
     iframe.addEventListener('load', () => {
       applyStudioDevicePreview(iframe);
+      if (Number.isInteger(restoreAlbumPageIndex) && restoreAlbumPageIndex >= 0) {
+        state.activeAlbumPage = restoreAlbumPageIndex;
+        // Structural page changes reload authored album scripts so cached page
+        // collections match the saved DOM. Keep their initial page-1 marker
+        // from overriding the page that initiated the operation.
+        lockAlbumPageNavigation(restoreAlbumPageIndex, 2000);
+      }
       syncAlbumPagesFromPreview(iframe, { refreshStrip: refreshFramesStrip });
+      if (Number.isInteger(restoreAlbumPageIndex) && restoreAlbumPageIndex >= 0) {
+        // Some authored albums publish a delayed initial-page callback after
+        // load. Keep that callback from painting page 1 as selected while the
+        // centre is already showing the restored page.
+        state.activeAlbumPage = restoreAlbumPageIndex;
+        lockAlbumPageNavigation(restoreAlbumPageIndex, 1200);
+        updateAlbumPageTabActive();
+        focusAlbumPreviewPage(iframe.contentDocument, restoreAlbumPageIndex);
+      }
       wirePreviewTextLocate(iframe);
       wireAlbumPreviewWheelNav(iframe);
       scheduleGenerationPreviewLayout();
+      if (typeof onPreviewReady === 'function') onPreviewReady(iframe);
     });
   }
   if (refreshFramesStrip) renderFramesStrip();
@@ -5705,6 +5736,20 @@ function renderPreview({ refreshFramesStrip = true } = {}) {
   // (draft / fit) and the per-frame narration line in sync, regardless of which
   // path triggered the change.
   if (typeof window.__hvSyncNarration === 'function') window.__hvSyncNarration();
+}
+
+function renderPreviewAndWait(options = {}, timeoutMs = 4000) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve();
+    };
+    const timer = setTimeout(finish, timeoutMs);
+    renderPreview({ ...options, onPreviewReady: finish });
+  });
 }
 
 function getAlbumPagesFromIframe(iframe) {
@@ -5928,7 +5973,10 @@ function findAlbumPageElements(root) {
     });
   }
   let filtered = pages
-    .filter((page) => page.querySelector('[data-hv-text], [data-hv-image], [data-hv-cta], img, h1, h2, h3, p, button, a'))
+    .filter((page) => (
+      page.matches('[data-hv-blank-page="true"], .hv-blank-page')
+      || page.querySelector('[data-hv-text], [data-hv-image], [data-hv-cta], img, h1, h2, h3, p, button, a')
+    ))
     .filter((page) => !pages.some((other) => other !== page && other.contains(page)));
 
   // Fallback: direct children of the album scroller (AI markup varies a lot).
@@ -5939,7 +5987,8 @@ function findAlbumPageElements(root) {
         if (!el || el.nodeType !== 1) return false;
         if (/^(SCRIPT|STYLE|LINK|NOSCRIPT)$/i.test(el.tagName)) return false;
         if (/controls|dots|nav/i.test(`${el.className || ''} ${el.id || ''}`)) return false;
-        return !!(el.querySelector('h1, h2, h3, p, img, [data-hv-text], [data-hv-image]') || (el.textContent || '').trim().length > 8);
+        return el.matches('[data-hv-blank-page="true"], .hv-blank-page')
+          || !!(el.querySelector('h1, h2, h3, p, img, [data-hv-text], [data-hv-image]') || (el.textContent || '').trim().length > 8);
       });
       if (kids.length > filtered.length) {
         filtered = kids.filter((page) => !kids.some((other) => other !== page && other.contains(page)));
@@ -6027,15 +6076,17 @@ async function startAlbumPageTextEdit(pageIndex) {
   if (typeof pageIndex === 'number' && !Number.isNaN(pageIndex)) {
     target = pageIndex;
   } else {
+    const lockedTarget = currentAlbumPageNavigationTarget();
     // Centre preview may have moved via album-native wheel/dots while studio
     // state still pointed at page 0 — resolve from the live iframe.
     const visible = resolveVisibleAlbumPageIndex();
-    target = visible == null ? state.activeAlbumPage : visible;
+    target = lockedTarget ?? (visible == null ? state.activeAlbumPage : visible);
   }
   const liveCount = getAlbumPagesFromIframe(document.getElementById('preview-iframe')).length;
   const pageCount = Math.max(Number(state.albumPageCount) || 1, liveCount || 1);
   if (liveCount > 0) state.albumPageCount = liveCount;
   state.activeAlbumPage = Math.max(0, Math.min(pageCount - 1, Number(target) || 0));
+  lockAlbumPageNavigation(state.activeAlbumPage);
   queueAgentViewStateSync();
   updateAlbumPageTabActive();
   scrollPreviewToAlbumPage(state.activeAlbumPage, 'auto', { mode: 'browse' });
@@ -6058,6 +6109,7 @@ async function selectAlbumPage(pageIndex, { startEdit = false } = {}) {
   const safeIndex = Math.max(0, Math.min((state.albumPageCount || 1) - 1, Number(pageIndex) || 0));
   const pageChanged = safeIndex !== state.activeAlbumPage;
   if (pageChanged) await flushTextEditsIfNeeded();
+  lockAlbumPageNavigation(safeIndex);
   state.activeAlbumPage = safeIndex;
   queueAgentViewStateSync();
   updateAlbumPageTabActive();
@@ -6083,6 +6135,24 @@ async function selectAlbumPage(pageIndex, { startEdit = false } = {}) {
   } else {
     updateAlbumPageEditControls();
   }
+}
+
+function lockAlbumPageNavigation(target, durationMs = 1000) {
+  state.albumPageNavigationLock = createAlbumPageNavigationLock(target, Date.now(), durationMs);
+}
+
+function currentAlbumPageNavigationTarget(now = Date.now()) {
+  const target = albumPageNavigationTarget(state.albumPageNavigationLock, now);
+  if (target === null) {
+    state.albumPageNavigationLock = null;
+  }
+  return target;
+}
+
+function acceptPreviewAlbumPageSync(pageIndex, now = Date.now()) {
+  const decision = decidePreviewAlbumPageSync(state.albumPageNavigationLock, pageIndex, now);
+  state.albumPageNavigationLock = decision.nextLock;
+  return decision.accept;
 }
 
 function syncAlbumPagesFromPreview(iframe, { refreshStrip = true } = {}) {
@@ -6120,7 +6190,12 @@ function syncAlbumPagesFromPreview(iframe, { refreshStrip = true } = {}) {
   // Prefer the page the preview is actually showing (album scripts often use
   // .active / scroll without updating studio state yet).
   const visible = resolveVisibleAlbumPageIndex(iframe);
-  if (visible != null && visible !== state.activeAlbumPage && !state.albumPageTextEditActive) {
+  if (
+    visible != null
+    && acceptPreviewAlbumPageSync(visible)
+    && visible !== state.activeAlbumPage
+    && !state.albumPageTextEditActive
+  ) {
     state.activeAlbumPage = visible;
   }
   updateAlbumPageEditControls();
@@ -6227,7 +6302,9 @@ function wireAlbumPageScrollSync(iframe) {
       // Hard-cut: left rail owns the page; don't fight display:none paging.
       if (doc.documentElement.classList.contains('hv-album-preview-focus')) return;
       const bestIndex = resolveVisibleAlbumPageIndex(iframe);
-      if (bestIndex == null || bestIndex === state.activeAlbumPage) return;
+      if (bestIndex == null) return;
+      if (!acceptPreviewAlbumPageSync(bestIndex)) return;
+      if (bestIndex === state.activeAlbumPage) return;
       const wasEditing = state.albumPageTextEditActive;
       state.activeAlbumPage = bestIndex;
       queueAgentViewStateSync();
@@ -6303,6 +6380,7 @@ function scrollPreviewToAlbumPage(index, behavior = 'smooth', opts = {}) {
   const safeIndex = Math.max(0, Math.min(pages.length - 1, Number(index) || 0));
   state.activeAlbumPage = safeIndex;
   updateAlbumPageTabActive();
+  alignAuthoredAlbumPageMarkers(pages, safeIndex);
 
   const browse = opts.mode === 'browse';
   if (browse) clearAlbumPreviewPageFocus(doc);
@@ -6381,6 +6459,21 @@ function scrollPreviewToAlbumPage(index, behavior = 'smooth', opts = {}) {
   requestAnimationFrame(() => requestAnimationFrame(verifyAndMaybeHardCut));
   // Do NOT hard-cut immediately on auto: that locks overflow + display:none and
   // kills wheel page browsing. Only hard-cut when the scroll verify fails above.
+}
+
+function alignAuthoredAlbumPageMarkers(pages, activeIndex) {
+  const list = Array.from(pages || []);
+  if (!list.length) return;
+  const safe = Math.max(0, Math.min(list.length - 1, Number(activeIndex) || 0));
+  for (const className of ['active', 'is-active', 'current']) {
+    if (!list.some((page) => page.classList.contains(className))) continue;
+    list.forEach((page, index) => page.classList.toggle(className, index === safe));
+  }
+  list.forEach((page, index) => {
+    if (page.hasAttribute('aria-hidden')) {
+      page.setAttribute('aria-hidden', index === safe ? 'false' : 'true');
+    }
+  });
 }
 
 /** Reset scroll-sync after DOM page order changes (reorder / duplicate / delete). */
@@ -6742,6 +6835,7 @@ function updateAlbumPageTabActive() {
     const isActive = pageIndex === state.activeAlbumPage;
     btn.classList.toggle('active', isActive);
     btn.classList.toggle('editing', !!state.albumPageTextEditActive && isActive);
+    btn.setAttribute('aria-current', isActive ? 'page' : 'false');
     btn.closest('.album-page-item')?.classList.toggle('active', isActive);
   });
   updateAlbumPageEditControls();
@@ -7071,7 +7165,7 @@ function renderAlbumPagesStrip(strip, p) {
     const title = topic ? `第 ${index + 1} 页 · ${topic}` : `第 ${index + 1} 页`;
     const cls = ['frame-tab', 'album-page-tab', isActive && 'active', isEditing && 'editing'].filter(Boolean).join(' ');
     return `<div class="album-page-item ${isActive ? 'active' : ''}" data-album-page-item="${index}" draggable="${state.albumPageActionBusy ? 'false' : 'true'}">
-      <button class="${cls}" data-album-page="${index}" title="${esc(title)}">
+      <button class="${cls}" data-album-page="${index}" title="${esc(title)}" aria-current="${isActive ? 'page' : 'false'}">
         <div class="frame-thumb" style="height:${thumbH}px;max-height:none">
           <iframe sandbox="allow-scripts allow-same-origin"
             src="/preview/${p.id}?thumb=1&albumPage=${index + 1}&v=${ver}"
@@ -7082,10 +7176,14 @@ function renderAlbumPagesStrip(strip, p) {
           ${topic ? `<span class="page-topic">${esc(topic)}</span>` : ''}
         </div>
       </button>
-      <div class="album-page-actions" aria-label="页面操作">
-        <button type="button" data-album-page-action="duplicate" data-album-page="${index}" title="复制">⧉</button>
-        <button type="button" data-album-page-action="delete" data-album-page="${index}" title="删除" ${count <= 1 ? 'disabled' : ''}>×</button>
+      <button type="button" class="album-page-delete" data-album-page-action="delete" data-album-page="${index}" title="删除本页" aria-label="删除第 ${index + 1} 页" ${count <= 1 ? 'disabled' : ''}>×</button>
+      <div class="album-page-footer-actions" aria-label="页面操作">
+        <button type="button" class="album-page-edit" data-album-page-action="edit" data-album-page="${index}" title="编辑本页"><span aria-hidden="true">✎</span><span>编辑本页</span></button>
+        <button type="button" class="album-page-move" data-album-page-action="move-up" data-album-page="${index}" title="上移一页（Alt + ↑）" aria-label="将第 ${index + 1} 页上移一页" ${index === 0 ? 'disabled' : ''}>↑</button>
+        <button type="button" class="album-page-move" data-album-page-action="move-down" data-album-page="${index}" title="下移一页（Alt + ↓）" aria-label="将第 ${index + 1} 页下移一页" ${index === count - 1 ? 'disabled' : ''}>↓</button>
+        <button type="button" class="album-page-duplicate" data-album-page-action="duplicate" data-album-page="${index}" title="复制本页" aria-label="复制第 ${index + 1} 页">⧉</button>
       </div>
+      <button type="button" class="album-page-add-after" data-album-page-action="add-blank" data-album-page="${index}" title="在此页后新增空白页" aria-label="在第 ${index + 1} 页后新增空白页"><span aria-hidden="true">＋</span></button>
     </div>`;
   }).join('');
   strip.innerHTML = `<div class="album-rail-head"><span class="label">页面</span></div>${tabs}`;
@@ -7103,6 +7201,18 @@ function albumRailOrder(strip) {
   return Array.from(strip?.querySelectorAll?.('.album-page-item') || [])
     .map((item) => Number(item.dataset.albumPageItem))
     .filter((index) => Number.isInteger(index) && index >= 0);
+}
+
+function moveAlbumPageByStep(pageIndex, delta) {
+  if (state.albumPageActionBusy) return;
+  const count = Number(state.albumPageCount) || 0;
+  const from = Math.max(0, Math.min(count - 1, Number(pageIndex) || 0));
+  const step = Number(delta) < 0 ? -1 : 1;
+  const to = from + step;
+  if (!count || to < 0 || to >= count) return;
+  const order = Array.from({ length: count }, (_, index) => index);
+  [order[from], order[to]] = [order[to], order[from]];
+  performAlbumPageReorder(order);
 }
 
 function wireAlbumPageDragSorting(strip) {
@@ -7138,7 +7248,12 @@ function wireAlbumPageDragSorting(strip) {
     if (actionBtn && strip.contains(actionBtn)) {
       e.stopPropagation();
       if (!actionBtn.disabled) {
-        performAlbumPageAction(actionBtn.dataset.albumPageAction, Number(actionBtn.dataset.albumPage) || 0);
+        const action = actionBtn.dataset.albumPageAction;
+        const pageIndex = Number(actionBtn.dataset.albumPage) || 0;
+        if (action === 'edit') startAlbumPageTextEdit(pageIndex);
+        else if (action === 'move-up') moveAlbumPageByStep(pageIndex, -1);
+        else if (action === 'move-down') moveAlbumPageByStep(pageIndex, 1);
+        else performAlbumPageAction(action, pageIndex);
       }
       return;
     }
@@ -7148,10 +7263,21 @@ function wireAlbumPageDragSorting(strip) {
     selectAlbumPage(Number(btn.dataset.albumPage) || 0);
   });
 
+  strip.addEventListener('keydown', (e) => {
+    if (!e.altKey || (e.key !== 'ArrowUp' && e.key !== 'ArrowDown')) return;
+    const item = e.target?.closest?.('.album-page-item');
+    const pageIndex = item
+      ? Number(item.dataset.albumPageItem)
+      : Number(state.activeAlbumPage) || 0;
+    e.preventDefault();
+    e.stopPropagation();
+    moveAlbumPageByStep(pageIndex, e.key === 'ArrowUp' ? -1 : 1);
+  });
+
   strip.addEventListener('dragstart', (e) => {
     const item = e.target?.closest?.('.album-page-item');
     if (!item || !strip.contains(item)) return;
-    if (state.albumPageActionBusy || e.target?.closest?.('.album-page-actions')) {
+    if (state.albumPageActionBusy || e.target?.closest?.('[data-album-page-action]')) {
       e.preventDefault();
       return;
     }
@@ -7428,11 +7554,13 @@ function setAlbumPageBusyUi(busy) {
     item.classList.toggle('saving', !!busy);
   });
   document.querySelectorAll('[data-album-page-action]').forEach((btn) => {
-    if (btn.dataset.albumPageAction === 'delete' && (Number(state.albumPageCount) || 0) <= 1) {
-      btn.disabled = true;
-    } else {
-      btn.disabled = !!busy;
-    }
+    const action = btn.dataset.albumPageAction;
+    const count = Number(state.albumPageCount) || 0;
+    const index = Number(btn.dataset.albumPage) || 0;
+    btn.disabled = !!busy
+      || (action === 'delete' && count <= 1)
+      || (action === 'move-up' && index <= 0)
+      || (action === 'move-down' && index >= count - 1);
   });
 }
 
@@ -7453,6 +7581,7 @@ function updateAlbumRailIndicesFromDom(summaries = state.albumPageSummaries) {
       tab.title = title;
       tab.classList.toggle('active', index === state.activeAlbumPage);
       tab.classList.toggle('editing', !!state.albumPageTextEditActive && index === state.activeAlbumPage);
+      tab.setAttribute('aria-current', index === state.activeAlbumPage ? 'page' : 'false');
     }
     const order = item.querySelector('.order');
     if (order) order.textContent = String(index + 1);
@@ -7470,7 +7599,11 @@ function updateAlbumRailIndicesFromDom(summaries = state.albumPageSummaries) {
 
     item.querySelectorAll('[data-album-page-action]').forEach((btn) => {
       btn.dataset.albumPage = String(index);
-      btn.disabled = state.albumPageActionBusy || (btn.dataset.albumPageAction === 'delete' && count <= 1);
+      const action = btn.dataset.albumPageAction;
+      btn.disabled = state.albumPageActionBusy
+        || (action === 'delete' && count <= 1)
+        || (action === 'move-up' && index === 0)
+        || (action === 'move-down' && index === count - 1);
     });
     const thumb = item.querySelector('iframe[data-album-thumb]');
     if (thumb) thumb.dataset.albumThumb = String(index);
@@ -7512,6 +7645,54 @@ function applyLiveAlbumPageDuplicate(pageIndex) {
   return { doc, activeIndex: nextIndex };
 }
 
+function createBlankAlbumPage(doc, source, pageIndex) {
+  if (!doc || !source) return null;
+  const blank = source.cloneNode(false);
+  uniquifyClonedAlbumPageIds(blank);
+  blank.removeAttribute('id');
+  blank.removeAttribute('hidden');
+  blank.removeAttribute('aria-hidden');
+  ['data-hv-text', 'data-hv-image', 'data-hv-cta', 'data-hv-key'].forEach((name) => {
+    blank.removeAttribute(name);
+  });
+  Array.from(blank.attributes).forEach((attribute) => {
+    if (/^on/i.test(attribute.name)) blank.removeAttribute(attribute.name);
+  });
+  blank.classList.remove('active', 'is-active', 'current', 'selected');
+  blank.classList.add('page', 'hv-blank-page');
+  blank.setAttribute('data-hv-blank-page', 'true');
+  blank.setAttribute('data-page', `page_${pageIndex + 1}`);
+  blank.setAttribute('data-album-page', `page_${pageIndex + 1}`);
+  blank.setAttribute('data-page-title', '空白页');
+  blank.setAttribute('aria-label', `空白页 ${pageIndex + 1}`);
+  blank.style.removeProperty('display');
+  blank.style.removeProperty('visibility');
+  blank.style.background = '#fff';
+  blank.style.color = '#111';
+
+  const surface = doc.createElement('div');
+  surface.className = 'hv-blank-page-surface';
+  surface.setAttribute('aria-hidden', 'true');
+  surface.style.cssText = 'width:100%;height:100%;min-height:inherit;box-sizing:border-box;';
+  blank.appendChild(surface);
+  return blank;
+}
+
+function applyLiveAlbumPageAddBlank(pageIndex) {
+  const doc = getPreviewDocument();
+  if (!doc) return null;
+  const pages = findAlbumPageElements(doc);
+  const source = pages[pageIndex];
+  if (!source) return null;
+  const nextIndex = Math.min(pageIndex + 1, pages.length);
+  const blank = createBlankAlbumPage(doc, source, nextIndex);
+  if (!blank) return null;
+  source.parentNode.insertBefore(blank, source.nextSibling);
+  rewriteAlbumPageEditableKeys(blank, nextIndex);
+  syncAlbumPageChrome(doc, pages.length, pages.length + 1);
+  return { doc, activeIndex: nextIndex };
+}
+
 function applyLiveAlbumPageDelete(pageIndex) {
   const doc = getPreviewDocument();
   if (!doc) return null;
@@ -7537,7 +7718,16 @@ function removeAlbumRailItem(pageIndex) {
   item?.remove();
 }
 
-async function saveAlbumPageOperation(doc, activeIndex, message, { refreshText = true } = {}) {
+async function saveAlbumPageOperation(
+  doc,
+  activeIndex,
+  message,
+  {
+    refreshText = true,
+    reloadPreview = false,
+    reloadFramesStrip = true,
+  } = {},
+) {
   const html = serializeAlbumDoc(doc);
   const res = await API.putRawHtml(state.selected.id, html);
   if (res?.error) throw new Error(res.error);
@@ -7552,25 +7742,15 @@ async function saveAlbumPageOperation(doc, activeIndex, message, { refreshText =
   updateAlbumPageTabLabels(state.albumPageSummaries);
   updateAlbumPageTabActive();
   if (refreshText) await refreshTextFields();
+  if (reloadPreview) {
+    await renderPreviewAndWait({
+      refreshFramesStrip: reloadFramesStrip,
+      restoreAlbumPageIndex: state.activeAlbumPage,
+    });
+  }
   updateAlbumPageEditControls();
   updateGenerationControls();
   toast(message, 'success');
-}
-
-function reorderAlbumRailDom(order) {
-  const strip = document.getElementById('frames-strip');
-  if (!strip) return;
-  const items = Array.from(strip.querySelectorAll('.album-page-item'));
-  if (!items.length || items.length !== order.length) return;
-  const head = strip.querySelector('.album-rail-head');
-  const frag = document.createDocumentFragment();
-  order.forEach((sourceIndex) => {
-    const item = items[sourceIndex];
-    if (item) frag.appendChild(item);
-  });
-  if (head?.nextSibling) strip.insertBefore(frag, head.nextSibling);
-  else if (head) head.after(frag);
-  else strip.appendChild(frag);
 }
 
 async function performAlbumPageReorder(order) {
@@ -7588,18 +7768,8 @@ async function performAlbumPageReorder(order) {
   try {
     const previousActive = Math.max(0, Math.min(normalized.length - 1, Number(state.activeAlbumPage) || 0));
     const activeIndex = Math.max(0, normalized.indexOf(previousActive));
-    const liveDoc = applyLiveAlbumPageReorder(normalized);
-    if (!liveDoc) throw new Error('Cannot reorder pages in the live preview');
-    const previousSummaries = Array.isArray(state.albumPageSummaries) ? state.albumPageSummaries : [];
-    state.albumPageSummaries = normalized.map((sourceIndex) => previousSummaries[sourceIndex] || '');
-    state.activeAlbumPage = activeIndex;
-    // One-shot rail reorder keeps each thumb iframe with its content (no remount flash).
-    reorderAlbumRailDom(normalized);
-    updateAlbumRailIndicesFromDom(state.albumPageSummaries);
-    updateAlbumPageTabActive();
-    // Keep wheel/scroll browse — do not lock centre preview into hard-cut focus.
-    scrollPreviewToAlbumPage(activeIndex, 'auto', { mode: 'browse' });
-
+    // Do not mutate the current rail or preview. The saved document below is
+    // the sole source for the next render, preventing cumulative index drift.
     await flushTextEditsIfNeeded();
     const html = await API.rawHtml(state.selected.id);
     if (!html) throw new Error('No preview HTML');
@@ -7620,10 +7790,13 @@ async function performAlbumPageReorder(order) {
     anchor.remove();
 
     const synced = syncAlbumPageChrome(doc, pages.length, pages.length);
-    await saveAlbumPageOperation(doc, Math.min(activeIndex, synced.length - 1), '已调整页面顺序', { refreshText: false });
-    // Do NOT remount the rail here — renderFramesStrip() reload iframes and
-    // causes a second jitter wave. Dom order + labels already match.
-    scrollPreviewToAlbumPage(state.activeAlbumPage, 'auto', { mode: 'browse' });
+    await saveAlbumPageOperation(doc, Math.min(activeIndex, synced.length - 1), '已调整页面顺序', {
+      refreshText: false,
+      reloadPreview: true,
+      // Rebuild once from the saved HTML. Incrementally recycling thumbnail
+      // iframes made content, labels and selection diverge after repeated moves.
+      reloadFramesStrip: true,
+    });
   } catch (error) {
     console.warn('[studio] album page reorder failed:', error);
     toast(`页面排序保存失败：${error?.message ?? error}。请刷新后重试。`, 'error');
@@ -7640,7 +7813,7 @@ async function performAlbumPageAction(action, pageIndex) {
     const count = Number(state.albumPageCount) || 0;
     const index = Math.max(0, Math.min(count - 1, Number(pageIndex) || 0));
     if (count <= 1) return;
-    if (!confirm(`确定删除第 ${index + 1} 页吗？`)) return;
+    if (!await confirmAlbumPageDelete(index)) return;
   }
   setAlbumPageBusyUi(true);
   try {
@@ -7655,7 +7828,22 @@ async function performAlbumPageAction(action, pageIndex) {
     let activeIndex = index;
     let message = '页面已更新';
 
-    if (actionName === 'duplicate') {
+    if (actionName === 'add-blank') {
+      const live = applyLiveAlbumPageAddBlank(index);
+      if (!live) throw new Error('Cannot add a blank page in the live preview');
+      cloneAlbumRailItemAfter(index);
+      const source = pages[index] || pages[pages.length - 1];
+      const nextIndex = Math.min(index + 1, pages.length);
+      const blank = createBlankAlbumPage(doc, source, nextIndex);
+      if (!blank) throw new Error('Cannot create a blank page');
+      source.parentNode.insertBefore(blank, source.nextSibling);
+      rewriteAlbumPageEditableKeys(blank, nextIndex);
+      pages = findAlbumPageElements(doc);
+      activeIndex = nextIndex;
+      message = '已新增空白页';
+      state.albumPageCount = oldCount + 1;
+      state.activeAlbumPage = live.activeIndex;
+    } else if (actionName === 'duplicate') {
       const live = applyLiveAlbumPageDuplicate(index);
       cloneAlbumRailItemAfter(index);
       const source = pages[index] || pages[pages.length - 1];
@@ -7688,13 +7876,67 @@ async function performAlbumPageAction(action, pageIndex) {
     updateAlbumRailIndicesFromDom(state.albumPageSummaries);
     updateAlbumPageTabActive();
     scrollPreviewToAlbumPage(state.activeAlbumPage, 'auto', { mode: 'browse' });
-    await saveAlbumPageOperation(doc, Math.min(activeIndex, pages.length - 1), message);
+    await saveAlbumPageOperation(doc, Math.min(activeIndex, pages.length - 1), message, {
+      reloadPreview: true,
+    });
   } catch (error) {
     console.warn('[studio] album page operation failed:', error);
     toast(`页面操作保存失败：${error?.message ?? error}。请刷新后重试。`, 'error');
   } finally {
     setAlbumPageBusyUi(false);
   }
+}
+
+let activeAlbumPageDeleteDialog = null;
+
+function confirmAlbumPageDelete(pageIndex) {
+  const modal = document.getElementById('album-page-delete-modal');
+  const cancel = document.getElementById('album-page-delete-cancel');
+  const confirmDelete = document.getElementById('album-page-delete-confirm');
+  const description = document.getElementById('album-page-delete-description');
+  if (!modal || !cancel || !confirmDelete) return Promise.resolve(false);
+
+  activeAlbumPageDeleteDialog?.finish(false);
+  const previousFocus = document.activeElement;
+  if (description) {
+    description.textContent = `确定删除第 ${Math.max(0, Number(pageIndex) || 0) + 1} 页？删除后无法恢复。`;
+  }
+
+  return new Promise((resolve) => {
+    let settled = false;
+    const onKeyDown = (event) => {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        finish(false);
+      }
+    };
+    const finish = (confirmed) => {
+      if (settled) return;
+      settled = true;
+      modal.classList.remove('show');
+      modal.setAttribute('aria-hidden', 'true');
+      document.removeEventListener('keydown', onKeyDown, true);
+      cancel.onclick = null;
+      confirmDelete.onclick = null;
+      modal.onclick = null;
+      if (activeAlbumPageDeleteDialog?.finish === finish) activeAlbumPageDeleteDialog = null;
+      if (previousFocus?.isConnected && typeof previousFocus.focus === 'function') {
+        previousFocus.focus({ preventScroll: true });
+      }
+      resolve(Boolean(confirmed));
+    };
+
+    activeAlbumPageDeleteDialog = { finish };
+    cancel.onclick = () => finish(false);
+    confirmDelete.onclick = () => finish(true);
+    modal.onclick = (event) => {
+      if (event.target === modal) finish(false);
+    };
+    document.addEventListener('keydown', onKeyDown, true);
+    modal.classList.add('show');
+    modal.setAttribute('aria-hidden', 'false');
+    requestAnimationFrame(() => cancel.focus());
+  });
 }
 
 async function openGraphModal() {

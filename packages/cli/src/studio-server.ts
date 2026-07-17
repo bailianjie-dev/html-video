@@ -2425,7 +2425,16 @@ function frameAlbumPage(project: Project, nodeId: string): number | undefined {
   return index >= 0 ? index + 1 : undefined;
 }
 
+function stripAuthoredScriptsForAlbumThumb(html: string): string {
+  // A rail thumbnail is a static snapshot. Running the authored album script
+  // here is both unnecessary and unsafe for page isolation: many generated
+  // albums unconditionally mark page 1 active during DOMContentLoaded/load,
+  // overriding the requested albumPage after Studio has selected it.
+  return html.replace(/<script\b[^>]*>[\s\S]*?<\/script\s*>/gi, '');
+}
+
 function injectAlbumPageThumbMode(html: string, pageIndex: number): string {
+  const staticHtml = stripAuthoredScriptsForAlbumThumb(html);
   const safeIndex = Math.max(0, Math.floor(pageIndex));
   const payload = JSON.stringify({ pageIndex: safeIndex });
   const snippet = `
@@ -2457,7 +2466,10 @@ function injectAlbumPageThumbMode(html: string, pageIndex: number): string {
       });
     }
     return out
-      .filter((page) => page.querySelector('[data-hv-text], [data-hv-image], [data-hv-cta], img, h1, h2, p, button, a'))
+      .filter((page) => (
+        page.matches('[data-hv-blank-page="true"], .hv-blank-page')
+        || page.querySelector('[data-hv-text], [data-hv-image], [data-hv-cta], img, h1, h2, p, button, a')
+      ))
       .filter((page) => !out.some((other) => other !== page && other.contains(page)));
   }
   function apply() {
@@ -2558,9 +2570,9 @@ html.hv-album-thumb [data-hv-thumb-page] {
   setTimeout(tryApply, 120);
 })();
 </script>`;
-  if (html.includes('</head>')) return html.replace('</head>', `${snippet}\n</head>`);
-  if (html.includes('</body>')) return html.replace('</body>', `${snippet}\n</body>`);
-  return html + snippet;
+  if (staticHtml.includes('</head>')) return staticHtml.replace('</head>', `${snippet}\n</head>`);
+  if (staticHtml.includes('</body>')) return staticHtml.replace('</body>', `${snippet}\n</body>`);
+  return staticHtml + snippet;
 }
 
 async function readBody(req: IncomingMessage): Promise<Record<string, unknown>> {

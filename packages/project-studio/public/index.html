@@ -1866,6 +1866,28 @@
   .generation-page-rail .album-page-item.dragging {
     opacity: .55;
   }
+  .generation-page-rail .album-page-item.active button.album-page-tab {
+    border: 3px solid #2563eb;
+    background: #eff6ff;
+    box-shadow: 0 0 0 3px rgba(37, 99, 235, .22), 0 8px 20px rgba(37, 99, 235, .18);
+  }
+  .generation-page-rail .album-page-item.active::after {
+    content: '当前页';
+    position: absolute;
+    left: 7px;
+    top: 7px;
+    z-index: 5;
+    padding: 2px 6px;
+    border-radius: 999px;
+    background: #2563eb;
+    color: #fff;
+    font-size: 9px;
+    font-weight: 750;
+    line-height: 1.35;
+    letter-spacing: .03em;
+    pointer-events: none;
+    box-shadow: 0 2px 7px rgba(15, 23, 42, .2);
+  }
   .generation-page-rail .album-page-item.drop-before::before,
   .generation-page-rail .album-page-item.drop-after::after {
     content: '';
@@ -1953,49 +1975,105 @@
     position: relative;
     flex: 0 0 auto;
   }
-  .generation-page-rail .album-page-actions {
+  .generation-page-rail .album-page-delete {
     position: absolute;
-    top: 4px;
-    right: 4px;
-    z-index: 4;
+    top: 6px;
+    right: 6px;
+    z-index: 7;
+    width: 20px;
+    height: 20px;
     display: grid;
-    grid-template-columns: repeat(2, 22px);
-    gap: 3px;
+    place-items: center;
+    padding: 0;
+    border: 1px solid rgba(248, 113, 113, .45);
+    border-radius: 6px;
+    background: rgba(255,255,255,.9);
+    color: #dc2626;
+    box-shadow: 0 2px 7px rgba(15, 23, 42, .12);
+    font-size: 14px;
+    line-height: 1;
+    cursor: pointer;
     opacity: 0;
     pointer-events: none;
     transition: opacity .12s ease;
   }
-  .generation-page-rail .album-page-item:hover .album-page-actions,
-  .generation-page-rail .album-page-item.active .album-page-actions {
+  .generation-page-rail .album-page-item:hover .album-page-delete,
+  .generation-page-rail .album-page-item.active .album-page-delete {
     opacity: 1;
     pointer-events: auto;
   }
-  .generation-page-rail .album-page-actions button {
-    width: 22px;
-    height: 22px;
-    display: grid;
-    place-items: center;
-    border: 1px solid rgba(203, 213, 225, .95);
-    border-radius: 6px;
-    background: rgba(255,255,255,.92);
-    color: #334155;
-    box-shadow: 0 2px 8px rgba(15, 23, 42, .12);
-    font-size: 12px;
-    line-height: 1;
-    font-weight: 750;
-    cursor: pointer;
-  }
-  .generation-page-rail .album-page-actions button:hover {
-    border-color: #93b2df;
-    background: #eef4ff;
-    color: #1d4ed8;
-  }
-  .generation-page-rail .album-page-actions button[data-album-page-action="delete"]:hover {
-    border-color: #fecaca;
+  .generation-page-rail .album-page-delete:hover {
+    border-color: #fca5a5;
     background: #fff1f2;
     color: #be123c;
   }
-  .generation-page-rail .album-page-actions button:disabled {
+  .generation-page-rail .album-page-delete:disabled {
+    display: none;
+  }
+  .generation-page-rail .album-page-footer-actions {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    margin-top: 4px;
+  }
+  .generation-page-rail .album-page-footer-actions button {
+    height: 24px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 4px;
+    border: 0;
+    border-radius: 5px;
+    background: transparent;
+    color: #334155;
+    font-size: 10px;
+    line-height: 1;
+    cursor: pointer;
+  }
+  .generation-page-rail .album-page-footer-actions .album-page-edit {
+    flex: 1 1 auto;
+    justify-content: flex-start;
+    padding: 0 5px;
+    color: #2563eb;
+  }
+  .generation-page-rail .album-page-footer-actions .album-page-duplicate {
+    width: 26px;
+    flex: 0 0 26px;
+    font-size: 13px;
+  }
+  .generation-page-rail .album-page-footer-actions .album-page-move {
+    width: 22px;
+    flex: 0 0 22px;
+    color: #475569;
+    font-size: 14px;
+    font-weight: 650;
+  }
+  .generation-page-rail .album-page-footer-actions button:hover {
+    background: #eff6ff;
+    color: #1d4ed8;
+  }
+  .generation-page-rail .album-page-add-after {
+    width: 26px;
+    height: 26px;
+    display: grid;
+    place-items: center;
+    margin: 6px auto 1px;
+    padding: 0;
+    border: 1px solid #cbd5e1;
+    border-radius: 50%;
+    background: #fff;
+    color: #64748b;
+    box-shadow: 0 2px 6px rgba(15, 23, 42, .08);
+    font-size: 15px;
+    line-height: 1;
+    cursor: pointer;
+  }
+  .generation-page-rail .album-page-add-after:hover {
+    border-color: #60a5fa;
+    background: #eff6ff;
+    color: #1d4ed8;
+  }
+  .generation-page-rail [data-album-page-action]:disabled {
     opacity: .4;
     cursor: not-allowed;
   }
@@ -3763,6 +3841,13 @@
     font-weight: 500;
     opacity: .85;
   }
+  /* Album selection uses the same blue as its outline/current-page badge.
+     Do not inherit the product accent (green in some themes) here. */
+  .generation-page-rail .frames-strip button.album-page-tab.active .frame-tab-label,
+  .generation-page-rail .frames-strip button.album-page-tab.active .order,
+  .generation-page-rail .frames-strip button.album-page-tab.active .page-topic {
+    color: #2563eb;
+  }
   .frames-strip button.album-page-tab .frame-thumb {
     background:
       radial-gradient(circle at 24% 30%, rgba(255,255,255,.9), transparent 34%),
@@ -4143,6 +4228,70 @@
   .small-modal button.primary { background: var(--accent); color: var(--accent-fg);
     border-color: var(--accent); font-weight: 500; }
   .small-modal button.primary:hover { background: var(--accent-hover); }
+
+  .album-page-delete-modal {
+    z-index: 1400;
+    background: rgba(15, 23, 42, .42);
+    backdrop-filter: blur(1px);
+  }
+  .album-page-delete-modal .modal {
+    width: min(448px, calc(100vw - 36px));
+    min-height: 164px;
+    padding: 26px 24px 24px;
+    border: 0;
+    border-radius: 16px;
+    background: #fff;
+    color: #0f172a;
+    box-shadow: 0 24px 70px rgba(15, 23, 42, .24);
+  }
+  .album-page-delete-modal h2 {
+    margin: 0;
+    font-family: var(--font-sans, system-ui, sans-serif);
+    font-size: 18px;
+    font-weight: 750;
+    line-height: 1.4;
+  }
+  .album-page-delete-modal p {
+    margin: 10px 0 0;
+    color: #475569;
+    font-size: 14px;
+    line-height: 1.6;
+  }
+  .album-page-delete-modal .actions {
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 14px;
+    margin-top: 25px;
+  }
+  .album-page-delete-modal .actions button {
+    min-width: 52px;
+    height: 38px;
+    padding: 0 14px;
+    border: 0;
+    border-radius: 9px;
+    font-size: 14px;
+    font-weight: 650;
+    cursor: pointer;
+  }
+  .album-page-delete-modal .cancel {
+    background: transparent;
+    color: #334155;
+  }
+  .album-page-delete-modal .cancel:hover {
+    background: #f1f5f9;
+  }
+  .album-page-delete-modal .danger {
+    background: #ef2929;
+    color: #fff;
+  }
+  .album-page-delete-modal .danger:hover {
+    background: #dc2626;
+  }
+  .album-page-delete-modal .actions button:focus-visible {
+    outline: 3px solid rgba(37, 99, 235, .3);
+    outline-offset: 2px;
+  }
 </style>
 </head>
 <body>
@@ -4256,6 +4405,17 @@
 </div>
 
 <div class="toast" id="toast"></div>
+
+<div class="modal-bg album-page-delete-modal" id="album-page-delete-modal" aria-hidden="true">
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="album-page-delete-title" aria-describedby="album-page-delete-description" tabindex="-1">
+    <h2 id="album-page-delete-title">删除页面</h2>
+    <p id="album-page-delete-description">确定删除此页？删除后无法恢复。</p>
+    <div class="actions">
+      <button type="button" class="cancel" id="album-page-delete-cancel">取消</button>
+      <button type="button" class="danger" id="album-page-delete-confirm">删除</button>
+    </div>
+  </div>
+</div>
 
 <div class="modal-bg small-modal" id="new-modal">
   <div class="modal">
@@ -4383,6 +4543,6 @@
   </div>
 </div>
 
-<script type="module" src="/app.js?v=output-token-limit-hint"></script>
+<script type="module" src="/app.js?v=hide-export-mp4"></script>
 </body>
 </html>
