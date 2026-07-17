@@ -1,6 +1,7 @@
 import type { SimpleAlbumCommand } from './simple-album-command.js';
 import { normalizeSafeColor } from './simple-album-command.js';
 import { validateAlbumHtmlBeforePersist } from './studio-server.js';
+import { createHash } from 'node:crypto';
 
 export type SimpleAlbumHtmlPatchStrategy =
   | 'replace_text_node_source'
@@ -15,6 +16,7 @@ export interface SimpleAlbumHtmlSourceRange {
 export interface SimpleAlbumHtmlPatch {
   html: string;
   changed_key: string;
+  changed_keys: string[];
   page_number: number;
   source_range: SimpleAlbumHtmlSourceRange;
   replacement_range: SimpleAlbumHtmlSourceRange;
@@ -28,6 +30,7 @@ export type SimpleAlbumHtmlPatchNotHandledReason =
   | 'ambiguous_page_structure'
   | 'target_not_found'
   | 'target_ambiguous'
+  | 'target_changed'
   | 'target_crosses_markup'
   | 'invalid_color'
   | 'validation_failed';
@@ -44,6 +47,35 @@ export interface ExecuteSimpleAlbumHtmlPatchOptions {
   /** One-based Studio page used when the parsed command targets current_page. */
   currentPageNumber?: number;
 }
+
+export interface SimpleAlbumTextTargetLocation {
+  page_number: number;
+  match_count: number;
+  changed_keys: string[];
+}
+
+export interface SimpleTextTargetCandidate {
+  candidate_id: string;
+  page_number: number;
+  data_hv_text_key: string;
+  occurrence_index: number;
+  matched_text: string;
+  context_before: string;
+  context_after: string;
+  source_range: SimpleAlbumHtmlSourceRange;
+  source_hash: string;
+}
+
+export type LocateSimpleTextTargetCandidatesResult =
+  | { handled: true; page_count: number; candidates: SimpleTextTargetCandidate[] }
+  | {
+      handled: false;
+      reason: 'empty_html' | 'current_page_unresolved' | 'page_not_found' | 'ambiguous_page_structure';
+    };
+
+export type LocateSimpleAlbumTextTargetsResult =
+  | { handled: true; page_count: number; locations: SimpleAlbumTextTargetLocation[] }
+  | { handled: false; reason: 'empty_html' | 'ambiguous_page_structure' };
 
 interface ScannedElement {
   tagName: string;
@@ -152,6 +184,7 @@ export function executeSimpleAlbumHtmlPatch(
     patch: {
       html: patchedHtml,
       changed_key: match.node.hvTextKey,
+      changed_keys: [match.node.hvTextKey],
       page_number: pageNumber,
       source_range: { ...match.range },
       replacement_range: {
@@ -161,6 +194,140 @@ export function executeSimpleAlbumHtmlPatch(
       patch_strategy: patchStrategy,
     },
   };
+}
+
+/**
+ * Return every text-node occurrence on exactly one page. ASCII letters are
+ * compared case-insensitively while source ranges retain the original casing.
+ */
+export function locateSimpleTextTargetCandidates(
+  html: string,
+  command: SimpleAlbumCommand,
+  options: ExecuteSimpleAlbumHtmlPatchOptions = {},
+): LocateSimpleTextTargetCandidatesResult {
+  if (!html) return { handled: false, reason: 'empty_html' };
+  const requestedPage = 'page_number' in command ? command.page_number : options.currentPageNumber;
+  if (!Number.isSafeInteger(requestedPage) || Number(requestedPage) < 1) {
+    return { handled: false, reason: 'current_page_unresolved' };
+  }
+  const scan = scanAlbumHtml(html);
+  if (scan.ambiguousPageStructure) return { handled: false, reason: 'ambiguous_page_structure' };
+  const pageNumber = Number(requestedPage);
+  if (pageNumber > scan.pageCount) return { handled: false, reason: 'page_not_found' };
+  const targetText = command.type === 'replace_text' ? command.old_text : command.target_text;
+  return {
+    handled: true,
+    page_count: scan.pageCount,
+    candidates: buildTextTargetCandidates(
+      html,
+      scan.textNodes,
+      findTextMatches(scan.textNodes, pageNumber, targetText),
+    ),
+  };
+}
+
+/** Apply only server-snapshotted candidates after strictly revalidating them. */
+export function executeSimpleAlbumHtmlPatchForCandidates(
+  html: string,
+  command: SimpleAlbumCommand,
+  snapshots: readonly SimpleTextTargetCandidate[],
+  selectedCandidateIds: readonly string[],
+): SimpleAlbumHtmlPatchResult {
+  if (!html) return notHandled('empty_html');
+  if (snapshots.length === 0 || selectedCandidateIds.length === 0) return notHandled('target_changed');
+  const pageNumber = snapshots[0]!.page_number;
+  if (snapshots.some((candidate) => candidate.page_number !== pageNumber)) return notHandled('target_changed');
+  const located = locateSimpleTextTargetCandidates(html, command, { currentPageNumber: pageNumber });
+  if (!located.handled) return notHandled(located.reason);
+  const currentById = new Map(located.candidates.map((candidate) => [candidate.candidate_id, candidate]));
+  const snapshotById = new Map(snapshots.map((candidate) => [candidate.candidate_id, candidate]));
+  const chosen = [...new Set(selectedCandidateIds)].map((candidateId) => {
+    const snapshot = snapshotById.get(candidateId);
+    const current = currentById.get(candidateId);
+    return snapshot && current && sameTextTargetCandidate(snapshot, current) ? current : null;
+  });
+  if (chosen.some((candidate) => candidate === null)) return notHandled('target_changed');
+
+  const patches: Array<{
+    range: SimpleAlbumHtmlSourceRange;
+    replacement: string;
+    key: string;
+    strategy: SimpleAlbumHtmlPatchStrategy;
+  }> = [];
+  for (const candidate of chosen as SimpleTextTargetCandidate[]) {
+    let range = { ...candidate.source_range };
+    let replacement: string;
+    let strategy: SimpleAlbumHtmlPatchStrategy;
+    if (command.type === 'replace_text') {
+      replacement = escapeHtmlText(command.new_text);
+      strategy = 'replace_text_node_source';
+    } else {
+      const color = normalizeSafeColor(command.color);
+      if (!color) return notHandled('invalid_color');
+      const match = findMatchForCandidate(html, command, candidate);
+      if (!match) return notHandled('target_changed');
+      const controlledColor = findControlledColorValueRange(html, match);
+      if (controlledColor) {
+        range = controlledColor;
+        replacement = escapeHtmlAttribute(color);
+        strategy = 'update_controlled_color_span';
+      } else {
+        replacement = `<span style="color:${escapeHtmlAttribute(color)}">${html.slice(range.start, range.end)}</span>`;
+        strategy = 'wrap_text_node_with_color_span';
+      }
+    }
+    patches.push({ range, replacement, key: candidate.data_hv_text_key, strategy });
+  }
+  patches.sort((left, right) => right.range.start - left.range.start);
+  for (let index = 1; index < patches.length; index += 1) {
+    if (patches[index - 1]!.range.start < patches[index]!.range.end) return notHandled('target_changed');
+  }
+  let patchedHtml = html;
+  for (const patch of patches) {
+    patchedHtml = `${patchedHtml.slice(0, patch.range.start)}${patch.replacement}${patchedHtml.slice(patch.range.end)}`;
+  }
+  const validation = validateAlbumHtmlBeforePersist(html, patchedHtml);
+  if (!validation.ok) {
+    return { handled: false, reason: 'validation_failed', validation_reasons: [...validation.reasons] };
+  }
+  const first = patches[patches.length - 1]!;
+  const changedKeys = [...new Set(patches.map((patch) => patch.key))];
+  return {
+    handled: true,
+    patch: {
+      html: patchedHtml,
+      changed_key: changedKeys[0]!,
+      changed_keys: changedKeys,
+      page_number: pageNumber,
+      source_range: { ...first.range },
+      replacement_range: { start: first.range.start, end: first.range.start + first.replacement.length },
+      patch_strategy: patches.every((patch) => patch.strategy === first.strategy)
+        ? first.strategy
+        : 'wrap_text_node_with_color_span',
+    },
+  };
+}
+
+/** Locate exact text-node matches across data-hv-text fields without mutation. */
+export function locateSimpleAlbumTextTargets(
+  html: string,
+  command: SimpleAlbumCommand,
+): LocateSimpleAlbumTextTargetsResult {
+  if (!html) return { handled: false, reason: 'empty_html' };
+  const scan = scanAlbumHtml(html);
+  if (scan.ambiguousPageStructure) return { handled: false, reason: 'ambiguous_page_structure' };
+  const targetText = command.type === 'replace_text' ? command.old_text : command.target_text;
+  const locations: SimpleAlbumTextTargetLocation[] = [];
+  for (let pageNumber = 1; pageNumber <= scan.pageCount; pageNumber += 1) {
+    const matches = findTextMatches(scan.textNodes, pageNumber, targetText);
+    if (matches.length === 0) continue;
+    locations.push({
+      page_number: pageNumber,
+      match_count: matches.length,
+      changed_keys: [...new Set(matches.map((match) => match.node.hvTextKey))],
+    });
+  }
+  return { handled: true, page_count: scan.pageCount, locations };
 }
 
 function scanAlbumHtml(html: string): HtmlScan {
@@ -295,12 +462,14 @@ function findControlledColorValueRange(
 
 function findTextMatches(nodes: ScannedTextNode[], pageNumber: number, target: string): TextMatch[] {
   if (!target) return [];
+  const foldedTarget = foldAsciiCase(target);
   const matches: TextMatch[] = [];
   for (const node of nodes) {
     if (node.pageNumber !== pageNumber) continue;
+    const foldedValue = foldAsciiCase(node.decoded.value);
     let from = 0;
     while (from <= node.decoded.value.length - target.length) {
-      const index = node.decoded.value.indexOf(target, from);
+      const index = foldedValue.indexOf(foldedTarget, from);
       if (index < 0) break;
       const lastIndex = index + target.length - 1;
       const start = node.decoded.sourceStarts[index];
@@ -312,6 +481,101 @@ function findTextMatches(nodes: ScannedTextNode[], pageNumber: number, target: s
   return matches;
 }
 
+function buildTextTargetCandidates(
+  html: string,
+  nodes: readonly ScannedTextNode[],
+  matches: readonly TextMatch[],
+): SimpleTextTargetCandidate[] {
+  const occurrences = new Map<string, number>();
+  return matches.map((match) => {
+    const occurrenceIndex = occurrences.get(match.node.hvTextKey) ?? 0;
+    occurrences.set(match.node.hvTextKey, occurrenceIndex + 1);
+    const decodedStart = sourceRangeDecodedIndex(match.node.decoded, match.range.start);
+    const decodedEnd = sourceRangeDecodedIndex(match.node.decoded, match.range.end, true);
+    const fieldNodes = nodes.filter(
+      (node) => node.pageNumber === match.node.pageNumber && node.hvTextKey === match.node.hvTextKey,
+    );
+    const nodeFieldOffset = fieldNodes
+      .slice(0, Math.max(0, fieldNodes.indexOf(match.node)))
+      .reduce((total, node) => total + node.decoded.value.length, 0);
+    const fieldText = fieldNodes.map((node) => node.decoded.value).join('');
+    const fieldMatchStart = nodeFieldOffset + decodedStart;
+    const fieldMatchEnd = nodeFieldOffset + decodedEnd;
+    const field = [...match.node.ancestors].reverse().find(
+      (ancestor) => ancestor.hvTextKey === match.node.hvTextKey && ancestor.closeEnd !== null,
+    );
+    const fieldSource = field
+      ? html.slice(field.openStart, field.closeEnd ?? field.openEnd)
+      : html.slice(match.node.start, match.node.end);
+    const matchedText = match.node.decoded.value.slice(decodedStart, decodedEnd);
+    const fingerprint = [
+      match.node.pageNumber,
+      match.node.hvTextKey,
+      occurrenceIndex,
+      match.range.start,
+      match.range.end,
+      matchedText,
+      sha256(fieldSource),
+    ].join('\u0000');
+    return {
+      candidate_id: `txt_${sha256(fingerprint).slice(0, 24)}`,
+      page_number: match.node.pageNumber,
+      data_hv_text_key: match.node.hvTextKey,
+      occurrence_index: occurrenceIndex,
+      matched_text: matchedText,
+      context_before: fieldText.slice(Math.max(0, fieldMatchStart - 32), fieldMatchStart),
+      context_after: fieldText.slice(fieldMatchEnd, fieldMatchEnd + 32),
+      source_range: { ...match.range },
+      source_hash: sha256(fieldSource),
+    };
+  });
+}
+
+function sameTextTargetCandidate(
+  snapshot: SimpleTextTargetCandidate,
+  current: SimpleTextTargetCandidate,
+): boolean {
+  return snapshot.candidate_id === current.candidate_id
+    && snapshot.page_number === current.page_number
+    && snapshot.data_hv_text_key === current.data_hv_text_key
+    && snapshot.occurrence_index === current.occurrence_index
+    && snapshot.matched_text === current.matched_text
+    && snapshot.context_before === current.context_before
+    && snapshot.context_after === current.context_after
+    && snapshot.source_range.start === current.source_range.start
+    && snapshot.source_range.end === current.source_range.end
+    && snapshot.source_hash === current.source_hash;
+}
+
+function findMatchForCandidate(
+  html: string,
+  command: SimpleAlbumCommand,
+  candidate: SimpleTextTargetCandidate,
+): TextMatch | null {
+  const scan = scanAlbumHtml(html);
+  const targetText = command.type === 'replace_text' ? command.old_text : command.target_text;
+  return findTextMatches(scan.textNodes, candidate.page_number, targetText).find(
+    (match) => match.range.start === candidate.source_range.start
+      && match.range.end === candidate.source_range.end
+      && match.node.hvTextKey === candidate.data_hv_text_key,
+  ) ?? null;
+}
+
+function sourceRangeDecodedIndex(decoded: DecodedSourceText, sourceOffset: number, end = false): number {
+  const offsets = end ? decoded.sourceEnds : decoded.sourceStarts;
+  const exact = offsets.indexOf(sourceOffset);
+  if (exact >= 0) return end ? exact + 1 : exact;
+  return end ? decoded.value.length : 0;
+}
+
+function foldAsciiCase(value: string): string {
+  return value.replace(/[A-Z]/g, (letter) => letter.toLowerCase());
+}
+
+function sha256(value: string): string {
+  return createHash('sha256').update(value).digest('hex');
+}
+
 function renderedFieldContainsTarget(nodes: ScannedTextNode[], pageNumber: number, target: string): boolean {
   if (!target) return false;
   const fields = new Map<string, string>();
@@ -319,7 +583,8 @@ function renderedFieldContainsTarget(nodes: ScannedTextNode[], pageNumber: numbe
     if (node.pageNumber !== pageNumber) continue;
     fields.set(node.hvTextKey, `${fields.get(node.hvTextKey) ?? ''}${node.decoded.value}`);
   }
-  return [...fields.values()].some((value) => value.includes(target));
+  const foldedTarget = foldAsciiCase(target);
+  return [...fields.values()].some((value) => foldAsciiCase(value).includes(foldedTarget));
 }
 
 function decodeHtmlTextWithSourceMap(source: string, sourceOffset: number): DecodedSourceText {

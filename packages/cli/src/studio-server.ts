@@ -101,6 +101,7 @@ import {
 } from './album-agent-tools.js';
 import { isLocalAgentSessionId, LocalAgentSessionStore } from './local-agent-session-store.js';
 import {
+  hasExplicitTextTargetEvidence,
   parseSimpleAlbumCommand,
   type SimpleAlbumCommand,
   type SimpleAlbumCommandNotHandledReason,
@@ -108,6 +109,7 @@ import {
 import type {
   SimpleAlbumHtmlPatchStrategy,
   SimpleAlbumHtmlSourceRange,
+  SimpleTextTargetCandidate,
 } from './simple-album-html-patch.js';
 
 interface StudioHandle {
@@ -3434,15 +3436,20 @@ async function completeDeterministicAlbumRun(args: {
 }): Promise<void> {
   const { ctx, projectId, sessionId, runId, history, log, result } = args;
   const toolCallId = `deterministic-${runId}`;
-  const toolName = result.command.type === 'replace_text'
-    ? 'replace_album_text'
-    : 'set_album_text_color';
+  const toolName = result.status === 'handled_confirmation_required'
+    || result.status === 'handled_target_not_found'
+    || result.status === 'handled_cancelled'
+    ? 'locate_album_text'
+    : result.command.type === 'replace_text'
+      ? 'replace_album_text'
+      : 'set_album_text_color';
   const details = deterministicToolResultDetails(result);
   const output = {
     content: [{ type: 'text', text: JSON.stringify(details) }],
     details,
   };
   const assistantText = deterministicAssistantResponse(result);
+  const toolArguments = 'command' in result && result.command ? result.command : {};
 
   log.append('run.started', {
     agent: 'fast-command-router',
@@ -3452,13 +3459,13 @@ async function completeDeterministicAlbumRun(args: {
   log.append('tool.call.started', {
     callId: toolCallId,
     name: toolName,
-    arguments: result.command,
+    arguments: toolArguments,
     executor: 'deterministic',
   });
   log.append('tool.call.completed', {
     callId: toolCallId,
     output,
-    isError: result.status !== 'handled_success',
+    isError: result.status === 'handled_conflict' || result.status === 'validation_failed',
     executor: 'deterministic',
     durationMs: result.duration_ms,
   });
@@ -3532,7 +3539,7 @@ function deterministicToolResultDetails(
       page_number: result.page_number,
       page_count: result.page_count,
       changed_pages: [result.page_number],
-      changed_text_keys: [result.changed_key],
+      changed_text_keys: result.changed_keys,
       preview_url: result.preview_url,
     };
   }
@@ -3546,6 +3553,56 @@ function deterministicToolResultDetails(
       duration_ms: result.duration_ms,
       expected_revision: result.expected_revision,
       current_revision: result.current_revision,
+    };
+  }
+  if (result.status === 'handled_confirmation_required') {
+    return {
+      ok: true,
+      confirmation_required: true,
+      code: result.code,
+      album_changed: false,
+      executor: result.executor,
+      strategy: result.strategy,
+      duration_ms: result.duration_ms,
+      action_id: result.action_id,
+      summary: result.summary,
+      requested_page: result.requested_page,
+      suggested_page: result.suggested_page,
+      candidate_pages: result.candidate_pages,
+      candidates: result.candidates.map(publicSimpleTextTargetCandidate),
+      target_text: result.target_text,
+      expected_revision: result.expected_revision,
+      expires_at: result.expires_at,
+      confirmation_kind: result.code === 'TEXT_TARGET_AMBIGUOUS'
+        ? 'simple_text_target'
+        : 'simple_page_target',
+    };
+  }
+  if (result.status === 'handled_target_not_found') {
+    return {
+      ok: true,
+      found: false,
+      code: result.code,
+      message: result.message,
+      album_changed: false,
+      executor: result.executor,
+      strategy: result.strategy,
+      duration_ms: result.duration_ms,
+      requested_page: result.requested_page,
+      target_text: result.target_text,
+    };
+  }
+  if (result.status === 'handled_cancelled') {
+    return {
+      ok: true,
+      cancelled: true,
+      code: result.code,
+      message: result.message,
+      action_id: result.action_id,
+      album_changed: false,
+      executor: result.executor,
+      strategy: result.strategy,
+      duration_ms: result.duration_ms,
     };
   }
   return {
@@ -3568,6 +3625,9 @@ function deterministicAssistantResponse(
   if (result.status === 'validation_failed') {
     return '这项修改未通过安全校验，相册内容没有改变。';
   }
+  if (result.status === 'handled_confirmation_required') return result.summary;
+  if (result.status === 'handled_target_not_found') return result.message;
+  if (result.status === 'handled_cancelled') return result.message;
   if (result.command.type === 'replace_text') {
     return `已将第 ${result.page_number} 页的“${result.command.old_text}”替换为“${result.command.new_text}”。`;
   }
@@ -3903,6 +3963,17 @@ function publicAlbumAgentSession(
           expected_revision: session.pendingConfirmation.expectedRevision,
           created_at: session.pendingConfirmation.createdAt,
           expires_at: session.pendingConfirmation.expiresAt,
+          ...(session.pendingConfirmation.kind === 'simple_page_target' && {
+            requested_page: session.pendingConfirmation.requestedPage,
+            candidate_pages: session.pendingConfirmation.candidatePages,
+            target_text: session.pendingConfirmation.targetText,
+          }),
+          ...(session.pendingConfirmation.kind === 'simple_text_target' && {
+            code: session.pendingConfirmation.code,
+            page_number: session.pendingConfirmation.pageNumber,
+            target_text: session.pendingConfirmation.targetText,
+            candidates: session.pendingConfirmation.candidates.map(publicSimpleTextTargetCandidate),
+          }),
         }
       : null,
     active_run: activeRun
@@ -3914,6 +3985,18 @@ function publicAlbumAgentSession(
       : null,
     created_at: session.createdAt,
     updated_at: session.updatedAt,
+  };
+}
+
+function publicSimpleTextTargetCandidate(candidate: SimpleTextTargetCandidate): Record<string, unknown> {
+  return {
+    candidate_id: candidate.candidate_id,
+    page_number: candidate.page_number,
+    data_hv_text_key: candidate.data_hv_text_key,
+    occurrence_index: candidate.occurrence_index,
+    matched_text: candidate.matched_text,
+    context_before: candidate.context_before,
+    context_after: candidate.context_after,
   };
 }
 
@@ -3982,6 +4065,86 @@ function parseStoredAlbumViewState(value: unknown): AlbumViewState | null {
 function parseStoredPendingAlbumConfirmation(value: unknown): PendingAlbumConfirmation | null {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
   const input = value as Record<string, unknown>;
+  if (input.kind === 'simple_text_target') {
+    const command = parseStoredSimpleAlbumCommand(input.command);
+    const candidates = Array.isArray(input.candidates)
+      ? input.candidates.map(parseStoredSimpleTextTargetCandidate).filter(
+          (candidate): candidate is SimpleTextTargetCandidate => candidate !== null,
+        )
+      : [];
+    const pageNumber = Number(input.pageNumber);
+    if (
+      typeof input.actionId !== 'string'
+      || input.code !== 'TEXT_TARGET_AMBIGUOUS'
+      || typeof input.summary !== 'string'
+      || typeof input.projectId !== 'string'
+      || typeof input.sessionId !== 'string'
+      || !Number.isSafeInteger(input.expectedRevision)
+      || Number(input.expectedRevision) < 0
+      || !Number.isSafeInteger(pageNumber)
+      || pageNumber < 1
+      || typeof input.targetText !== 'string'
+      || !input.targetText
+      || !command
+      || candidates.length < 2
+      || candidates.length !== (Array.isArray(input.candidates) ? input.candidates.length : 0)
+      || candidates.some((candidate) => candidate.page_number !== pageNumber)
+      || new Set(candidates.map((candidate) => candidate.candidate_id)).size !== candidates.length
+      || typeof input.createdAt !== 'string'
+      || typeof input.expiresAt !== 'string'
+    ) return null;
+    return {
+      actionId: input.actionId,
+      kind: 'simple_text_target',
+      code: 'TEXT_TARGET_AMBIGUOUS',
+      summary: input.summary,
+      projectId: input.projectId,
+      sessionId: input.sessionId,
+      expectedRevision: Number(input.expectedRevision),
+      pageNumber,
+      targetText: input.targetText,
+      command,
+      candidates,
+      createdAt: input.createdAt,
+      expiresAt: input.expiresAt,
+    };
+  }
+  if (input.kind === 'simple_page_target') {
+    const command = parseStoredSimpleAlbumCommand(input.command);
+    const candidatePages = Array.isArray(input.candidatePages)
+      ? input.candidatePages.filter((page): page is number => Number.isSafeInteger(page) && Number(page) > 0)
+      : [];
+    if (
+      typeof input.actionId !== 'string'
+      || typeof input.summary !== 'string'
+      || typeof input.projectId !== 'string'
+      || typeof input.sessionId !== 'string'
+      || !Number.isSafeInteger(input.expectedRevision)
+      || Number(input.expectedRevision) < 0
+      || !Number.isSafeInteger(input.requestedPage)
+      || Number(input.requestedPage) < 1
+      || candidatePages.length === 0
+      || typeof input.targetText !== 'string'
+      || !input.targetText
+      || !command
+      || typeof input.createdAt !== 'string'
+      || typeof input.expiresAt !== 'string'
+    ) return null;
+    return {
+      actionId: input.actionId,
+      kind: 'simple_page_target',
+      summary: input.summary,
+      projectId: input.projectId,
+      sessionId: input.sessionId,
+      expectedRevision: Number(input.expectedRevision),
+      requestedPage: Number(input.requestedPage),
+      candidatePages,
+      targetText: input.targetText,
+      command,
+      createdAt: input.createdAt,
+      expiresAt: input.expiresAt,
+    };
+  }
   const generationInput = input.generationInput;
   if (
     typeof input.actionId !== 'string'
@@ -4008,6 +4171,87 @@ function parseStoredPendingAlbumConfirmation(value: unknown): PendingAlbumConfir
     createdAt: input.createdAt,
     expiresAt: input.expiresAt,
   };
+}
+
+function parseStoredSimpleTextTargetCandidate(value: unknown): SimpleTextTargetCandidate | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const input = value as Record<string, unknown>;
+  const sourceRange = input.source_range;
+  if (!sourceRange || typeof sourceRange !== 'object' || Array.isArray(sourceRange)) return null;
+  const range = sourceRange as Record<string, unknown>;
+  const pageNumber = Number(input.page_number);
+  const occurrenceIndex = Number(input.occurrence_index);
+  const start = Number(range.start);
+  const end = Number(range.end);
+  if (
+    typeof input.candidate_id !== 'string'
+    || !/^txt_[0-9a-f]{24}$/u.test(input.candidate_id)
+    || !Number.isSafeInteger(pageNumber)
+    || pageNumber < 1
+    || typeof input.data_hv_text_key !== 'string'
+    || !input.data_hv_text_key
+    || !Number.isSafeInteger(occurrenceIndex)
+    || occurrenceIndex < 0
+    || typeof input.matched_text !== 'string'
+    || !input.matched_text
+    || typeof input.context_before !== 'string'
+    || typeof input.context_after !== 'string'
+    || !Number.isSafeInteger(start)
+    || !Number.isSafeInteger(end)
+    || start < 0
+    || end <= start
+    || typeof input.source_hash !== 'string'
+    || !/^[0-9a-f]{64}$/u.test(input.source_hash)
+  ) return null;
+  return {
+    candidate_id: input.candidate_id,
+    page_number: pageNumber,
+    data_hv_text_key: input.data_hv_text_key,
+    occurrence_index: occurrenceIndex,
+    matched_text: input.matched_text,
+    context_before: input.context_before,
+    context_after: input.context_after,
+    source_range: { start, end },
+    source_hash: input.source_hash,
+  };
+}
+
+function parseStoredSimpleAlbumCommand(value: unknown): SimpleAlbumCommand | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const command = value as Record<string, unknown>;
+  const pageNumber = Number(command.page_number);
+  if (!Number.isSafeInteger(pageNumber) || pageNumber < 1) return null;
+  if (
+    command.type === 'replace_text'
+    && typeof command.old_text === 'string'
+    && command.old_text
+    && typeof command.new_text === 'string'
+    && command.new_text
+  ) {
+    return {
+      type: 'replace_text',
+      page_number: pageNumber,
+      ...(command.page_match_policy === 'strict' && { page_match_policy: 'strict' as const }),
+      old_text: command.old_text,
+      new_text: command.new_text,
+    };
+  }
+  if (
+    command.type === 'set_text_color'
+    && typeof command.target_text === 'string'
+    && command.target_text
+    && typeof command.color === 'string'
+    && command.color
+  ) {
+    return {
+      type: 'set_text_color',
+      page_number: pageNumber,
+      ...(command.page_match_policy === 'strict' && { page_match_policy: 'strict' as const }),
+      target_text: command.target_text,
+      color: command.color,
+    };
+  }
+  return null;
 }
 
 function parseStoredCompletedAlbumToolCalls(value: unknown): Record<string, CompletedAlbumToolCall> {
@@ -4047,6 +4291,7 @@ async function executeAlbumGenerationTool(
 ): Promise<Record<string, unknown>> {
   const key = runtimeProjectKey(args.ctx, args.projectId);
   return withAlbumWriteQueue(key, async () => {
+    if (args.signal?.aborted) throw new Error('Album generation cancelled');
     let session = await getActiveAlbumAgentSession(
       args.ctx,
       args.projectId,
@@ -4065,7 +4310,7 @@ async function executeAlbumGenerationTool(
         return result;
       }
       const pending = session.pendingConfirmation;
-      if (!pending || pending.actionId !== actionId) {
+      if (!pending || pending.kind !== 'replace_album' || pending.actionId !== actionId) {
         return rememberAndPersistAlbumToolResult(args, session, {
           ok: false,
           code: 'CONFIRMATION_NOT_FOUND',
@@ -4207,7 +4452,7 @@ export interface TryExecuteSimpleAlbumCommandInput {
 
 interface DeterministicExecutionMetadata {
   executor: 'deterministic';
-  strategy: SimpleAlbumHtmlPatchStrategy | null;
+  strategy: SimpleAlbumHtmlPatchStrategy | 'locate_text_cross_page' | 'locate_text_same_page' | null;
   duration_ms: number;
 }
 
@@ -4222,6 +4467,7 @@ export type TryExecuteSimpleAlbumCommandResult =
       page_number: number;
       page_count: number;
       changed_key: string;
+      changed_keys: string[];
       source_range: SimpleAlbumHtmlSourceRange;
       replacement_range: SimpleAlbumHtmlSourceRange;
       preview_url: string;
@@ -4232,6 +4478,38 @@ export type TryExecuteSimpleAlbumCommandResult =
       album_changed: false;
       expected_revision: number;
       current_revision: number;
+    })
+  | (DeterministicExecutionMetadata & {
+      status: 'handled_confirmation_required';
+      command: SimpleAlbumCommand;
+      album_changed: false;
+      code: 'PAGE_TARGET_MISMATCH' | 'TEXT_TARGET_AMBIGUOUS';
+      action_id: string;
+      requested_page: number;
+      suggested_page: number | null;
+      candidate_pages: number[];
+      candidates: SimpleTextTargetCandidate[];
+      target_text: string;
+      expected_revision: number;
+      summary: string;
+      expires_at: string;
+    })
+  | (DeterministicExecutionMetadata & {
+      status: 'handled_target_not_found';
+      command?: SimpleAlbumCommand;
+      album_changed: false;
+      code: string;
+      requested_page: number | null;
+      target_text: string;
+      message: string;
+    })
+  | (DeterministicExecutionMetadata & {
+      status: 'handled_cancelled';
+      command: SimpleAlbumCommand;
+      album_changed: false;
+      code: 'PAGE_TARGET_CONFIRMATION_CANCELLED' | 'TEXT_TARGET_CONFIRMATION_CANCELLED';
+      action_id: string;
+      message: string;
     })
   | (DeterministicExecutionMetadata & {
       status: 'not_handled';
@@ -4254,12 +4532,88 @@ export async function tryExecuteSimpleAlbumCommand(
   input: TryExecuteSimpleAlbumCommandInput,
 ): Promise<TryExecuteSimpleAlbumCommandResult> {
   const startedAt = performance.now();
-  const parsed = parseSimpleAlbumCommand(input.userText);
-  if (!parsed.handled) {
-    return deterministicNotHandled(startedAt, parsed.reason);
+  const confirmationRequest = parseSimplePageTargetConfirmationRequest(input.userText);
+  const textConfirmationRequest = parseSimpleTextTargetConfirmationRequest(input.userText);
+  let command: SimpleAlbumCommand;
+  let confirmationActionId = '';
+  let confirmationDecision: 'apply' | 'keep' | 'cancel' | null = null;
+  let confirmationPage: number | null = null;
+  let selectedTextCandidateIds: string[] = [];
+  let pendingSnapshot: Extract<PendingAlbumConfirmation, {
+    kind: 'simple_page_target' | 'simple_text_target';
+  }> | null = null;
+  if (textConfirmationRequest) {
+    const snapshotSession = await getActiveAlbumAgentSession(input.ctx, input.projectId, input.sessionId);
+    const pending = snapshotSession.pendingConfirmation;
+    if (
+      !pending
+      || pending.kind !== 'simple_text_target'
+      || pending.actionId !== textConfirmationRequest.actionId
+      || pending.projectId !== input.projectId
+      || pending.sessionId !== input.sessionId
+    ) {
+      return deterministicTargetNotFound(startedAt, {
+        code: 'CONFIRMATION_NOT_FOUND',
+        message: '这项文字目标确认已失效或不属于当前 Session，请重新提交修改要求。',
+      });
+    }
+    pendingSnapshot = pending;
+    confirmationActionId = pending.actionId;
+    command = pending.command;
+    if (textConfirmationRequest.candidateId !== 'cancel') {
+      selectedTextCandidateIds = textConfirmationRequest.candidateId === 'all'
+        ? pending.candidates.map((candidate) => candidate.candidate_id)
+        : [textConfirmationRequest.candidateId];
+      if (selectedTextCandidateIds.some(
+        (candidateId) => !pending.candidates.some((candidate) => candidate.candidate_id === candidateId),
+      )) {
+        return deterministicTargetNotFound(startedAt, {
+          command,
+          code: 'INVALID_CONFIRMATION_CHOICE',
+          requestedPage: pending.pageNumber,
+          targetText: pending.targetText,
+          message: '确认的文字目标不在服务端候选列表中。',
+        });
+      }
+    }
+  } else if (confirmationRequest) {
+    const snapshotSession = await getActiveAlbumAgentSession(input.ctx, input.projectId, input.sessionId);
+    const pending = snapshotSession.pendingConfirmation;
+    if (
+      !pending
+      || pending.kind !== 'simple_page_target'
+      || pending.actionId !== confirmationRequest.actionId
+      || pending.projectId !== input.projectId
+      || pending.sessionId !== input.sessionId
+    ) {
+      return deterministicTargetNotFound(startedAt, {
+        code: 'CONFIRMATION_NOT_FOUND',
+        message: '这项页码确认已失效或不属于当前 Session，请重新提交修改要求。',
+      });
+    }
+    pendingSnapshot = pending;
+    confirmationActionId = pending.actionId;
+    confirmationDecision = confirmationRequest.decision;
+    confirmationPage = confirmationRequest.pageNumber;
+    command = pending.command;
+    if (confirmationDecision === 'apply') {
+      if (!confirmationPage || !pending.candidatePages.includes(confirmationPage)) {
+        return deterministicTargetNotFound(startedAt, {
+          command,
+          code: 'INVALID_CONFIRMATION_CHOICE',
+          requestedPage: pending.requestedPage,
+          targetText: pending.targetText,
+          message: '确认的目标页面不在服务端候选列表中。',
+        });
+      }
+      command = commandWithExplicitPage(command, confirmationPage, true);
+    }
+  } else {
+    const parsed = parseSimpleAlbumCommand(input.userText);
+    if (!parsed.handled) return deterministicNotHandled(startedAt, parsed.reason);
+    command = parsed.command;
   }
-  const command = parsed.command;
-  const strategy = simpleAlbumCommandStrategy(command);
+  let strategy = simpleAlbumCommandStrategy(command);
   if (input.signal?.aborted) return deterministicNotHandled(startedAt, 'cancelled', strategy);
 
   const [initialProject, initialSession, initialHtml] = await Promise.all([
@@ -4270,7 +4624,7 @@ export async function tryExecuteSimpleAlbumCommand(
   if (!initialHtml) return deterministicNotHandled(startedAt, 'no_album_html', strategy);
   if (input.signal?.aborted) return deterministicNotHandled(startedAt, 'cancelled', strategy);
   const snapshotRevision = projectAlbumRevision(initialProject);
-  const expectedRevision = input.expectedRevision ?? snapshotRevision;
+  const expectedRevision = pendingSnapshot?.expectedRevision ?? input.expectedRevision ?? snapshotRevision;
   if (!Number.isSafeInteger(expectedRevision) || expectedRevision < 0) {
     return deterministicNotHandled(startedAt, 'invalid_expected_revision', strategy);
   }
@@ -4279,13 +4633,126 @@ export async function tryExecuteSimpleAlbumCommand(
 
   return withAlbumWriteQueue(queueKey, async () => {
     if (input.signal?.aborted) return deterministicNotHandled(startedAt, 'cancelled', strategy);
-    const [project, session, currentHtml] = await Promise.all([
+    const [project, loadedSession, currentHtml] = await Promise.all([
       input.ctx.orchestrator.load(input.projectId),
       getActiveAlbumAgentSession(input.ctx, input.projectId, input.sessionId),
       input.ctx.orchestrator.readRawHtml(input.projectId).catch(() => null),
     ]);
+    let session = loadedSession;
+    if (textConfirmationRequest) {
+      const pending = session.pendingConfirmation;
+      if (
+        !pending
+        || pending.kind !== 'simple_text_target'
+        || pending.actionId !== confirmationActionId
+        || pending.projectId !== input.projectId
+        || pending.sessionId !== input.sessionId
+      ) {
+        return deterministicTargetNotFound(startedAt, {
+          command,
+          code: 'CONFIRMATION_NOT_FOUND',
+          message: '这项文字目标确认已失效或不属于当前 Session，请重新提交修改要求。',
+        });
+      }
+      if (Date.parse(pending.expiresAt) <= Date.now()) {
+        await persistAlbumAgentSession(input.ctx, {
+          ...session,
+          pendingConfirmation: null,
+          updatedAt: new Date().toISOString(),
+        });
+        return deterministicTargetNotFound(startedAt, {
+          command,
+          code: 'CONFIRMATION_EXPIRED',
+          requestedPage: pending.pageNumber,
+          targetText: pending.targetText,
+          message: '文字目标确认已过期，请重新提交修改要求。',
+        });
+      }
+      if (textConfirmationRequest.candidateId === 'cancel') {
+        await persistAlbumAgentSession(input.ctx, {
+          ...session,
+          pendingConfirmation: null,
+          updatedAt: new Date().toISOString(),
+        });
+        return {
+          status: 'handled_cancelled',
+          executor: 'deterministic',
+          strategy: 'locate_text_same_page',
+          duration_ms: elapsedMilliseconds(startedAt),
+          command,
+          album_changed: false,
+          code: 'TEXT_TARGET_CONFIRMATION_CANCELLED',
+          action_id: pending.actionId,
+          message: '已取消这次修改，相册内容没有改变。',
+        };
+      }
+      command = commandWithExplicitPage(pending.command, pending.pageNumber, true);
+      strategy = simpleAlbumCommandStrategy(command);
+    } else if (confirmationRequest) {
+      const pending = session.pendingConfirmation;
+      if (
+        !pending
+        || pending.kind !== 'simple_page_target'
+        || pending.actionId !== confirmationActionId
+        || pending.projectId !== input.projectId
+        || pending.sessionId !== input.sessionId
+      ) {
+        return deterministicTargetNotFound(startedAt, {
+          command,
+          code: 'CONFIRMATION_NOT_FOUND',
+          message: '这项页码确认已失效或不属于当前 Session，请重新提交修改要求。',
+        });
+      }
+      if (Date.parse(pending.expiresAt) <= Date.now()) {
+        await persistAlbumAgentSession(input.ctx, {
+          ...session,
+          pendingConfirmation: null,
+          updatedAt: new Date().toISOString(),
+        });
+        return deterministicTargetNotFound(startedAt, {
+          command,
+          code: 'CONFIRMATION_EXPIRED',
+          requestedPage: pending.requestedPage,
+          targetText: pending.targetText,
+          message: '页码确认已过期，请重新提交修改要求。',
+        });
+      }
+      if (confirmationDecision === 'cancel' || confirmationDecision === 'keep') {
+        await persistAlbumAgentSession(input.ctx, {
+          ...session,
+          pendingConfirmation: null,
+          updatedAt: new Date().toISOString(),
+        });
+        if (confirmationDecision === 'cancel') {
+          return {
+            status: 'handled_cancelled',
+            executor: 'deterministic',
+            strategy: 'locate_text_cross_page',
+            duration_ms: elapsedMilliseconds(startedAt),
+            command,
+            album_changed: false,
+            code: 'PAGE_TARGET_CONFIRMATION_CANCELLED',
+            action_id: pending.actionId,
+            message: '已取消这次修改，相册内容没有改变。',
+          };
+        }
+        return deterministicTargetNotFound(startedAt, {
+          command,
+          code: 'REQUESTED_PAGE_TARGET_NOT_FOUND',
+          requestedPage: pending.requestedPage,
+          targetText: pending.targetText,
+          message: `第 ${pending.requestedPage} 页仍未找到“${pending.targetText}”，请重新指定要修改的文字。`,
+        });
+      }
+      command = commandWithExplicitPage(pending.command, confirmationPage!, true);
+      strategy = simpleAlbumCommandStrategy(command);
+    }
     const currentRevision = projectAlbumRevision(project);
     if (currentRevision !== expectedRevision) {
+      if (confirmationRequest || textConfirmationRequest) {
+        session = { ...session, pendingConfirmation: null, updatedAt: new Date().toISOString() };
+        await persistAlbumAgentSession(input.ctx, session);
+      }
       return {
         status: 'handled_conflict',
         executor: 'deterministic',
@@ -4301,10 +4768,17 @@ export async function tryExecuteSimpleAlbumCommand(
     if (input.signal?.aborted) return deterministicNotHandled(startedAt, 'cancelled', strategy);
 
     // Loaded lazily to keep the source patcher independent from HTTP startup.
-    const { executeSimpleAlbumHtmlPatch } = await import('./simple-album-html-patch.js');
-    const patchResult = executeSimpleAlbumHtmlPatch(currentHtml, command, {
-      currentPageNumber: sessionCurrentPageNumber(session) ?? initialCurrentPage ?? undefined,
-    });
+    const patcher = await import('./simple-album-html-patch.js');
+    const patchResult = textConfirmationRequest && pendingSnapshot?.kind === 'simple_text_target'
+      ? patcher.executeSimpleAlbumHtmlPatchForCandidates(
+          currentHtml,
+          command,
+          pendingSnapshot.candidates,
+          selectedTextCandidateIds,
+        )
+      : patcher.executeSimpleAlbumHtmlPatch(currentHtml, command, {
+          currentPageNumber: sessionCurrentPageNumber(session) ?? initialCurrentPage ?? undefined,
+        });
     if (!patchResult.handled) {
       if (patchResult.reason === 'validation_failed') {
         return {
@@ -4317,6 +4791,149 @@ export async function tryExecuteSimpleAlbumCommand(
           validation_reasons: patchResult.validation_reasons ?? [],
           album_changed: false,
         };
+      }
+      if (patchResult.reason === 'target_ambiguous' && !confirmationRequest && !textConfirmationRequest) {
+        const located = patcher.locateSimpleTextTargetCandidates(currentHtml, command, {
+          currentPageNumber: sessionCurrentPageNumber(session) ?? initialCurrentPage ?? undefined,
+        });
+        if (located.handled && located.candidates.length > 1) {
+          const now = new Date();
+          const pageNumber = located.candidates[0]!.page_number;
+          const targetText = simpleAlbumCommandTargetText(command);
+          const summary = `第 ${pageNumber} 页找到 ${located.candidates.length} 处“${targetText}”，请选择要修改的位置。`;
+          const pending: Extract<PendingAlbumConfirmation, { kind: 'simple_text_target' }> = {
+            actionId: randomUUID(),
+            kind: 'simple_text_target',
+            code: 'TEXT_TARGET_AMBIGUOUS',
+            summary,
+            projectId: input.projectId,
+            sessionId: input.sessionId,
+            expectedRevision,
+            pageNumber,
+            targetText,
+            command: commandWithExplicitPage(command, pageNumber, true),
+            candidates: located.candidates,
+            createdAt: now.toISOString(),
+            expiresAt: new Date(now.getTime() + 15 * 60_000).toISOString(),
+          };
+          await persistAlbumAgentSession(input.ctx, {
+            ...session,
+            pendingConfirmation: pending,
+            updatedAt: now.toISOString(),
+          });
+          return {
+            status: 'handled_confirmation_required',
+            executor: 'deterministic',
+            strategy: 'locate_text_same_page',
+            duration_ms: elapsedMilliseconds(startedAt),
+            command,
+            album_changed: false,
+            code: 'TEXT_TARGET_AMBIGUOUS',
+            action_id: pending.actionId,
+            requested_page: pageNumber,
+            suggested_page: null,
+            candidate_pages: [pageNumber],
+            candidates: pending.candidates,
+            target_text: targetText,
+            expected_revision: expectedRevision,
+            summary,
+            expires_at: pending.expiresAt,
+          };
+        }
+      }
+      if (patchResult.reason === 'target_changed' && textConfirmationRequest) {
+        await persistAlbumAgentSession(input.ctx, {
+          ...session,
+          pendingConfirmation: null,
+          updatedAt: new Date().toISOString(),
+        });
+        return deterministicTargetNotFound(startedAt, {
+          command,
+          code: 'TEXT_TARGET_CHANGED',
+          requestedPage: pendingSnapshot?.kind === 'simple_text_target'
+            ? pendingSnapshot.pageNumber
+            : null,
+          targetText: simpleAlbumCommandTargetText(command),
+          message: '候选文字或其源码已经变化，请刷新后重新提交修改要求。',
+        });
+      }
+      if (patchResult.reason === 'target_not_found') {
+        if (confirmationRequest) {
+          session = { ...session, pendingConfirmation: null, updatedAt: new Date().toISOString() };
+          await persistAlbumAgentSession(input.ctx, session);
+          return deterministicTargetNotFound(startedAt, {
+            command,
+            code: 'CONFIRMED_PAGE_TARGET_NOT_FOUND',
+            requestedPage: 'page_number' in command ? command.page_number : null,
+            targetText: simpleAlbumCommandTargetText(command),
+            message: '确认后目标文字已不存在，请刷新后重新提交修改要求。',
+          });
+        }
+        const requestedPage = command.page_number;
+        const strictPage = 'page_match_policy' in command && command.page_match_policy === 'strict';
+        if (typeof requestedPage === 'number' && !strictPage) {
+          const { locateSimpleAlbumTextTargets } = await import('./simple-album-html-patch.js');
+          const located = locateSimpleAlbumTextTargets(currentHtml, command);
+          const candidates = located.handled
+            ? located.locations
+              .filter((location) => location.page_number !== requestedPage && location.match_count === 1)
+              .map((location) => location.page_number)
+            : [];
+          if (candidates.length > 0) {
+            const now = new Date();
+            const targetText = simpleAlbumCommandTargetText(command);
+            const summary = candidates.length === 1
+              ? `第 ${requestedPage} 页没有找到“${targetText}”，但在第 ${candidates[0]} 页唯一找到。是否修改第 ${candidates[0]} 页？`
+              : `第 ${requestedPage} 页没有找到“${targetText}”，但在第 ${candidates.join('、')} 页找到。请选择要修改的页面。`;
+            const pending: Extract<PendingAlbumConfirmation, { kind: 'simple_page_target' }> = {
+              actionId: randomUUID(),
+              kind: 'simple_page_target',
+              summary,
+              projectId: input.projectId,
+              sessionId: input.sessionId,
+              expectedRevision,
+              requestedPage,
+              candidatePages: candidates,
+              targetText,
+              command,
+              createdAt: now.toISOString(),
+              expiresAt: new Date(now.getTime() + 15 * 60_000).toISOString(),
+            };
+            await persistAlbumAgentSession(input.ctx, {
+              ...session,
+              pendingConfirmation: pending,
+              updatedAt: now.toISOString(),
+            });
+            return {
+              status: 'handled_confirmation_required',
+              executor: 'deterministic',
+              strategy: 'locate_text_cross_page',
+              duration_ms: elapsedMilliseconds(startedAt),
+              command,
+              album_changed: false,
+              code: 'PAGE_TARGET_MISMATCH',
+              action_id: pending.actionId,
+              requested_page: pending.requestedPage,
+              suggested_page: candidates.length === 1 ? candidates[0]! : null,
+              candidate_pages: candidates,
+              candidates: [],
+              target_text: targetText,
+              expected_revision: expectedRevision,
+              summary,
+              expires_at: pending.expiresAt,
+            };
+          }
+        }
+        if (!strictPage && !hasExplicitTextTargetEvidence(input.userText)) {
+          return deterministicNotHandled(startedAt, 'unproven_text_command', strategy);
+        }
+        return deterministicTargetNotFound(startedAt, {
+          command,
+          code: 'TARGET_TEXT_NOT_FOUND',
+          requestedPage: 'page_number' in command ? command.page_number : sessionCurrentPageNumber(session),
+          targetText: simpleAlbumCommandTargetText(command),
+          message: `没有在目标页面找到“${simpleAlbumCommandTargetText(command)}”，相册内容没有改变。`,
+        });
       }
       return deterministicNotHandled(startedAt, patchResult.reason, strategy);
     }
@@ -4381,11 +4998,14 @@ export async function tryExecuteSimpleAlbumCommand(
       };
     }
 
-    const updatedSession = updateSessionAfterAlbumUpdate(
+    let updatedSession = updateSessionAfterAlbumUpdate(
       session,
       saved,
       patchResult.patch.page_number - 1,
     );
+    if (confirmationRequest || textConfirmationRequest) {
+      updatedSession = { ...updatedSession, pendingConfirmation: null };
+    }
     await persistAlbumAgentSession(input.ctx, updatedSession);
     return {
       status: 'handled_success',
@@ -4400,6 +5020,7 @@ export async function tryExecuteSimpleAlbumCommand(
       page_number: patchResult.patch.page_number,
       page_count: Number(saved.page_count),
       changed_key: patchResult.patch.changed_key,
+      changed_keys: patchResult.patch.changed_keys,
       source_range: patchResult.patch.source_range,
       replacement_range: patchResult.patch.replacement_range,
       preview_url: String(saved.preview_url ?? `/preview/${input.projectId}`),
@@ -4416,6 +5037,84 @@ function simpleAlbumCommandStrategy(command: SimpleAlbumCommand): SimpleAlbumHtm
   return command.type === 'replace_text'
     ? 'replace_text_node_source'
     : 'wrap_text_node_with_color_span';
+}
+
+interface SimplePageTargetConfirmationRequest {
+  actionId: string;
+  decision: 'apply' | 'keep' | 'cancel';
+  pageNumber: number | null;
+}
+
+interface SimpleTextTargetConfirmationRequest {
+  actionId: string;
+  candidateId: string;
+}
+
+function parseSimpleTextTargetConfirmationRequest(
+  input: string,
+): SimpleTextTargetConfirmationRequest | null {
+  const match = /^\[fast-text-confirm:([0-9a-f-]{36}):(txt_[0-9a-f]{24}|all|cancel)\]$/iu.exec(
+    String(input ?? '').trim(),
+  );
+  if (!match?.[1] || !match[2]) return null;
+  return { actionId: match[1], candidateId: match[2].toLowerCase() };
+}
+
+function parseSimplePageTargetConfirmationRequest(
+  input: string,
+): SimplePageTargetConfirmationRequest | null {
+  const match = /^\[fast-page-confirm:([0-9a-f-]{36}):(apply|keep|cancel)(?::(\d{1,2}))?\]$/i.exec(
+    String(input ?? '').trim(),
+  );
+  if (!match?.[1] || !match[2]) return null;
+  const pageNumber = match[3] ? Number(match[3]) : null;
+  return {
+    actionId: match[1],
+    decision: match[2].toLowerCase() as SimplePageTargetConfirmationRequest['decision'],
+    pageNumber: Number.isSafeInteger(pageNumber) && Number(pageNumber) > 0 ? pageNumber : null,
+  };
+}
+
+function commandWithExplicitPage(
+  command: SimpleAlbumCommand,
+  pageNumber: number,
+  strict: boolean,
+): SimpleAlbumCommand {
+  const page = {
+    page_number: pageNumber,
+    ...(strict && { page_match_policy: 'strict' as const }),
+  };
+  return command.type === 'replace_text'
+    ? { type: 'replace_text', ...page, old_text: command.old_text, new_text: command.new_text }
+    : { type: 'set_text_color', ...page, target_text: command.target_text, color: command.color };
+}
+
+function simpleAlbumCommandTargetText(command: SimpleAlbumCommand): string {
+  return command.type === 'replace_text' ? command.old_text : command.target_text;
+}
+
+function deterministicTargetNotFound(
+  startedAt: number,
+  args: {
+    command?: SimpleAlbumCommand;
+    code: string;
+    requestedPage?: number | null;
+    targetText?: string;
+    message: string;
+  },
+): TryExecuteSimpleAlbumCommandResult {
+  return {
+    status: 'handled_target_not_found',
+    executor: 'deterministic',
+    strategy: 'locate_text_cross_page',
+    duration_ms: elapsedMilliseconds(startedAt),
+    ...(args.command && { command: args.command }),
+    album_changed: false,
+    code: args.code,
+    requested_page: args.requestedPage ?? null,
+    target_text: args.targetText ?? '',
+    message: args.message,
+  };
 }
 
 function deterministicNotHandled(
@@ -4827,6 +5526,7 @@ async function executeAlbumUpdateTool(
 ): Promise<Record<string, unknown>> {
   const key = runtimeProjectKey(args.ctx, args.projectId);
   return withAlbumWriteQueue(key, async () => {
+    if (args.signal?.aborted) throw new Error('Album update cancelled');
     let session = await getActiveAlbumAgentSession(
       args.ctx,
       args.projectId,
@@ -4955,6 +5655,8 @@ async function executeAlbumUpdateTool(
         attachments,
       });
     }
+
+    if (args.signal?.aborted) throw new Error('Album update cancelled');
 
     const saved = await persistAlbumUpdate({
       ...args,
@@ -5153,6 +5855,7 @@ function updateSessionAfterAlbumUpdate(
 async function persistAlbumUpdate(args: (ExecuteAlbumUpdateToolArgs | {
   ctx: CliContext;
   projectId: string;
+  signal?: AbortSignal;
 }) & {
   currentHtml: string;
   modifiedHtml: string;
@@ -5161,6 +5864,7 @@ async function persistAlbumUpdate(args: (ExecuteAlbumUpdateToolArgs | {
   operation?: 'update_album' | 'update_album_page' | 'replace_album_assets';
   allowedRemovedImageRefs?: ReadonlySet<string>;
 }): Promise<Record<string, unknown>> {
+  if (args.signal?.aborted) throw new Error('Album update cancelled');
   const validation = validateAlbumHtmlBeforePersist(args.currentHtml, args.modifiedHtml, {
     allowedRemovedImageRefs: args.allowedRemovedImageRefs,
   });
@@ -5186,6 +5890,7 @@ async function persistAlbumUpdate(args: (ExecuteAlbumUpdateToolArgs | {
       );
     }
   }
+  if (args.signal?.aborted) throw new Error('Album update cancelled');
   const written = await args.ctx.orchestrator.writePreviewHtmlRawIfRevision(
     args.projectId,
     args.modifiedHtml,
@@ -5233,6 +5938,7 @@ async function persistAlbumUpdate(args: (ExecuteAlbumUpdateToolArgs | {
 async function generateAndPersistAlbum(args: ExecuteAlbumGenerationToolArgs & {
   expectedRevision: number;
 }): Promise<Record<string, unknown>> {
+  if (args.signal?.aborted) throw new Error('Album generation cancelled');
   const beforeProject = await args.ctx.orchestrator.load(args.projectId);
   const currentRevision = projectAlbumRevision(beforeProject);
   if (currentRevision !== args.expectedRevision) {
@@ -5277,6 +5983,7 @@ async function generateAndPersistAlbum(args: ExecuteAlbumGenerationToolArgs & {
     attachments,
     signal: args.signal,
   });
+  if (args.signal?.aborted) throw new Error('Album generation cancelled');
 
   let writeStarted = false;
   try {

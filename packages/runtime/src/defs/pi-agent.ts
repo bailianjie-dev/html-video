@@ -80,23 +80,33 @@ export function resolvePiAgentConfig(modelOverride?: string): PiAgentResolvedCon
   return { apiKey, baseUrl, model, maxTokens };
 }
 
+const DEFAULT_PI_ABORT_GRACE_MS = 1_000;
+
 /**
- * Treat completion of session.abort() as authoritative cancellation. Some
- * SDK/provider combinations leave the original prompt promise pending after
- * abort, which otherwise prevents the Run from ever emitting run.cancelled.
+ * Ask the SDK to abort, but do not let its waitForIdle() contract keep the host
+ * Run alive forever. Pi propagates the abort signal to the active model/tool
+ * synchronously; the grace period only bounds the subsequent idle wait.
  */
 export async function waitForPiPromptOrAbort(
   promptPromise: Promise<unknown>,
   abortSession: () => Promise<unknown>,
   signal: AbortSignal,
+  abortGraceMs = DEFAULT_PI_ABORT_GRACE_MS,
 ): Promise<'completed' | 'aborted'> {
   let abortStarted = false;
+  let abortTimer: ReturnType<typeof setTimeout> | undefined;
   let resolveAborted!: () => void;
   const aborted = new Promise<void>((resolve) => { resolveAborted = resolve; });
   const onAbort = () => {
     if (abortStarted) return;
     abortStarted = true;
-    void abortSession().catch(() => { /* abort is best effort */ }).finally(resolveAborted);
+    const settle = () => {
+      if (abortTimer) clearTimeout(abortTimer);
+      abortTimer = undefined;
+      resolveAborted();
+    };
+    abortTimer = setTimeout(settle, Math.max(0, abortGraceMs));
+    void abortSession().catch(() => { /* abort is best effort */ }).finally(settle);
   };
   if (signal.aborted) onAbort();
   else signal.addEventListener('abort', onAbort, { once: true });
@@ -107,6 +117,7 @@ export async function waitForPiPromptOrAbort(
     ]);
   } finally {
     signal.removeEventListener('abort', onAbort);
+    if (abortTimer) clearTimeout(abortTimer);
   }
 }
 
@@ -206,16 +217,23 @@ async function runPiSdkSession(opts: {
     }
     if (event.type === 'agent_end') {
       const lastAssistant = [...event.messages].reverse().find((m) => m.role === 'assistant');
-      if (
-        lastAssistant
-        && 'stopReason' in lastAssistant
-        && (lastAssistant.stopReason === 'error' || lastAssistant.stopReason === 'aborted')
-      ) {
+      if (!lastAssistant || !('stopReason' in lastAssistant)) return;
+      const stopReason = String(lastAssistant.stopReason || '');
+      if (stopReason === 'error' || stopReason === 'aborted') {
         failed = true;
         const msg = ('errorMessage' in lastAssistant && lastAssistant.errorMessage)
           ? String(lastAssistant.errorMessage)
-          : `Pi Agent stopped with reason: ${lastAssistant.stopReason}`;
+          : `Pi Agent stopped with reason: ${stopReason}`;
         onEvent({ type: 'error', message: msg });
+        return;
+      }
+      // Provider hit the completion budget (config max_tokens) before a usable reply.
+      if (stopReason === 'length') {
+        failed = true;
+        onEvent({
+          type: 'error',
+          message: 'OUTPUT_TOKEN_LIMIT: model stopped because max_tokens was reached',
+        });
       }
     }
   });

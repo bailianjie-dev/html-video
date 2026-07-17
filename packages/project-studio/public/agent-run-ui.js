@@ -37,11 +37,86 @@ function shortText(value, maxLength = 96) {
   return text.length > maxLength ? `${text.slice(0, maxLength - 1)}…` : text;
 }
 
+/** User-facing Chinese labels for agent-run error codes / known English messages. */
+export function localizeAgentRunError(code, message) {
+  const rawCode = String(code || '').trim();
+  const rawMessage = String(message || '').trim();
+  const lowerMessage = rawMessage.toLowerCase();
+
+  const titleByCode = {
+    EMPTY_RESPONSE: '没有得到有效回复',
+    AGENT_FAILED: '处理失败',
+    RUN_CANCELLED: '已取消',
+    RUN_ERROR: '执行出错',
+    TOOL_FAILED: '操作失败',
+    OUTPUT_TOKEN_LIMIT: '回复长度超出上限',
+  };
+
+  let detail = '';
+  if (!rawMessage) {
+    detail = '';
+  } else if (/OUTPUT_TOKEN_LIMIT|max_tokens|stop(?:ped)?(?:\s+with\s+reason:)?\s*length/i.test(rawMessage)) {
+    detail = '本次回复达到了输出长度上限。请在把要求拆成更短的步骤。';
+  } else if (/empty response/i.test(rawMessage)) {
+    detail = 'AI 没有返回有效内容，请重试一次。';
+  } else if (/agent run cancelled/i.test(rawMessage)) {
+    detail = '本轮操作已取消。';
+  } else if (/agent exited with code\s*(-?\d+)/i.test(rawMessage)) {
+    const exitCode = /agent exited with code\s*(-?\d+)/i.exec(rawMessage)?.[1] ?? '';
+    detail = exitCode ? `AI 异常结束（代码 ${exitCode}），请重试。` : 'AI 异常结束，请重试。';
+  } else if (/^[A-Z][A-Z0-9_]+$/.test(rawMessage) && titleByCode[rawMessage]) {
+    detail = titleByCode[rawMessage];
+  } else if (/[A-Za-z]{4,}/.test(rawMessage) && !/[\u4e00-\u9fff]/.test(rawMessage)) {
+    // Prefer a known code title over dumping raw English to end users.
+    detail = titleByCode[rawCode] || '请稍后重试；若反复出现，可换一种说法再试。';
+  } else {
+    detail = shortText(rawMessage, 180);
+  }
+
+  const title = titleByCode[rawCode]
+    || (lowerMessage.includes('token') || lowerMessage.includes('max_tokens') || /\blength\b/.test(lowerMessage)
+      ? '回复长度超出上限'
+      : '')
+    || (lowerMessage.includes('cancel') ? '已取消' : '')
+    || (lowerMessage.includes('empty') ? '没有得到有效回复' : '')
+    || '执行出错';
+
+  return {
+    code: rawCode || 'RUN_ERROR',
+    title,
+    message: detail || title,
+  };
+}
+
 function compactIdentifier(value, maxLength = 32) {
   const text = shortText(value, maxLength);
   if (!text || text === '[已隐藏]') return text;
   if (text.length <= maxLength) return text;
   return `${text.slice(0, 12)}…${text.slice(-8)}`;
+}
+
+function safeActionIdentifier(value) {
+  const text = String(value ?? '').trim();
+  return /^[A-Za-z0-9_-]{1,80}$/.test(text) ? text : '';
+}
+
+export function buildFastPageConfirmationMarker({ actionId, decision, pageNumber = null } = {}) {
+  const safeActionId = safeActionIdentifier(actionId);
+  const safeDecision = String(decision || '').toLowerCase();
+  if (!safeActionId || !['apply', 'keep', 'cancel'].includes(safeDecision)) return '';
+  if (safeDecision === 'apply') {
+    const page = finiteNumber(pageNumber);
+    if (!Number.isInteger(page) || page < 1 || page > 30) return '';
+    return `[fast-page-confirm:${safeActionId}:apply:${page}]`;
+  }
+  return `[fast-page-confirm:${safeActionId}:${safeDecision}]`;
+}
+
+export function buildFastTextConfirmationMarker({ actionId, candidateId } = {}) {
+  const safeActionId = safeActionIdentifier(actionId);
+  const safeCandidateId = String(candidateId || '').toLowerCase();
+  if (!safeActionId || !/^(?:txt_[0-9a-f]{24}|all|cancel)$/.test(safeCandidateId)) return '';
+  return `[fast-text-confirm:${safeActionId}:${safeCandidateId}]`;
 }
 
 export function summarizeToolArguments(name, input) {
@@ -59,7 +134,6 @@ export function summarizeToolArguments(name, input) {
   add('颜色', shortText(args.color, 32));
   add('目标', shortText(args.target_key, 48));
   add('资源', compactIdentifier(args.asset_id));
-  add('预期版本', finiteNumber(args.expected_revision));
   add('确认操作', compactIdentifier(args.action_id));
 
   const request = args.request ?? args.instructions ?? args.requirements ?? args.topic;
@@ -106,6 +180,22 @@ export function extractToolResultDetails(output) {
   const changedPages = Array.isArray(details.changed_pages)
     ? details.changed_pages.map(finiteNumber).filter((value) => value !== null)
     : [];
+  const textTargetCandidates = Array.isArray(details.candidates)
+    ? details.candidates.map((raw) => {
+        const candidate = objectValue(raw);
+        const candidateId = String(candidate.candidate_id || '').toLowerCase();
+        if (!/^txt_[0-9a-f]{24}$/.test(candidateId)) return null;
+        return {
+          candidateId,
+          pageNumber: finiteNumber(candidate.page_number),
+          textKey: shortText(candidate.data_hv_text_key, 80),
+          occurrenceIndex: finiteNumber(candidate.occurrence_index),
+          matchedText: shortText(candidate.matched_text, 80),
+          contextBefore: shortText(candidate.context_before, 80),
+          contextAfter: shortText(candidate.context_after, 80),
+        };
+      }).filter(Boolean)
+    : [];
 
   return {
     ok: details.ok !== false && result.isError !== true,
@@ -132,8 +222,16 @@ export function extractToolResultDetails(output) {
       : 0,
     structuralChange: details.structural_change === true,
     confirmationRequired: details.confirmation_required === true,
-    actionId: compactIdentifier(details.action_id),
+    actionId: safeActionIdentifier(details.action_id),
     confirmationSummary: shortText(details.summary, 160),
+    confirmationKind: shortText(details.confirmation_kind, 64),
+    requestedPage: finiteNumber(details.requested_page),
+    suggestedPage: finiteNumber(details.suggested_page),
+    candidatePages: Array.isArray(details.candidate_pages)
+      ? details.candidate_pages.map(finiteNumber).filter((value) => value !== null)
+      : [],
+    textTargetCandidates,
+    targetText: shortText(details.target_text, 120),
     expiresAt: shortText(details.expires_at, 48),
     targetKey: shortText(details.target_key, 64),
     albumChanged: details.album_changed === true,
@@ -159,7 +257,7 @@ export function createAgentRunUiState({ runId = '', sessionId = '' } = {}) {
     runId: String(runId || ''),
     sessionId: String(sessionId || ''),
     status: 'idle',
-    statusText: '等待 Agent 启动',
+    statusText: '等待启动',
     agent: '',
     model: '',
     lastSequence: 0,
@@ -276,6 +374,12 @@ export function reduceAgentRunUiEvent(previousState, event) {
               summary: result.confirmationSummary,
               expectedRevision: result.expectedRevision,
               expiresAt: result.expiresAt,
+              kind: result.confirmationKind,
+              requestedPage: result.requestedPage,
+              suggestedPage: result.suggestedPage,
+              candidatePages: result.candidatePages,
+              candidates: result.textTargetCandidates,
+              targetText: result.targetText,
             }
           : state.confirmation,
       conflict:
@@ -339,21 +443,23 @@ export function reduceAgentRunUiEvent(previousState, event) {
     };
     effects.push({ type: 'terminal', status: 'completed' });
   } else if (event.type === 'run.failed') {
+    const localized = localizeAgentRunError(data.code, data.message);
     state = {
       ...state,
       status: 'failed',
       statusText: '本轮执行失败',
       tools: settleRunningTools(state.tools, 'failed'),
-      error: { code: shortText(data.code, 64), message: shortText(data.message, 180) },
+      error: { code: localized.code, message: localized.message, title: localized.title },
     };
     effects.push({ type: 'terminal', status: 'failed' });
   } else if (event.type === 'run.cancelled') {
+    const localized = localizeAgentRunError('RUN_CANCELLED', data.message);
     state = {
       ...state,
       status: 'cancelled',
       statusText: '本轮已取消',
       tools: settleRunningTools(state.tools, 'cancelled'),
-      error: { code: 'RUN_CANCELLED', message: shortText(data.message, 180) },
+      error: { code: localized.code, message: localized.message, title: localized.title },
     };
     effects.push({ type: 'terminal', status: 'cancelled' });
   }
@@ -381,7 +487,7 @@ export function reconcileRestoredAgentRunUi(restored, activeRun, sessionId) {
   return {
     ...createAgentRunUiState({ runId: activeRunId, sessionId }),
     status: 'running',
-    statusText: '正在恢复 Agent 运行状态',
+    statusText: '正在恢复运行状态',
   };
 }
 

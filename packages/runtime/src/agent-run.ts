@@ -145,8 +145,11 @@ export async function runAgentTurn(opts: RunAgentTurnOptions): Promise<AgentTurn
     events.append('run.cancelled', { message: 'Agent run cancelled' });
   } else if (exitCode !== 0 || error || !text.trim()) {
     if (!error && !text.trim()) error = 'Agent returned an empty response';
+    const tokenLimit = /OUTPUT_TOKEN_LIMIT|max_tokens|stop(?:ped)?(?:\s+with\s+reason:)?\s*length/i.test(error);
     events.append('run.failed', {
-      code: text.trim() ? 'AGENT_FAILED' : 'EMPTY_RESPONSE',
+      code: tokenLimit
+        ? 'OUTPUT_TOKEN_LIMIT'
+        : (text.trim() ? 'AGENT_FAILED' : 'EMPTY_RESPONSE'),
       message: error || `Agent exited with code ${exitCode}`,
     });
   } else {

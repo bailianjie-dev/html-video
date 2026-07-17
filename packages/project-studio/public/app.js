@@ -3,8 +3,11 @@
 import { t, getLocale, setLocale, AVAILABLE_LOCALES } from './i18n.js';
 import {
   buildAgentViewStateSnapshot,
+  buildFastPageConfirmationMarker,
+  buildFastTextConfirmationMarker,
   createAgentRunUiState,
   isAgentRunExecutionActive,
+  localizeAgentRunError,
   preserveActivePageIndex,
   reconcileRestoredAgentRunUi,
   reduceAgentRunUiEvent,
@@ -143,6 +146,7 @@ const state = {
   messages: [],
   agentSessions: [],
   activeAgentSessionId: null,
+  resolvedFastPageConfirmationActions: new Set(),
   agentSessionsLoading: false,
   agentSessionLoadToken: 0,
   projectAssets: [],
@@ -962,20 +966,35 @@ function pendingConfirmationRunState(session) {
       summary: pending.summary || '',
       expectedRevision: pending.expected_revision ?? null,
       expiresAt: pending.expires_at || '',
+      kind: pending.kind || '',
+      requestedPage: pending.requested_page ?? null,
+      suggestedPage: pending.candidate_pages?.length === 1 ? pending.candidate_pages[0] : null,
+      candidatePages: pending.candidate_pages || [],
+      targetText: pending.target_text || '',
+      pageNumber: pending.page_number ?? null,
+      candidates: pending.candidates || [],
     },
     tools: [{
       callId: `pending-${pending.action_id}`,
-      name: 'generate_album',
+      name: pending.kind === 'simple_page_target' ? 'locate_album_text' : 'generate_album',
       status: 'confirmation_required',
       argumentSummary: ['等待确认'],
       result: {
         ok: false,
-        code: 'OVERWRITE_CONFIRMATION_REQUIRED',
+        code: pending.kind === 'simple_page_target'
+          ? 'PAGE_TARGET_MISMATCH'
+          : 'OVERWRITE_CONFIRMATION_REQUIRED',
         confirmationRequired: true,
         actionId: pending.action_id,
         confirmationSummary: pending.summary || '',
         expectedRevision: pending.expected_revision ?? null,
         expiresAt: pending.expires_at || '',
+        confirmationKind: pending.kind || '',
+        requestedPage: pending.requested_page ?? null,
+        suggestedPage: pending.candidate_pages?.length === 1 ? pending.candidate_pages[0] : null,
+        candidatePages: pending.candidate_pages || [],
+        targetText: pending.target_text || '',
+        candidates: pending.candidates || [],
       },
     }],
   };
@@ -1074,52 +1093,19 @@ async function switchAgentSession(sessionId) {
 }
 
 function agentSessionBarHtml() {
-  const ordered = [...state.agentSessions].sort((left, right) => {
-    const created = String(left.created_at || '').localeCompare(String(right.created_at || ''));
-    return created || String(left.id).localeCompare(String(right.id));
-  });
-  const options = ordered.map((session) => {
-    const indicators = [
-      session.active_run ? '运行中' : '',
-      session.has_pending_confirmation ? '待确认' : '',
-    ].filter(Boolean);
-    const label = sessionDisplayTitle(session, state.agentSessions);
-    const text = indicators.length ? `${label} · ${indicators.join(' · ')}` : label;
-    return `<option value="${esc(session.id)}"${session.id === state.activeAgentSessionId ? ' selected' : ''}>${esc(text)}</option>`;
-  }).join('');
-  return `<div class="agent-session-bar" id="agent-session-bar">
-    <label class="agent-session-picker">
-      <span>Session</span>
-      <select id="agent-session-select" aria-label="切换 Agent Session"${state.agentSessionsLoading ? ' disabled' : ''}>
-        ${options || '<option value="">正在准备 Session…</option>'}
-      </select>
-    </label>
-    <div class="agent-session-actions">
-      <button type="button" id="btn-agent-session-new" title="创建 Session" aria-label="创建 Session">＋</button>
-      <button type="button" id="btn-agent-session-rename" title="重命名当前 Session">重命名</button>
-      <button type="button" id="btn-agent-session-archive" title="归档当前 Session">归档</button>
-    </div>
-  </div>`;
+  // Session switch / rename / archive stay internal — end users only see one
+  // conversation. Backend session plumbing is unchanged.
+  return '';
 }
 
 function renderAgentSessionBar() {
   const target = document.getElementById('agent-session-bar');
   if (!target) return;
-  const wrapper = document.createElement('div');
-  wrapper.innerHTML = agentSessionBarHtml();
-  target.replaceWith(wrapper.firstElementChild);
-  wireAgentSessionBar();
+  target.remove();
 }
 
 function wireAgentSessionBar() {
-  const select = document.getElementById('agent-session-select');
-  if (select) select.onchange = () => void switchAgentSession(select.value);
-  const createButton = document.getElementById('btn-agent-session-new');
-  if (createButton) createButton.onclick = () => void createAgentSessionFromUi();
-  const renameButton = document.getElementById('btn-agent-session-rename');
-  if (renameButton) renameButton.onclick = () => void renameActiveAgentSession();
-  const archiveButton = document.getElementById('btn-agent-session-archive');
-  if (archiveButton) archiveButton.onclick = () => void archiveActiveAgentSession();
+  // No-op while the session bar is hidden from the assistant UI.
 }
 
 async function createAgentSessionFromUi() {
@@ -4717,6 +4703,12 @@ function renderChatLog() {
   log.querySelectorAll('[data-cancel-agent-run]').forEach((button) => {
     button.onclick = () => void cancelActiveAgentRun(button.dataset.cancelAgentRun, button);
   });
+  log.querySelectorAll('[data-fast-page-confirm]').forEach((button) => {
+    button.onclick = () => void sendFastPageTargetConfirmation(button);
+  });
+  log.querySelectorAll('[data-fast-text-confirm]').forEach((button) => {
+    button.onclick = () => void sendFastTextTargetConfirmation(button);
+  });
   log.querySelectorAll('button.opt[data-opt-msg]').forEach((btn) => {
     btn.onclick = () => {
       const msgIdx = Number(btn.dataset.optMsg);
@@ -4980,6 +4972,7 @@ const TOOL_DISPLAY_NAMES = {
   update_album_page: '修改单页',
   replace_album_text: '快速替换文字',
   set_album_text_color: '快速修改文字颜色',
+  locate_album_text: '检查文字所在页面',
   replace_album_assets: '替换相册图片',
   confirm_album_action: '确认相册操作',
 };
@@ -4998,11 +4991,7 @@ const TOOL_STATUS_VIEW = {
 function renderToolResultDetails(result) {
   if (!result) return '';
   const rows = [];
-  const revision = result.revision ?? result.currentRevision;
-  if (revision !== null && revision !== undefined) rows.push(`<span>当前 revision <b>${esc(revision)}</b></span>`);
-  if (result.previousRevision !== null && result.previousRevision !== undefined) {
-    rows.push(`<span>上一 revision <b>${esc(result.previousRevision)}</b></span>`);
-  }
+  // Keep user-facing summaries concrete (page / fields), not internal revision ids.
   if (result.changedPages?.length) rows.push(`<span>变更页面 <b>${esc(result.changedPages.join('、'))}</b></span>`);
   if (result.pageNumber !== null && result.pageNumber !== undefined) rows.push(`<span>页面 <b>${esc(result.pageNumber)}</b></span>`);
   if (result.pageCount !== null && result.pageCount !== undefined) rows.push(`<span>共 <b>${esc(result.pageCount)}</b> 页</span>`);
@@ -5018,17 +5007,20 @@ function renderToolResultDetails(result) {
     notice = `<div class="agent-tool-notice confirmation">
       <b>需要确认后才能继续</b>
       ${result.confirmationSummary ? `<span>${esc(result.confirmationSummary)}</span>` : ''}
-      ${result.expectedRevision !== null ? `<span>基于 revision ${esc(result.expectedRevision)}</span>` : ''}
     </div>`;
   } else if (result.code === 'ALBUM_REVISION_CONFLICT') {
     notice = `<div class="agent-tool-notice conflict">
       <b>相册已被其他操作更新</b>
-      <span>预期 revision ${esc(result.expectedRevision ?? '未知')}，当前 revision ${esc(result.currentRevision ?? '未知')}</span>
+      <span>请刷新预览后重试这次修改</span>
     </div>`;
   } else if (result.ok === false) {
+    const localized = localizeAgentRunError(result.code || 'TOOL_FAILED', result.message);
+    const detail = result.message && /[\u4e00-\u9fff]/.test(String(result.message))
+      ? String(result.message)
+      : localized.message;
     notice = `<div class="agent-tool-notice failure">
-      <b>${esc(result.code || 'TOOL_FAILED')}</b>
-      ${result.message ? `<span>${esc(result.message)}</span>` : ''}
+      <b>${esc(localized.title)}</b>
+      <span>${esc(detail)}</span>
     </div>`;
   }
 
@@ -5061,18 +5053,144 @@ function renderAgentRunMessage(runState, { persisted = false } = {}) {
   return `<div class="msg agent-run ${esc(run.status || 'idle')}${persisted ? ' persisted' : ''}">
     <div class="agent-run-head">
       <span class="agent-run-icon">${navIcon(statusIcon)}</span>
-      <span class="agent-run-status">${esc(run.statusText || 'Agent 处理中')}</span>
-      ${run.latestRevision !== null && run.latestRevision !== undefined ? `<span class="agent-run-revision">revision ${esc(run.latestRevision)}</span>` : ''}
+      <span class="agent-run-status">${esc(run.statusText || '处理中')}</span>
       ${!persisted && run.status === 'running' && run.runId ? `<button type="button" class="agent-run-cancel" data-cancel-agent-run="${esc(run.runId)}">取消</button>` : ''}
     </div>
-    ${run.tools?.length ? `<div class="agent-tools">${run.tools.map(renderAgentTool).join('')}</div>` : '<div class="agent-run-thinking">正在分析请求并选择下一步</div>'}
-    ${run.error?.message ? `<div class="agent-run-error"><b>${esc(run.error.code || 'RUN_ERROR')}</b><span>${esc(run.error.message)}</span></div>` : ''}
+    ${run.tools?.length
+      ? `<div class="agent-tools">${run.tools.map(renderAgentTool).join('')}</div>`
+      : (run.status === 'running' || run.status === 'idle'
+        ? '<div class="agent-run-thinking">正在分析请求并选择下一步</div>'
+        : '')}
+    ${renderPageTargetConfirmation(run.confirmation, { persisted })}
+    ${renderTextTargetConfirmation(run.confirmation, { persisted })}
+    ${(() => {
+      if (!run.error?.message && !run.error?.code) return '';
+      const localized = localizeAgentRunError(run.error.code, run.error.message);
+      const title = run.error.title || localized.title;
+      return `<div class="agent-run-error"><b>${esc(title)}</b><span>${esc(localized.message)}</span></div>`;
+    })()}
   </div>`;
+}
+
+function renderTextTargetConfirmation(confirmation, { persisted = false } = {}) {
+  if (confirmation?.kind !== 'simple_text_target' || !confirmation.actionId) return '';
+  if (state.resolvedFastPageConfirmationActions.has(confirmation.actionId)) {
+    return '<div class="confirm-resolved-mark">已提交选择</div>';
+  }
+  if (persisted && activeAgentSession()?.pending_confirmation?.action_id !== confirmation.actionId) return '';
+  const candidates = Array.isArray(confirmation.candidates) ? confirmation.candidates : [];
+  const candidateButtons = candidates.map((candidate) => {
+    const candidateId = String(candidate.candidateId || candidate.candidate_id || '');
+    if (!/^txt_[0-9a-f]{24}$/i.test(candidateId)) return '';
+    const key = String(candidate.textKey || candidate.data_hv_text_key || '');
+    const label = simpleTextCandidateLabel(key);
+    const before = String(candidate.contextBefore ?? candidate.context_before ?? '');
+    const matched = String(candidate.matchedText ?? candidate.matched_text ?? confirmation.targetText ?? '');
+    const after = String(candidate.contextAfter ?? candidate.context_after ?? '');
+    const context = `${before}${matched}${after}`.replace(/\s+/g, ' ').trim();
+    return `<button type="button" class="opt" data-fast-text-confirm="${esc(candidateId)}"
+      data-action-id="${esc(confirmation.actionId)}">${esc(label)}：${esc(context || matched)}</button>`;
+  }).join('');
+  return `<div class="opt-card fast-text-confirmation">
+    <div class="question">${esc(confirmation.summary || '当前页找到多处目标文字，请选择要修改的位置。')}</div>
+    <div class="opts">
+      ${candidateButtons}
+      <button type="button" class="opt" data-fast-text-confirm="all"
+        data-action-id="${esc(confirmation.actionId)}">全部修改</button>
+      <button type="button" class="opt" data-fast-text-confirm="cancel"
+        data-action-id="${esc(confirmation.actionId)}">取消</button>
+    </div>
+  </div>`;
+}
+
+function simpleTextCandidateLabel(key) {
+  const normalized = String(key || '').toLowerCase();
+  if (/(?:^|[._-])(?:title|headline)(?:$|[._-])/.test(normalized)) return '标题';
+  if (/(?:^|[._-])(?:subtitle|subhead|caption)(?:$|[._-])/.test(normalized)) return '副标题';
+  if (/(?:^|[._-])(?:email|mail)(?:$|[._-])/.test(normalized)) return '邮箱';
+  if (/(?:^|[._-])footer(?:$|[._-])/.test(normalized)) return '页脚';
+  return '文字';
+}
+
+function renderPageTargetConfirmation(confirmation, { persisted = false } = {}) {
+  if (confirmation?.kind !== 'simple_page_target' || !confirmation.actionId) return '';
+  if (state.resolvedFastPageConfirmationActions.has(confirmation.actionId)) {
+    return '<div class="confirm-resolved-mark">已提交选择</div>';
+  }
+  if (
+    persisted
+    && activeAgentSession()?.pending_confirmation?.action_id !== confirmation.actionId
+  ) return '';
+  const candidates = Array.isArray(confirmation.candidatePages)
+    ? confirmation.candidatePages.filter((page) => Number.isInteger(Number(page)) && Number(page) > 0)
+    : [];
+  const applyButtons = candidates.map((page) => `
+    <button type="button" class="opt" data-fast-page-confirm="apply"
+      data-action-id="${esc(confirmation.actionId)}" data-page-number="${esc(page)}">
+      修改第 ${esc(page)} 页
+    </button>`).join('');
+  return `<div class="opt-card fast-page-confirmation">
+    <div class="question">${esc(confirmation.summary || '指定页面没有找到目标文字，请确认正确页面。')}</div>
+    <div class="opts">
+      ${applyButtons}
+      <button type="button" class="opt" data-fast-page-confirm="keep"
+        data-action-id="${esc(confirmation.actionId)}">仍然修改第 ${esc(confirmation.requestedPage ?? '?')} 页</button>
+      <button type="button" class="opt" data-fast-page-confirm="cancel"
+        data-action-id="${esc(confirmation.actionId)}">取消</button>
+    </div>
+  </div>`;
+}
+
+async function sendFastPageTargetConfirmation(button) {
+  if (state.composing) return;
+  const actionId = String(button?.dataset?.actionId || '');
+  const decision = String(button?.dataset?.fastPageConfirm || '');
+  const pageNumber = Number(button?.dataset?.pageNumber || 0);
+  const marker = buildFastPageConfirmationMarker({ actionId, decision, pageNumber });
+  if (!marker) return;
+  const ta = document.getElementById('composer-input');
+  if (!ta) return;
+  button.disabled = true;
+  ta.value = marker;
+  await sendMessage();
+  state.resolvedFastPageConfirmationActions.add(actionId);
+  renderChatLog();
+}
+
+async function sendFastTextTargetConfirmation(button) {
+  if (state.composing) return;
+  const actionId = String(button?.dataset?.actionId || '');
+  const candidateId = String(button?.dataset?.fastTextConfirm || '');
+  const marker = buildFastTextConfirmationMarker({ actionId, candidateId });
+  if (!marker) return;
+  const ta = document.getElementById('composer-input');
+  if (!ta) return;
+  button.disabled = true;
+  ta.value = marker;
+  await sendMessage();
+  state.resolvedFastPageConfirmationActions.add(actionId);
+  renderChatLog();
 }
 
 function renderMessage(m, idx) {
   if (m.role === 'user') {
     const userContent = (m.content ?? '').trim();
+    const fastTextConfirmation = /^\[fast-text-confirm:[0-9a-f-]{36}:(txt_[0-9a-f]{24}|all|cancel)\]$/i.exec(userContent);
+    if (fastTextConfirmation) {
+      const choice = fastTextConfirmation[1]?.toLowerCase();
+      const label = choice === 'all' ? '确认全部修改' : choice === 'cancel' ? '取消这次修改' : '已选择文字位置';
+      return `<div class="msg user">${esc(label)}</div>`;
+    }
+    const fastConfirmation = /^\[fast-page-confirm:[0-9a-f-]{36}:(apply|keep|cancel)(?::(\d{1,2}))?\]$/i.exec(userContent);
+    if (fastConfirmation) {
+      const decision = fastConfirmation[1]?.toLowerCase();
+      const label = decision === 'apply'
+        ? `确认修改第 ${fastConfirmation[2]} 页`
+        : decision === 'keep'
+          ? '仍然修改原指定页面'
+          : '取消这次修改';
+      return `<div class="msg user">${esc(label)}</div>`;
+    }
     if (
       document.getElementById('chat-log')?.classList.contains('generation-chat-log') &&
       /^\[(?:hv-confirm|hv-form):/.test(userContent)
@@ -5109,10 +5227,25 @@ function renderMessage(m, idx) {
     const tool = toolUiFromStoredMessage(m);
     return renderAgentRunMessage({
       ...createAgentRunUiState({ runId: m.runId, sessionId: m.sessionId }),
-      status: tool.status === 'succeeded' ? 'completed' : tool.status === 'cancelled' ? 'cancelled' : 'failed',
+      status: tool.status === 'succeeded' || tool.status === 'confirmation_required'
+        ? 'completed'
+        : tool.status === 'cancelled' ? 'cancelled' : 'failed',
       statusText: '历史工具结果',
       latestRevision: tool.result?.revision ?? tool.result?.currentRevision ?? null,
       tools: [tool],
+      confirmation: tool.status === 'confirmation_required'
+        ? {
+            actionId: tool.result?.actionId,
+            summary: tool.result?.confirmationSummary,
+            expectedRevision: tool.result?.expectedRevision,
+            expiresAt: tool.result?.expiresAt,
+            kind: tool.result?.confirmationKind,
+            requestedPage: tool.result?.requestedPage,
+            suggestedPage: tool.result?.suggestedPage,
+            candidatePages: tool.result?.candidatePages || [],
+            targetText: tool.result?.targetText,
+          }
+        : null,
     }, { persisted: true });
   }
   if (m.role === 'export-done') {

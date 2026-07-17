@@ -1,0 +1,66 @@
+# Config template.
+# Copy this file to config/config.local.toml and replace CHANGE_ME values.
+#
+#   cp config/config.toml.example config/config.local.toml
+#
+# Loading rules:
+#   1. Start from config/config.toml (base, committed)
+#   2. If config/config.local.toml exists and is non-empty, merge it on top
+#      (local keys win; [[auth.users]] in local fully replaces base users)
+#   3. Shell environment variables still win over both for [agent] / HV_PI_*
+#
+# Do not commit config.local.toml (gitignored via config/*.local.toml).
+
+[database]
+enabled = true
+host = "127.0.0.1"
+port = 5432
+name = "html_video"
+user = "postgres"
+password = "CHANGE_ME"
+pool_min_size = 2
+pool_max_size = 10
+pool_timeout = 30
+connect_timeout = 10
+
+[oss]
+enabled = true
+provider = "aliyun"
+# Example: "oss-cn-beijing.aliyuncs.com"
+endpoint = "oss-cn-hangzhou.aliyuncs.com"
+bucket = "your-bucket"
+access_key_id = "CHANGE_ME"
+access_key_secret = "CHANGE_ME"
+# Optional. Defaults to https://<bucket>.<endpoint> when empty.
+public_base_url = ""
+prefix = "albumgen/"
+
+[auth]
+# Shared default password for users below that omit `password`.
+password = "CHANGE_ME"
+
+[[auth.users]]
+user_id = "admin"
+display_name = "管理员"
+
+[[auth.users]]
+user_id = "alice"
+display_name = "Alice"
+
+[[auth.users]]
+user_id = "bob"
+display_name = "Bob"
+# Optional per-user password:
+# password = "bob-only-password"
+
+[agent]
+# Mapped to HV_PI_* for the Pi Agent SDK.
+base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+api_key = "CHANGE_ME"
+model = "qwen3.7-plus"
+# Max completion tokens per reply (request max_tokens). Default 16384 if unset/invalid.
+max_tokens = 16384
+
+# Aliases also accepted via shell / legacy config/agent.env:
+# DASHSCOPE_API_KEY / DASHSCOPE_BASE_URL / DASHSCOPE_MODEL / DASHSCOPE_MAX_TOKENS
+# OPENAI_API_KEY / OPENAI_BASE_URL / OPENAI_MODEL / OPENAI_MAX_TOKENS

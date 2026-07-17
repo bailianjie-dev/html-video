@@ -1,5 +1,7 @@
 import type { AgentRunEventLog } from '@html-video/runtime';
 import type { AlbumViewState, GenerateAlbumToolInput } from './album-agent-tools.js';
+import type { SimpleAlbumCommand } from './simple-album-command.js';
+import type { SimpleTextTargetCandidate } from './simple-album-html-patch.js';
 
 export const ALBUM_AGENT_PROMPT_VERSION = 'album-agent-v1-phase5.3';
 export const ALBUM_AGENT_TOOLSET_VERSION = 'album-tools-v1-assets';
@@ -52,7 +54,7 @@ export const ALBUM_AGENT_ROUTE_MATRIX: readonly AlbumAgentRouteRule[] = [
   },
 ] as const;
 
-export interface PendingAlbumConfirmation {
+export interface PendingAlbumReplacementConfirmation {
   actionId: string;
   kind: 'replace_album';
   summary: string;
@@ -62,6 +64,42 @@ export interface PendingAlbumConfirmation {
   createdAt: string;
   expiresAt: string;
 }
+
+export interface PendingSimpleAlbumCommandConfirmation {
+  actionId: string;
+  kind: 'simple_page_target';
+  summary: string;
+  projectId: string;
+  sessionId: string;
+  expectedRevision: number;
+  requestedPage: number;
+  candidatePages: number[];
+  targetText: string;
+  command: SimpleAlbumCommand;
+  createdAt: string;
+  expiresAt: string;
+}
+
+export interface PendingSimpleTextTargetConfirmation {
+  actionId: string;
+  kind: 'simple_text_target';
+  code: 'TEXT_TARGET_AMBIGUOUS';
+  summary: string;
+  projectId: string;
+  sessionId: string;
+  expectedRevision: number;
+  pageNumber: number;
+  targetText: string;
+  command: SimpleAlbumCommand;
+  candidates: SimpleTextTargetCandidate[];
+  createdAt: string;
+  expiresAt: string;
+}
+
+export type PendingAlbumConfirmation =
+  | PendingAlbumReplacementConfirmation
+  | PendingSimpleAlbumCommandConfirmation
+  | PendingSimpleTextTargetConfirmation;
 
 export interface CompletedAlbumToolCall {
   result: Record<string, unknown>;

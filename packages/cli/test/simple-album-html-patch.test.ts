@@ -1,6 +1,10 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { executeSimpleAlbumHtmlPatch } from '../dist/simple-album-html-patch.js';
+import {
+  executeSimpleAlbumHtmlPatch,
+  executeSimpleAlbumHtmlPatchForCandidates,
+  locateSimpleTextTargetCandidates,
+} from '../dist/simple-album-html-patch.js';
 import type { SimpleAlbumCommand } from '../dist/simple-album-command.js';
 
 const PREFIX = `<!doctype html><html><head><style>.p2-title{animation:rise 1s;color:white}</style></head><body><main id="album">`;
@@ -125,6 +129,68 @@ test('returns target_ambiguous for multiple matches on the target page', () => {
     handled: false,
     reason: 'target_ambiguous',
   });
+});
+
+test('locates same-page ASCII matches case-insensitively and applies only a snapshotted candidate', () => {
+  const original = `${PREFIX}
+<section data-album-page="page_1"><h1 data-hv-text="page_1.title">One</h1></section>
+<section data-album-page="page_2">
+  <h1 data-hv-text="page_2.title">开启你的 SU7 之旅</h1>
+  <p data-hv-text="page_2.subtitle">亲身感受小米 SU7 带来的极致体验</p>
+  <p data-hv-text="page_2.email">su7@xiaomi.com</p>
+  <p data-hv-text="page_2.footer_right">SU7 · 官方宣传</p>
+</section>${SUFFIX}`;
+  const command: SimpleAlbumCommand = {
+    type: 'set_text_color', page_number: 2, target_text: 'su7', color: '#0000FF',
+  };
+  assert.deepEqual(executeSimpleAlbumHtmlPatch(original, command), {
+    handled: false,
+    reason: 'target_ambiguous',
+  });
+  const located = locateSimpleTextTargetCandidates(original, command);
+  assert.equal(located.handled, true);
+  if (!located.handled) return;
+  assert.equal(located.candidates.length, 4);
+  assert.deepEqual(located.candidates.map((candidate) => candidate.matched_text), ['SU7', 'SU7', 'su7', 'SU7']);
+  assert.deepEqual(located.candidates.map((candidate) => candidate.data_hv_text_key), [
+    'page_2.title', 'page_2.subtitle', 'page_2.email', 'page_2.footer_right',
+  ]);
+  assert.ok(located.candidates.every((candidate) => /^[0-9a-f]{64}$/.test(candidate.source_hash)));
+
+  const selected = executeSimpleAlbumHtmlPatchForCandidates(
+    original,
+    command,
+    located.candidates,
+    [located.candidates[0]!.candidate_id],
+  );
+  assert.equal(selected.handled, true);
+  if (!selected.handled) return;
+  assert.match(selected.patch.html, /开启你的 <span style="color:#0000FF">SU7<\/span> 之旅/);
+  assert.match(selected.patch.html, />su7@xiaomi\.com</);
+  assert.equal((selected.patch.html.match(/style="color:#0000FF"/g) ?? []).length, 1);
+});
+
+test('revalidates candidate source hashes and supports server-approved all selection', () => {
+  const original = album('SU7<br><span>su7</span>');
+  const command: SimpleAlbumCommand = {
+    type: 'set_text_color', page_number: 2, target_text: 'su7', color: '#0000FF',
+  };
+  const located = locateSimpleTextTargetCandidates(original, command);
+  assert.equal(located.handled, true);
+  if (!located.handled) return;
+  const all = executeSimpleAlbumHtmlPatchForCandidates(
+    original, command, located.candidates, located.candidates.map((candidate) => candidate.candidate_id),
+  );
+  assert.equal(all.handled, true);
+  if (all.handled) assert.equal((all.patch.html.match(/style="color:#0000FF"/g) ?? []).length, 2);
+
+  const changed = original.replace('data-hv-text="page_2.title"', 'data-hv-text="page_2.changed"');
+  assert.deepEqual(
+    executeSimpleAlbumHtmlPatchForCandidates(
+      changed, command, located.candidates, [located.candidates[0]!.candidate_id],
+    ),
+    { handled: false, reason: 'target_changed' },
+  );
 });
 
 test('returns target_not_found for zero matches', () => {

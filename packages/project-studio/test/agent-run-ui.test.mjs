@@ -3,8 +3,11 @@ import test from 'node:test';
 
 import {
   buildAgentViewStateSnapshot,
+  buildFastPageConfirmationMarker,
+  buildFastTextConfirmationMarker,
   createAgentRunUiState,
   isAgentRunExecutionActive,
+  localizeAgentRunError,
   preserveActivePageIndex,
   reconcileRestoredAgentRunUi,
   reduceAgentRunUiEvent,
@@ -74,7 +77,7 @@ test('maps a complete tool run and exposes preview revision', () => {
   assert.equal(state.model, 'qwen3.7-plus');
   assert.equal(state.tools[0].name, 'update_album_page');
   assert.equal(state.tools[0].status, 'succeeded');
-  assert.deepEqual(state.tools[0].argumentSummary, ['页码：2', '预期版本：4', '要求：修改标题']);
+  assert.deepEqual(state.tools[0].argumentSummary, ['页码：2', '要求：修改标题']);
   assert.equal(state.latestRevision, 5);
   assert.deepEqual(state.preview.changedPages, [2]);
   assert.deepEqual(
@@ -104,6 +107,109 @@ test('maps overwrite confirmation without claiming success', () => {
   assert.equal(state.tools[0].status, 'confirmation_required');
   assert.equal(state.confirmation.expectedRevision, 7);
   assert.equal(state.tools[0].result.ok, false);
+});
+
+test('maps deterministic page-target confirmation fields for Session recovery', () => {
+  const state = apply([
+    event(1, 'run.started', { executor: 'deterministic' }),
+    event(2, 'tool.call.started', { callId: 'locate', name: 'locate_album_text', arguments: {} }),
+    event(3, 'tool.call.completed', {
+      callId: 'locate',
+      output: {
+        details: {
+          ok: false,
+          confirmation_required: true,
+          confirmation_kind: 'simple_page_target',
+          code: 'PAGE_TARGET_MISMATCH',
+          action_id: '11111111-1111-4111-8111-111111111111',
+          summary: '第一页没有找到“核心性能”，但在第二页唯一找到。',
+          requested_page: 1,
+          suggested_page: 2,
+          candidate_pages: [2],
+          target_text: '核心性能',
+          expected_revision: 8,
+        },
+      },
+    }),
+    event(4, 'run.completed'),
+  ]).state;
+
+  assert.equal(state.status, 'completed');
+  assert.equal(state.tools[0].status, 'confirmation_required');
+  assert.deepEqual(state.confirmation, {
+    actionId: '11111111-1111-4111-8111-111111111111',
+    summary: '第一页没有找到“核心性能”，但在第二页唯一找到。',
+    expectedRevision: 8,
+    expiresAt: '',
+    kind: 'simple_page_target',
+    requestedPage: 1,
+    suggestedPage: 2,
+    candidatePages: [2],
+    candidates: [],
+    targetText: '核心性能',
+  });
+});
+
+test('maps text-target candidates and builds opaque candidate-only markers', () => {
+  const actionId = '11111111-1111-4111-8111-111111111111';
+  const candidateId = 'txt_0123456789abcdef01234567';
+  const state = apply([
+    event(1, 'tool.call.started', { callId: 'locate', name: 'locate_album_text', arguments: {} }),
+    event(2, 'tool.call.completed', {
+      callId: 'locate',
+      output: { details: {
+        confirmation_required: true,
+        confirmation_kind: 'simple_text_target',
+        code: 'TEXT_TARGET_AMBIGUOUS',
+        action_id: actionId,
+        summary: '第三页找到 4 处“su7”，请选择要修改的位置。',
+        requested_page: 3,
+        candidate_pages: [3],
+        target_text: 'su7',
+        candidates: [{
+          candidate_id: candidateId,
+          page_number: 3,
+          data_hv_text_key: 'page_3.title',
+          occurrence_index: 0,
+          matched_text: 'SU7',
+          context_before: '开启你的 ',
+          context_after: ' 之旅',
+        }],
+      } },
+    }),
+  ]).state;
+  assert.equal(state.confirmation.kind, 'simple_text_target');
+  assert.deepEqual(state.confirmation.candidates, [{
+    candidateId,
+    pageNumber: 3,
+    textKey: 'page_3.title',
+    occurrenceIndex: 0,
+    matchedText: 'SU7',
+    contextBefore: '开启你的',
+    contextAfter: '之旅',
+  }]);
+  assert.equal(
+    buildFastTextConfirmationMarker({ actionId, candidateId }),
+    `[fast-text-confirm:${actionId}:${candidateId}]`,
+  );
+  assert.equal(buildFastTextConfirmationMarker({ actionId, candidateId: 'all' }), `[fast-text-confirm:${actionId}:all]`);
+  assert.equal(buildFastTextConfirmationMarker({ actionId, candidateId: 'page_3.title' }), '');
+  assert.equal(buildFastTextConfirmationMarker({ actionId, candidateId: '../source' }), '');
+});
+
+test('builds opaque page confirmation markers without accepting arbitrary commands', () => {
+  const actionId = '11111111-1111-4111-8111-111111111111';
+  assert.equal(
+    buildFastPageConfirmationMarker({ actionId, decision: 'apply', pageNumber: 2 }),
+    `[fast-page-confirm:${actionId}:apply:2]`,
+  );
+  assert.equal(
+    buildFastPageConfirmationMarker({ actionId, decision: 'cancel' }),
+    `[fast-page-confirm:${actionId}:cancel]`,
+  );
+  assert.equal(buildFastPageConfirmationMarker({ actionId, decision: 'apply', pageNumber: 99 }), '');
+  assert.equal(buildFastPageConfirmationMarker({ actionId: '<script>', decision: 'apply', pageNumber: 2 }), '');
+  assert.equal(buildFastPageConfirmationMarker({ actionId, decision: 'replace_html', pageNumber: 2 }), '');
 });
 
 test('maps revision conflicts and validation failures', () => {
@@ -277,7 +383,7 @@ test('tool argument summaries hide HTML, URLs and local paths', () => {
       source_url: 'https://example.com/a.png',
       local_path: 'C:\\secret\\a.png',
     }),
-    ['预期版本：2', '要求：[已隐藏]'],
+    ['要求：[已隐藏]'],
   );
 });
 
@@ -308,4 +414,32 @@ test('preview refresh keeps the active page and only clamps when pages shrink', 
   assert.equal(preserveActivePageIndex(1, 3), 1);
   assert.equal(preserveActivePageIndex(2, 2), 1);
   assert.equal(preserveActivePageIndex(2, 0), 0);
+});
+
+test('localizes empty-response and cancelled errors for end users', () => {
+  const empty = localizeAgentRunError('EMPTY_RESPONSE', 'Agent returned an empty response');
+  assert.equal(empty.title, '没有得到有效回复');
+  assert.match(empty.message, /没有返回有效内容/);
+
+  const cancelled = localizeAgentRunError('RUN_CANCELLED', 'Agent run cancelled');
+  assert.equal(cancelled.title, '已取消');
+  assert.match(cancelled.message, /已取消/);
+
+  const tokenLimit = localizeAgentRunError(
+    'OUTPUT_TOKEN_LIMIT',
+    'OUTPUT_TOKEN_LIMIT: model stopped because max_tokens was reached',
+  );
+  assert.equal(tokenLimit.title, '回复长度超出上限');
+  assert.match(tokenLimit.message, /max_tokens/);
+
+  const failed = reduceAgentRunUiEvent(
+    createAgentRunUiState({ runId: 'run-empty', sessionId: 'session-1' }),
+    event(1, 'run.failed', {
+      code: 'EMPTY_RESPONSE',
+      message: 'Agent returned an empty response',
+    }),
+  ).state;
+  assert.equal(failed.error.title, '没有得到有效回复');
+  assert.match(failed.error.message, /没有返回有效内容/);
+  assert.doesNotMatch(failed.error.message, /EMPTY_RESPONSE|empty response/i);
 });

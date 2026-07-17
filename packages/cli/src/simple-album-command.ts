@@ -1,5 +1,5 @@
 export type SimpleAlbumCommandPage =
-  | { page_number: number; current_page?: never }
+  | { page_number: number; current_page?: never; page_match_policy?: 'strict' }
   | { current_page: true; page_number?: never };
 
 export type SimpleAlbumCommand = SimpleAlbumCommandPage & (
@@ -27,6 +27,7 @@ export type SimpleAlbumCommandNotHandledReason =
   | 'missing_target_text'
   | 'missing_color'
   | 'invalid_color'
+  | 'non_text_style_request'
   | 'unsupported_command';
 
 export type ParseSimpleAlbumCommandResult =
@@ -36,7 +37,19 @@ export type ParseSimpleAlbumCommandResult =
 const SUBJECTIVE_REQUEST = /(?:更|再)?(?:高级|高級|好看|漂亮|美观|美觀|科技感|有质感|有質感|大气|大氣|精致|精緻|酷炫|炫酷|时尚|時尚|专业|專業|协调|協調|舒服|优化一下|優化一下|美化一下)/i;
 const COMPOUND_REQUEST = /(?:并且|並且|同时|同時|然后|然後|以及|再把|再将|再將|;)/i;
 const COLOR_STYLE_HINT = /(?:字体|字體|文字|文本)?(?:的)?(?:颜色|顏色|色彩)|字体|字體|字色|font\s*color|text\s*color/i;
-const OPERATOR = /(替换成|替換成|替换为|替換為|改成|改为|改為|换成|換成|换为|換為|设为|設為|设置为|設置為)/gu;
+const NON_TEXT_STYLE_TARGET = /(?:背景(?:色|颜色|顏色)?|渐变(?:色)?|漸變(?:色)?|边框|邊框|阴影|陰影|布局|佈局|字号|字號|动画|動畫|圆角|圓角|间距|間距|留白|透明度|蒙版|遮罩|滤镜|濾鏡|定位|对齐|對齊|尺寸|宽度|寬度|高度)/iu;
+const CANONICAL_OPERATOR = '改为';
+const OPERATOR = /改为/gu;
+const OPERATOR_ALIASES = Object.freeze([
+  '替换成', '替換成', '替换为', '替換為',
+  '设置成', '設置成', '设置为', '設置為',
+  '调整成', '調整成', '调整为', '調整為',
+  '变成', '變成', '变为', '變為',
+  '弄成', '搞成', '调成', '調成', '调为', '調為',
+  '改成', '改为', '改為',
+  '换成', '換成', '换为', '換為',
+  '设为', '設為',
+] as const);
 
 const SAFE_COLORS: Readonly<Record<string, string>> = Object.freeze({
   '红色': '#FF0000',
@@ -73,7 +86,7 @@ const SAFE_COLORS: Readonly<Record<string, string>> = Object.freeze({
 
 /** Parse a deliberately small, deterministic subset of album edit commands. */
 export function parseSimpleAlbumCommand(input: string): ParseSimpleAlbumCommandResult {
-  const normalized = normalizeSimpleCommandText(input);
+  const normalized = normalizeSimpleCommandAliases(normalizeSimpleCommandText(input));
   if (!normalized) return notHandled('empty_input');
   if (SUBJECTIVE_REQUEST.test(normalized)) return notHandled('subjective_request');
   if (COMPOUND_REQUEST.test(normalized)) return notHandled('compound_request');
@@ -81,6 +94,7 @@ export function parseSimpleAlbumCommand(input: string): ParseSimpleAlbumCommandR
   const page = parsePageSelector(normalized);
   if (!page.ok) return notHandled(page.reason);
   const body = removePageSelectors(normalized)
+    .replace(/^\s*就是\s*[,：:]?\s*/u, '')
     .replace(/^\s*(?:的|之中|中|里|裡)\s*/u, '')
     .trim();
 
@@ -99,6 +113,9 @@ export function parseSimpleAlbumCommand(input: string): ParseSimpleAlbumCommandR
   const rightRaw = body.slice(operatorIndex + operator.length);
   const left = cleanCommandValue(leftRaw, 'left');
   const right = cleanCommandValue(rightRaw, 'right');
+  if (!hasExplicitTextTargetEvidence(input) && NON_TEXT_STYLE_TARGET.test(left)) {
+    return notHandled('non_text_style_request');
+  }
 
   const styleIntent = COLOR_STYLE_HINT.test(leftRaw);
   const color = normalizeSafeColor(right);
@@ -132,6 +149,16 @@ export function parseSimpleAlbumCommand(input: string): ParseSimpleAlbumCommandR
   };
 }
 
+/**
+ * Evidence that the user explicitly refers to literal text rather than using
+ * the generic "X 改成 Y" shape for an arbitrary visual property.
+ */
+export function hasExplicitTextTargetEvidence(input: string): boolean {
+  const normalized = normalizeSimpleCommandText(input);
+  if (/"[^"\r\n]{1,500}"/u.test(normalized)) return true;
+  return /(?:文字|文本|文案|字样|字樣|词语|詞語|字符|(?:几|幾|[0-9一二三四五六七八九十]+)个字|字体|字體|字色|font\s*color|text\s*color)/iu.test(normalized);
+}
+
 export function normalizeSimpleCommandText(input: string): string {
   return String(input ?? '')
     .normalize('NFKC')
@@ -143,6 +170,49 @@ export function normalizeSimpleCommandText(input: string): string {
     .replace(/\s+/g, ' ')
     .replace(/\s*([,:;.])\s*/g, '$1')
     .trim();
+}
+
+/**
+ * Canonicalize a deliberately bounded operator vocabulary outside quoted
+ * literal text. This is lexical normalization, not fuzzy language inference.
+ */
+export function normalizeSimpleCommandAliases(input: string): string {
+  const source = String(input ?? '');
+  let normalized = '';
+  let quote = '';
+  for (let index = 0; index < source.length;) {
+    const char = source[index]!;
+    if (quote) {
+      normalized += char;
+      if (char === quote) quote = '';
+      index += 1;
+      continue;
+    }
+    if (char === '"' || char === "'") {
+      quote = char;
+      normalized += char;
+      index += 1;
+      continue;
+    }
+    const alias = OPERATOR_ALIASES.find(
+      (candidate) => source.startsWith(candidate, index)
+        && !isAliasEmbeddedInStyleTerm(source, index, candidate),
+    );
+    if (alias) {
+      normalized += CANONICAL_OPERATOR;
+      index += alias.length;
+      continue;
+    }
+    normalized += char;
+    index += 1;
+  }
+  return normalized;
+}
+
+function isAliasEmbeddedInStyleTerm(source: string, index: number, alias: string): boolean {
+  // “渐变为/漸變為” describes a gradient and must not contribute a second
+  // colloquial “变为” mutation operator.
+  return /^(?:变|變)(?:成|为|為)$/u.test(alias) && /[渐漸]/u.test(source[index - 1] ?? '');
 }
 
 export function normalizeSafeColor(input: string): string | null {
@@ -174,7 +244,15 @@ function parsePageSelector(input: string):
   }
   const uniquePages = [...new Set(pageNumbers as number[])];
   if (uniquePages.length > 1) return { ok: false, reason: 'ambiguous_page' };
-  if (uniquePages.length === 1) return { ok: true, value: { page_number: uniquePages[0]! } };
+  if (uniquePages.length === 1) {
+    return {
+      ok: true,
+      value: {
+        page_number: uniquePages[0]!,
+        ...(/就是\s*第/u.test(input) && { page_match_policy: 'strict' as const }),
+      },
+    };
+  }
   return { ok: true, value: { current_page: true } };
 }
 
@@ -213,6 +291,7 @@ function cleanCommandValue(input: string, side: 'left' | 'right'): string {
   if (side === 'left') {
     value = value
       .replace(/^\s*(?:把|将|將)\s*/u, '')
+      .replace(/^\s*的\s*/u, '')
       .replace(/\s*(?:,|:)\s*$/u, '')
       .replace(/\s*(?:的)?(?:字体|字體|文字|文本)?(?:颜色|顏色|色彩|字色|font\s*color|text\s*color)\s*$/iu, '')
       .replace(/\s*(?:的)?(?:字体|字體)\s*$/u, '');

@@ -2,6 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   normalizeSafeColor,
+  normalizeSimpleCommandAliases,
   normalizeSimpleCommandText,
   parseSimpleAlbumCommand,
 } from '../dist/simple-album-command.js';
@@ -62,6 +63,63 @@ test('parses a safe named color without an explicit style word', () => {
       type: 'set_text_color',
       current_page: true,
       target_text: '遥遥领先',
+      color: '#FF0000',
+    },
+  });
+});
+
+test('normalizes bounded colloquial operators into deterministic color commands', () => {
+  for (const operator of ['变成', '变为', '弄成', '搞成', '调成', '调整为', '设置成']) {
+    assert.deepEqual(parseSimpleAlbumCommand(`xiaomi${operator}绿色`), {
+      handled: true,
+      command: {
+        type: 'set_text_color',
+        current_page: true,
+        target_text: 'xiaomi',
+        color: '#008000',
+      },
+    }, operator);
+  }
+});
+
+test('keeps colloquial normalization lexical and preserves quoted literals', () => {
+  assert.equal(normalizeSimpleCommandAliases('xiaomi变成绿色'), 'xiaomi改为绿色');
+  assert.equal(
+    normalizeSimpleCommandAliases('把"成长变成力量"变成"新的文案"'),
+    '把"成长变成力量"改为"新的文案"',
+  );
+  assert.equal(
+    normalizeSimpleCommandAliases('背景换成渐变色,渐变为白色'),
+    '背景改为渐变色,渐变为白色',
+  );
+  assert.deepEqual(parseSimpleAlbumCommand('xiaomi变成小米'), {
+    handled: true,
+    command: {
+      type: 'replace_text',
+      current_page: true,
+      old_text: 'xiaomi',
+      new_text: '小米',
+    },
+  });
+});
+
+test('parses 把 before an explicit page and marks 就是第N页 as strict', () => {
+  assert.deepEqual(parseSimpleAlbumCommand('把第一页的核心性能改成红色'), {
+    handled: true,
+    command: {
+      type: 'set_text_color',
+      page_number: 1,
+      target_text: '核心性能',
+      color: '#FF0000',
+    },
+  });
+  assert.deepEqual(parseSimpleAlbumCommand('就是第一页，把核心性能改成红色'), {
+    handled: true,
+    command: {
+      type: 'set_text_color',
+      page_number: 1,
+      page_match_policy: 'strict',
+      target_text: '核心性能',
       color: '#FF0000',
     },
   });
@@ -133,6 +191,30 @@ test('returns subjective_request for non-deterministic visual requests', () => {
   }
 });
 
+test('rejects non-text style properties before the generic replacement grammar', () => {
+  for (const input of [
+    '第一页背景色换成渐变色，上面蓝色，渐变为白色',
+    '第二页边框改成蓝色',
+    '当前页动画改为淡入',
+    '背景变成绿色',
+    '第二页边框弄成蓝色',
+  ]) {
+    assert.deepEqual(parseSimpleAlbumCommand(input), {
+      handled: false,
+      reason: 'non_text_style_request',
+    });
+  }
+  assert.deepEqual(parseSimpleAlbumCommand('把“背景色”改成“背景颜色”'), {
+    handled: true,
+    command: {
+      type: 'replace_text',
+      current_page: true,
+      old_text: '背景色',
+      new_text: '背景颜色',
+    },
+  });
+});
+
 test('returns explicit reasons when required values are missing', () => {
   assert.deepEqual(parseSimpleAlbumCommand('改成遥遥领先'), {
     handled: false,
@@ -173,6 +255,10 @@ test('rejects compound, ambiguous-page, invalid-page, and unsupported requests',
 
 test('rejects commands containing more than one mutation operator', () => {
   assert.deepEqual(parseSimpleAlbumCommand('把A改成B改成C'), {
+    handled: false,
+    reason: 'ambiguous_command',
+  });
+  assert.deepEqual(parseSimpleAlbumCommand('把A变成B再调成C'), {
     handled: false,
     reason: 'ambiguous_command',
   });
